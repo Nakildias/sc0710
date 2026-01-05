@@ -5,6 +5,8 @@ An improved, modern Linux driver for the Elgato 4K60 Pro mk.2 capture card.
 > [!NOTE]
 > This driver has been specifically tested and optimized for **Kernel 6.18.3-arch1-1**.
 
+# 1080p works for now, I'm currently trying to get 4k working.
+
 ## Features
 
 This improved version brings significant stability and functionality updates over the original driver:
