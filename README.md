@@ -1,14 +1,47 @@
-# sc0710
-Elgato 4K60 Pro mk.2 capture card driver for linux. Tested on kernel 6.18.3-arch1-1
-Improvement over the original drivers
-1. Actually compiles
-2. Multi-Application (Capture Card works on multiple apps at the same time)
-3. Can survive a HDMI unplug and replug without crashing the kernel
-4. Will have some support if you have issues please open an issue about it
-5. Display is correct upon disconection and reconection of the HDMI cable. (IDK IF the original had this issue as I never were able to even compile it as my Kernel is too recent for it.)
+# Elgato 4K60 Pro mk.2 Linux Driver
 
+An improved, modern Linux driver for the Elgato 4K60 Pro mk.2 capture card.
 
-Please note that this is orginally the the work of
-@stoth68000 & @Subtixx
-https://github.com/stoth68000/sc0710
-thanks to them as this would not exist without them.
+> [!NOTE]
+> This driver has been specifically tested and optimized for **Kernel 6.18.3-arch1-1**.
+
+## Features
+
+This improved version brings significant stability and functionality updates over the original driver:
+
+*   **Modern Kernel Support**: It actually compiles! Fixed build issues for newer Linux kernels (tested on 6.18+).
+*   **Multi-Application Support**: The capture card can now be accessed by multiple applications simultaneously.
+*   **Robust Hotplug Stability**: Can survive HDMI unplug and replug events without crashing the kernel (no more hard lockups!).
+*   **Correct Signal Restoration**: Fixes image alignment issues upon HDMI reconnection (no more "cut" or swapped frames).
+*   **Active Support**: If you encounter issues, please open a ticket!
+
+## Installation
+
+### Prerequisites
+Ensure you have the necessary kernel headers and build tools installed for your distribution.
+
+### Build and Install
+1.  Compile the driver:
+    ```bash
+    make
+    ```
+2.  Load the kernel module:
+    ```bash
+    sudo insmod sc0710.ko
+    ```
+
+## Usage
+Once loaded, the device will appear as a standard V4L2 device (e.g., `/dev/video0`). You can use it with any compatible software such as:
+*   OBS Studio
+*   FFmpeg
+*   VLC
+*   Discord (via browser or app if supported)
+
+## Credits
+This project is built upon the incredible reverse engineering and initial development work of:
+*   **@stoth68000** (Steven Toth)
+*   **@Subtixx**
+
+Original repository: [stoth68000/sc0710](https://github.com/stoth68000/sc0710)
+
+Special thanks to them, as this driver would not exist without their foundational work.
