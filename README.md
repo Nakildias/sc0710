@@ -43,7 +43,7 @@ sudo dnf install kernel-devel kernel-headers gcc make git
 
 **Step 1: Download the driver**
 ```bash
-git clone https://github.com/YOUR_USERNAME/sc0710.git
+git clone https://github.com/Nakildias/sc0710.git
 cd sc0710
 ```
 
