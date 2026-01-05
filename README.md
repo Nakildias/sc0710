@@ -5,7 +5,7 @@ An improved, modern Linux driver for the Elgato 4K60 Pro mk.2 capture card.
 > [!NOTE]
 > This driver has been specifically tested and optimized for **Kernel 6.18.3-arch1-1**.
 
-# 1080p works for now, I'm currently trying to get 4k working.
+# I will start reverse engineering asap to get 4k support.
 
 ## Features
 
@@ -16,6 +16,13 @@ This improved version brings significant stability and functionality updates ove
 *   **Robust Hotplug Stability**: Can survive HDMI unplug and replug events without crashing the kernel (no more hard lockups!).
 *   **Correct Signal Restoration**: Fixes image alignment issues upon HDMI reconnection (no more "cut" or swapped frames).
 *   **Active Support**: If you encounter issues, please open a ticket!
+
+### Known Limitations
+
+> [!CAUTION]
+> **4K capture is currently experimental and not fully working.** The driver detects 4K signals correctly and transfers the data, but the resulting image displays with visual artifacts (striping). This appears to be a hardware-level output format issue in the Elgato FPGA that requires further reverse-engineering.
+>
+> **Workaround:** Set your source device to output 1080p, which works flawlessly.
 
 ## Installation
 
