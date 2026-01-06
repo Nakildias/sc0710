@@ -11,7 +11,7 @@ IFS=$'\n\t'
 # --- Configuration ---
 REPO_URL="https://github.com/Nakildias/sc0710.git"
 DRV_NAME="sc0710"
-DRV_VERSION="1.0.0"
+DRV_VERSION="1.0.1"
 SRC_DEST="/usr/src/${DRV_NAME}-${DRV_VERSION}"
 
 # --- Visual Definition (Pacman Style) ---
