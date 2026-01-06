@@ -195,66 +195,117 @@ static int sc0710_i2c_writeread(struct sc0710_dev *dev, u8 devaddr8bit, u8 *wbuf
 	return ret;
 }
 
-/* Helper to fully restart DMA on signal restoration to fix frame alignment */
+/* Helper to fully restart DMA on signal restoration to fix frame alignment.
+ * Also handles starting DMA if streaming started without signal.
+ */
 static void sc0710_reset_dma_frame_sync(struct sc0710_dev *dev)
 {
 	struct sc0710_dma_channel *ch;
 	struct sc0710_dma_descriptor_chain *chain;
 	struct sc0710_dma_descriptor_chain_allocation *dca;
 	int ch_idx, i, j;
+	int dma_was_running = 0;
+	int has_streaming_clients = 0;
 
+	if (!dev->fmt) {
+		printk(KERN_INFO "%s: No format detected, skipping DMA reset\n", dev->name);
+		return;
+	}
+
+	/* Check video channel status */
 	for (ch_idx = 0; ch_idx < SC0710_MAX_CHANNELS; ch_idx++) {
 		ch = &dev->channel[ch_idx];
 		
-		if (!ch->enabled || ch->state != STATE_RUNNING)
-			continue;
-		
-		/* Only reset video channel, not audio */
-		if (ch->mediatype != CHTYPE_VIDEO)
+		if (!ch->enabled || ch->mediatype != CHTYPE_VIDEO)
 			continue;
 
-		mutex_lock(&ch->lock);
+		if (ch->state == STATE_RUNNING)
+			dma_was_running = 1;
 		
-		printk(KERN_INFO "%s: Stopping DMA channel %d for frame resync\n",
-			dev->name, ch_idx);
-		
-		/* 1. Stop the DMA hardware */
-		sc_write(dev, 1, ch->reg_dma_control_w1c, 0x00000001);
-		
-		/* 2. Small delay to let hardware quiesce */
-		usleep_range(1000, 2000);
-		
-		/* 3. Clear all writeback metadata */
-		for (i = 0; i < ch->numDescriptorChains; i++) {
-			chain = &ch->chains[i];
-			for (j = 0; j < chain->numAllocations; j++) {
-				dca = &chain->allocations[j];
-				if (dca->wbm[0])
-					*(dca->wbm[0]) = 0;
-				if (dca->wbm[1])
-					*(dca->wbm[1]) = 0;
-			}
-		}
-		
-		/* 4. Reset descriptor counter and reprogram start address */
-		ch->dma_completed_descriptor_count_last = 0;
-		sc_write(dev, 1, ch->reg_dma_completed_descriptor_count, 1);
-		sc_write(dev, 1, ch->reg_sg_start_h, ch->pt_dma >> 32);
-		sc_write(dev, 1, ch->reg_sg_start_l, ch->pt_dma);
-		sc_write(dev, 1, ch->reg_sg_adj, 0);
-		
-		/* 5. Small delay before restart */
-		usleep_range(500, 1000);
-		
-		/* 6. Restart the DMA hardware */
-		sc_write(dev, 1, ch->reg_dma_control_w1s, 0x00000001);
-		
-		printk(KERN_INFO "%s: Restarted DMA channel %d after signal restoration\n",
-			dev->name, ch_idx);
-		
-		mutex_unlock(&ch->lock);
+		if (atomic_read(&ch->streaming_refcount) > 0)
+			has_streaming_clients = 1;
 	}
+
+	if (!has_streaming_clients) {
+		printk(KERN_INFO "%s: No streaming clients, skipping DMA start\n", dev->name);
+		return;
+	}
+
+	printk(KERN_INFO "%s: Signal restoration - DMA was %s, have streaming clients\n",
+		dev->name, dma_was_running ? "running" : "stopped");
+
+	/* Phase 1: Stop DMA if it was running */
+	if (dma_was_running) {
+		for (ch_idx = 0; ch_idx < SC0710_MAX_CHANNELS; ch_idx++) {
+			ch = &dev->channel[ch_idx];
+			
+			if (!ch->enabled || ch->state != STATE_RUNNING)
+				continue;
+			
+			if (ch->mediatype != CHTYPE_VIDEO)
+				continue;
+
+			mutex_lock(&ch->lock);
+			
+			printk(KERN_INFO "%s: Stopping DMA channel %d for resync\n",
+				dev->name, ch_idx);
+			
+			/* Stop the DMA hardware */
+			sc_write(dev, 1, ch->reg_dma_control_w1c, 0x00000001);
+			
+			/* Small delay to let hardware quiesce */
+			usleep_range(2000, 3000);
+			
+			/* Clear all writeback metadata */
+			for (i = 0; i < ch->numDescriptorChains; i++) {
+				chain = &ch->chains[i];
+				for (j = 0; j < chain->numAllocations; j++) {
+					dca = &chain->allocations[j];
+					if (dca->wbm[0])
+						*(dca->wbm[0]) = 0;
+					if (dca->wbm[1])
+						*(dca->wbm[1]) = 0;
+				}
+			}
+			
+			/* Reset descriptor counter */
+			ch->dma_completed_descriptor_count_last = 0;
+			sc_write(dev, 1, ch->reg_dma_completed_descriptor_count, 1);
+			sc_write(dev, 1, ch->reg_sg_start_h, ch->pt_dma >> 32);
+			sc_write(dev, 1, ch->reg_sg_start_l, ch->pt_dma);
+			sc_write(dev, 1, ch->reg_sg_adj, 0);
+			
+			/* Update state so resize() can proceed */
+			ch->state = STATE_STOPPED;
+			
+			mutex_unlock(&ch->lock);
+		}
+	}
+
+	/* Phase 2: Resize DMA buffers if needed (for resolution changes) */
+	sc0710_dma_channels_resize(dev);
+
+	/* Phase 3: Program hardware registers */
+	if (dev->fmt) {
+		sc_write(dev, 0, BAR0_00C8, dev->fmt->height);
+		printk(KERN_INFO "%s: Reprogrammed height register to %d\n",
+			dev->name, dev->fmt->height);
+	}
+	sc_write(dev, 0, BAR0_00D0, 0x4100);
+	sc_write(dev, 0, 0xcc, 0);
+	sc_write(dev, 0, 0xdc, 0);
+	sc_write(dev, 0, BAR0_00D0, 0x4300);
+	sc_write(dev, 0, BAR0_00D0, 0x4100);
+
+	/* Small delay before restart */
+	msleep(10);
+
+	/* Phase 4: Start DMA */
+	sc0710_dma_channels_start(dev);
+	printk(KERN_INFO "%s: DMA started after signal restoration\n", dev->name);
 }
+
+
 
 int sc0710_i2c_read_hdmi_status(struct sc0710_dev *dev)
 {
@@ -286,6 +337,9 @@ int sc0710_i2c_read_hdmi_status(struct sc0710_dev *dev)
 	printk("\n");
 #endif
 	if (rbuf[8]) {
+		u32 new_pixelLineH, new_pixelLineV;
+		int timing_changed = 0;
+		
 		dev->locked = 1;
 		
 		switch ((rbuf[0x0d] & 0x30) >> 4) {
@@ -316,10 +370,24 @@ int sc0710_i2c_read_hdmi_status(struct sc0710_dev *dev)
 			dev->colorspace = CS_UNDEFINED;
 		}
 
+		/* Save old timings to detect changes */
+		new_pixelLineV = rbuf[0x05] << 8 | rbuf[0x04];
+		new_pixelLineH = rbuf[0x07] << 8 | rbuf[0x06];
+		
+		/* Detect timing change (quick replug or resolution change) */
+		if (was_locked && dev->pixelLineH > 0 && dev->pixelLineV > 0) {
+			if (new_pixelLineH != dev->pixelLineH || new_pixelLineV != dev->pixelLineV) {
+				timing_changed = 1;
+				printk(KERN_INFO "%s: HDMI timing changed (%dx%d -> %dx%d)\n",
+					dev->name, dev->pixelLineH, dev->pixelLineV,
+					new_pixelLineH, new_pixelLineV);
+			}
+		}
+
 		dev->width = rbuf[0x0b] << 8 | rbuf[0x0a];
 		dev->height = rbuf[0x09] << 8 | rbuf[0x08];
-		dev->pixelLineV = rbuf[0x05] << 8 | rbuf[0x04];
-		dev->pixelLineH = rbuf[0x07] << 8 | rbuf[0x06];
+		dev->pixelLineV = new_pixelLineV;
+		dev->pixelLineH = new_pixelLineH;
 
 		dev->interlaced = rbuf[0x0d] & 0x01;
 		if (dev->interlaced)
@@ -327,10 +395,22 @@ int sc0710_i2c_read_hdmi_status(struct sc0710_dev *dev)
 
 		dev->fmt = sc0710_format_find_by_timing(dev->pixelLineH, dev->pixelLineV);
 		
-		/* Detect signal restoration (unlocked -> locked transition) */
-		if (!was_locked && dev->locked) {
-			printk(KERN_INFO "%s: HDMI signal restored, resynchronizing frames\n", dev->name);
+		/* Save last known format for placeholder rendering */
+		if (dev->fmt)
+			dev->last_fmt = dev->fmt;
+		
+		/* Detect signal restoration (unlocked -> locked transition) OR timing change */
+		if ((!was_locked && dev->locked) || timing_changed) {
+			printk(KERN_INFO "%s: HDMI signal %s, waiting for stabilization...\n",
+				dev->name, timing_changed ? "timing changed" : "restored");
 			mutex_unlock(&dev->signalMutex);
+			
+			/* Wait for HDMI signal to stabilize.
+			 * A 150ms delay gives the source time to fully establish the link.
+			 */
+			msleep(150);
+			
+			printk(KERN_INFO "%s: Resynchronizing DMA frames\n", dev->name);
 			sc0710_reset_dma_frame_sync(dev);
 			return 0; /* Success */
 		}
