@@ -362,6 +362,7 @@ struct sc0710_dev {
 	u32                        width, height;    /* Actual display */
 	u32                        interlaced;
 	const struct sc0710_format *fmt;
+	const struct sc0710_format *last_fmt;  /* Last active format for placeholders */
 	enum sc0710_colorimetry_e  colorimetry;
 	enum sc0710_colorspace_e   colorspace;
 
@@ -416,6 +417,7 @@ int sc0710_i2c_read_procamp(struct sc0710_dev *dev);
 /* -formats.c */
 void sc0710_format_initialize(void);
 const struct sc0710_format *sc0710_format_find_by_timing(u32 timingH, u32 timingV);
+const struct sc0710_format *sc0710_get_default_format(void);
 
 /* -dma-channel.c */
 int  sc0710_dma_channel_alloc(struct sc0710_dev *dev, u32 nr, enum sc0710_channel_dir_e direction, u32 baseaddr,
