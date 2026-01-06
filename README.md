@@ -7,14 +7,15 @@ An improved, modern Linux driver for the Elgato 4K60 Pro mk.2 capture card.
 
 ## Features
 
-This improved version brings significant stability and functionality updates over the original driver:
+This enhanced driver architecture delivers enterprise-grade stability and extended functionality over the reference implementation:
 
-*   **Modern Kernel Support**: It actually compiles! Fixed build issues for newer Linux kernels (tested on 6.18+).
-*   **Multi-Application Support**: The capture card can now be accessed by multiple applications simultaneously.
-*   **4k 60fps support**: It should work flawlessly if you have enough pcie bandwidth. If you don't then there will be artifacts.
-*   **Robust Hotplug Stability**: Can survive HDMI unplug and replug events without crashing the kernel (no more hard lockups!).
-*   **Correct Signal Restoration**: Fixes image alignment issues upon HDMI reconnection (no more "cut" or swapped frames).
-*   **Active Support**: If you encounter issues, please open a ticket!
+*   **Modern Kernel Compatibility**: Re-engineered codebase ensuring seamless compilation and operation on bleeding-edge Linux kernels (tested on 6.18+).
+*   **Fail-Safe Signal Generation**: Implements automatic SMPTE color bar generation during signal loss or physical disconnection. This maintains the V4L2 buffer stream, preventing consumer application capture failures or pipeline crashes.
+*   **Automated DKMS Lifecycle**: Fully integrated Dynamic Kernel Module Support (DKMS). The driver automatically recompiles and links against new kernel headers during system updates, ensuring persistent availability without manual intervention.
+*   **Concurrent Access Architecture**: Unlocks multi-client capabilities, allowing simultaneous stream acquisition by multiple applications.
+*   **High-Bandwidth Throughput**: Optimized Direct Memory Access (DMA) pathing for consistent 4K 60fps capture performance (subject to host PCIe bandwidth availability).
+*   **Resilient Hotplug Mechanism**: Hardened interrupt handling for HDMI hotplug events, eliminating kernel panics and hard lockups during physical cable reconnections.
+*   **Atomic Signal Restoration**: Corrected frame alignment and synchronization logic prevents image tearing or buffer desynchronization upon signal restoration.
 
 ## Installation
 
@@ -76,4 +77,4 @@ This project is built upon the incredible reverse engineering and initial develo
 
 Original repository: [stoth68000/sc0710](https://github.com/stoth68000/sc0710)
 
-Special thanks to them, as this driver would not exist without their foundational work.
+Special thanks to them, as this version of the driver would not exist without their foundational work.
