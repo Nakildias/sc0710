@@ -5,24 +5,16 @@ An improved, modern Linux driver for the Elgato 4K60 Pro mk.2 capture card.
 > [!NOTE]
 > This driver has been specifically tested and optimized for **Kernel 6.18.3-arch1-1**.
 
-# I will start reverse engineering asap to get 4k support.
-
 ## Features
 
 This improved version brings significant stability and functionality updates over the original driver:
 
 *   **Modern Kernel Support**: It actually compiles! Fixed build issues for newer Linux kernels (tested on 6.18+).
 *   **Multi-Application Support**: The capture card can now be accessed by multiple applications simultaneously.
+*   **4k 60fps support**: It should work flawlessly if you have enough pcie bandwidth. If you don't then there will be artifacts.
 *   **Robust Hotplug Stability**: Can survive HDMI unplug and replug events without crashing the kernel (no more hard lockups!).
 *   **Correct Signal Restoration**: Fixes image alignment issues upon HDMI reconnection (no more "cut" or swapped frames).
 *   **Active Support**: If you encounter issues, please open a ticket!
-
-### Known Limitations
-
-> [!CAUTION]
-> **4K capture is currently experimental and not fully working.** The driver detects 4K signals correctly and transfers the data, but the resulting image displays with visual artifacts (striping). This appears to be a hardware-level output format issue in the Elgato FPGA that requires further reverse-engineering.
->
-> **Workaround:** Set your source device to output 1080p, which works flawlessly.
 
 ## Installation
 
@@ -61,12 +53,20 @@ Type `make` and press Enter. You should see a lot of text scrolling by.
 ```bash
 make
 ```
-*If this fails, double-check that you installed the prerequisites above!*
+
+**If step 2 didn't work check if you have trhe prerequisites then reboot the system then try again**
 
 **Step 3: Load the driver**
 This command loads the driver into your kernel so you can use the card immediately.
 ```bash
 sudo insmod sc0710.ko
+```
+**If step 3 didn't work try this then try step 3 again**
+Those commands will load the potentially missing kernel modules for sc0710 to load properly.
+```bash
+sudo modprobe videodev
+sudo modprobe videobuf2-v4l2
+sudo modprobe videobuf2-vmalloc
 ```
 
 **Step 4: Verify it's working**
