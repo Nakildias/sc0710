@@ -198,6 +198,28 @@ static struct sc0710_format formats[] =
 	{ 4400, 2250, 3840, 2160, 0, 6000, 60000, 1000, 8, 0, "3840x2160p60",    V4L2_DV_BT_CEA_3840X2160P60 },
 };
 
+/* Default format for no-signal mode (1920x1080p60) */
+static struct sc0710_format default_no_signal_format = {
+	.timingH = 2200,
+	.timingV = 1125,
+	.width = 1920,
+	.height = 1080,
+	.interlaced = 0,
+	.fpsX100 = 6000,
+	.fpsnum = 60000,
+	.fpsden = 1000,
+	.depth = 8,
+	.framesize = 1920 * 2 * 1080,  /* YUV 4:2:2 */
+	.name = "No Signal (1920x1080)",
+	.dv_timings = V4L2_DV_BT_CEA_1920X1080P60,
+};
+
+/* Get the default format for no-signal mode */
+const struct sc0710_format *sc0710_get_default_format(void)
+{
+	return &default_no_signal_format;
+}
+
 void sc0710_format_initialize(void)
 {
 	struct sc0710_format *fmt;
@@ -356,16 +378,17 @@ static int vidioc_g_fmt_vid_cap(struct file *file, void *priv, struct v4l2_forma
 {
 	struct sc0710_dma_channel *ch = video_drvdata(file);
 	struct sc0710_dev *dev = ch->dev;
+	const struct sc0710_format *fmt;
 
-	if (dev->fmt == NULL)
-		return -EINVAL;
+	/* Use real format if available, otherwise use default */
+	fmt = dev->fmt ? dev->fmt : sc0710_get_default_format();
 
-	f->fmt.pix.width = dev->fmt->width;
-	f->fmt.pix.height = dev->fmt->height;
+	f->fmt.pix.width = fmt->width;
+	f->fmt.pix.height = fmt->height;
 	f->fmt.pix.pixelformat = V4L2_PIX_FMT_YUYV;
 	f->fmt.pix.field = V4L2_FIELD_NONE;
-	f->fmt.pix.bytesperline = dev->fmt->width * 2;
-	f->fmt.pix.sizeimage = dev->fmt->framesize;
+	f->fmt.pix.bytesperline = fmt->width * 2;
+	f->fmt.pix.sizeimage = fmt->framesize;
 	f->fmt.pix.colorspace = V4L2_COLORSPACE_SRGB;
 
 	return 0;
@@ -375,16 +398,17 @@ static int vidioc_try_fmt_vid_cap(struct file *file, void *priv, struct v4l2_for
 {
 	struct sc0710_dma_channel *ch = video_drvdata(file);
 	struct sc0710_dev *dev = ch->dev;
+	const struct sc0710_format *fmt;
 
-	if (dev->fmt == NULL)
-		return -EINVAL;
+	/* Use real format if available, otherwise use default */
+	fmt = dev->fmt ? dev->fmt : sc0710_get_default_format();
 
-	f->fmt.pix.width = dev->fmt->width;
-	f->fmt.pix.height = dev->fmt->height;
+	f->fmt.pix.width = fmt->width;
+	f->fmt.pix.height = fmt->height;
 	f->fmt.pix.pixelformat = V4L2_PIX_FMT_YUYV;
 	f->fmt.pix.field = V4L2_FIELD_NONE;
-	f->fmt.pix.bytesperline = dev->fmt->width * 2;
-	f->fmt.pix.sizeimage = dev->fmt->framesize;
+	f->fmt.pix.bytesperline = fmt->width * 2;
+	f->fmt.pix.sizeimage = fmt->framesize;
 	f->fmt.pix.colorspace = V4L2_COLORSPACE_SRGB;
 
 	return 0;
@@ -481,15 +505,16 @@ static int sc0710_queue_setup(struct vb2_queue *q,
 	struct sc0710_client *client = vb2_get_drv_priv(q);
 	struct sc0710_dma_channel *ch = client->fh->ch;
 	struct sc0710_dev *dev = ch->dev;
+	const struct sc0710_format *fmt;
 
-	if (dev->fmt == NULL)
-		return -EINVAL;
+	/* Use real format if available, otherwise use default */
+	fmt = dev->fmt ? dev->fmt : sc0710_get_default_format();
 
 	if (*num_buffers < 2)
 		*num_buffers = 2;
 
 	*num_planes = 1;
-	sizes[0] = dev->fmt->framesize;
+	sizes[0] = fmt->framesize;
 
 	dprintk(2, "%s() buffer count=%d, size=%d\n", __func__, *num_buffers, sizes[0]);
 
@@ -501,17 +526,18 @@ static int sc0710_buf_prepare(struct vb2_buffer *vb)
 	struct sc0710_client *client = vb2_get_drv_priv(vb->vb2_queue);
 	struct sc0710_dma_channel *ch = client->fh->ch;
 	struct sc0710_dev *dev = ch->dev;
+	const struct sc0710_format *fmt;
 
-	if (dev->fmt == NULL)
-		return -EINVAL;
+	/* Use real format if available, otherwise use default */
+	fmt = dev->fmt ? dev->fmt : sc0710_get_default_format();
 
-	if (vb2_plane_size(vb, 0) < dev->fmt->framesize) {
+	if (vb2_plane_size(vb, 0) < fmt->framesize) {
 		dprintk(0, "%s() buffer too small (%lu < %u)\n",
-			__func__, vb2_plane_size(vb, 0), dev->fmt->framesize);
+			__func__, vb2_plane_size(vb, 0), fmt->framesize);
 		return -EINVAL;
 	}
 
-	vb2_set_plane_payload(vb, 0, dev->fmt->framesize);
+	vb2_set_plane_payload(vb, 0, fmt->framesize);
 
 	return 0;
 }
@@ -537,31 +563,17 @@ static int sc0710_start_streaming(struct vb2_queue *q, unsigned int count)
 	int refcount;
 	int ret;
 
-	dprintk(1, "%s(ch#%d)\n", __func__, ch->nr);
-
-	/* Make sure we have a detected format for video. */
-	if (dev->fmt == NULL) {
-		struct sc0710_buffer *buf, *tmp;
-		unsigned long flags;
-
-		spin_lock_irqsave(&client->buffer_lock, flags);
-		list_for_each_entry_safe(buf, tmp, &client->buffer_list, list) {
-			list_del(&buf->list);
-			vb2_buffer_done(&buf->vb.vb2_buf, VB2_BUF_STATE_QUEUED);
-		}
-		spin_unlock_irqrestore(&client->buffer_lock, flags);
-		return -ENODATA;
-	}
+	dprintk(1, "%s(ch#%d)\\n", __func__, ch->nr);
 
 	/* Mark this client as streaming */
 	client->streaming = true;
 
 	/* Increment streaming reference count */
 	refcount = atomic_inc_return(&ch->streaming_refcount);
-	dprintk(1, "%s() streaming refcount now %d\n", __func__, refcount);
+	dprintk(1, "%s() streaming refcount now %d\\n", __func__, refcount);
 
-	/* Only start DMA if we're the first streaming client */
-	if (refcount == 1) {
+	/* Only start DMA if we're the first streaming client AND have signal */
+	if (refcount == 1 && dev->fmt != NULL) {
 		sc0710_dma_channels_resize(dev);
 
 		ret = sc0710_dma_channels_start(dev);
@@ -580,8 +592,11 @@ static int sc0710_start_streaming(struct vb2_queue *q, unsigned int count)
 			spin_unlock_irqrestore(&client->buffer_lock, flags);
 			return ret;
 		}
+	} else if (dev->fmt == NULL) {
+		dprintk(1, "%s() No signal - will deliver placeholder frames\\n", __func__);
 	}
 
+	/* Start timer for delivering frames (real or placeholder) */
 	mod_timer(&ch->timeout, jiffies + VBUF_TIMEOUT);
 
 	return 0;
@@ -907,34 +922,64 @@ static void sc0710_vid_timeout(struct timer_list *t)
 	struct sc0710_dma_channel *ch = container_of(t, struct sc0710_dma_channel, timeout);
 #endif
 	struct sc0710_dev *dev = ch->dev;
-	struct sc0710_buffer *buf;
-	unsigned long flags;
-	u8 *dst;
+	struct sc0710_client *client;
+	const struct sc0710_format *fmt;
+	unsigned long flags, buf_flags;
+	int any_streaming = 0;
 
-	dprintk(0, "%s(ch#%d)\n", __func__, ch->nr);
-
-	/* Return all of the buffers in error state, so the vbi/vid inode
-	 * can return from blocking.
+	/* Use last known format for placeholder, or default if never had signal.
+	 * This ensures colorbars fill the entire buffer (e.g., 4K buffers when
+	 * returning from 4K signal).
 	 */
-	spin_lock_irqsave(&ch->v4l2_capture_list_lock, flags);
-	while (!list_empty(&ch->v4l2_capture_list)) {
-		buf = list_first_entry(&ch->v4l2_capture_list, struct sc0710_buffer, list);
+	fmt = dev->last_fmt ? dev->last_fmt : sc0710_get_default_format();
+
+	/* If we have real signal, DMA is handling frame delivery, just reschedule */
+	if (dev->fmt != NULL && dev->locked) {
+		/* Re-set the buffer timeout for DMA monitoring */
+		if (atomic_read(&ch->streaming_refcount) > 0)
+			mod_timer(&ch->timeout, jiffies + VBUF_TIMEOUT);
+		return;
+	}
+
+	/* No signal - deliver placeholder frames to all streaming clients */
+	dprintk(0, "%s(ch#%d) - delivering placeholder frames\n", __func__, ch->nr);
+
+	spin_lock_irqsave(&ch->client_list_lock, flags);
+	list_for_each_entry(client, &ch->client_list, list) {
+		struct sc0710_buffer *buf;
+		u8 *dst;
+
+		if (!client->streaming)
+			continue;
+
+		any_streaming = 1;
+
+		spin_lock_irqsave(&client->buffer_lock, buf_flags);
+
+		/* Deliver one placeholder frame per timeout */
+		if (!list_empty(&client->buffer_list)) {
+			buf = list_first_entry(&client->buffer_list, struct sc0710_buffer, list);
 
 		dst = vb2_plane_vaddr(&buf->vb.vb2_buf, 0);
-		if (dst && dev->fmt) {
-			fill_frame(ch, dst, dev->fmt->width, dev->fmt->height, FILL_MODE_COLORBARS);
-			vb2_set_plane_payload(&buf->vb.vb2_buf, 0, dev->fmt->framesize);
+			if (dst) {
+				fill_frame(ch, dst, fmt->width, fmt->height, FILL_MODE_COLORBARS);
+				vb2_set_plane_payload(&buf->vb.vb2_buf, 0, fmt->framesize);
+			}
+
+			buf->vb.vb2_buf.timestamp = ktime_get_ns();
+			buf->vb.sequence = ch->frame_sequence;
+			list_del(&buf->list);
+			vb2_buffer_done(&buf->vb.vb2_buf, VB2_BUF_STATE_DONE);
 		}
 
-		buf->vb.vb2_buf.timestamp = ktime_get_ns();
-		buf->vb.sequence = ch->frame_sequence++;
-		list_del(&buf->list);
-		vb2_buffer_done(&buf->vb.vb2_buf, VB2_BUF_STATE_DONE);
+		spin_unlock_irqrestore(&client->buffer_lock, buf_flags);
 	}
-	spin_unlock_irqrestore(&ch->v4l2_capture_list_lock, flags);
+	ch->frame_sequence++;
+	spin_unlock_irqrestore(&ch->client_list_lock, flags);
 
-	/* re-set the buffer timeout */
-	mod_timer(&ch->timeout, jiffies + VBUF_TIMEOUT);
+	/* Re-set the buffer timeout if any clients are still streaming */
+	if (any_streaming)
+		mod_timer(&ch->timeout, jiffies + VBUF_TIMEOUT);
 }
 
 void sc0710_video_unregister(struct sc0710_dma_channel *ch)
