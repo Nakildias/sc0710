@@ -196,8 +196,9 @@ static int __sc0710_i2c_writeread(struct sc0710_dev *dev, u8 devaddr8bit, u8 *wb
 		cnt++;
 	}
 	v = sc_read(dev, 0, BAR0_3104);
-	if (v != 0xc8) {
-		printk("3104 %08x --- c8?\n", sc_read(dev, 0, BAR0_3104));
+	/* Accept both 0xc8 and 0xcc as valid completion status */
+	if (v != 0xc8 && v != 0xcc) {
+		printk("3104 %08x --- c8/cc?\n", sc_read(dev, 0, BAR0_3104));
 		printk("  ac %08x --- 0?\n", sc_read(dev, 0, BAR0_00AC));
 		return -1;
 	}
@@ -419,6 +420,12 @@ int sc0710_i2c_read_hdmi_status(struct sc0710_dev *dev)
 			dev->height *= 2;
 
 		dev->fmt = sc0710_format_find_by_timing(dev->pixelLineH, dev->pixelLineV);
+		
+		/* Debug: show timing when format not found */
+		if (!dev->fmt) {
+			printk(KERN_INFO "%s: Unknown timing %dx%d (add to formats table)\n",
+				dev->name, dev->pixelLineH, dev->pixelLineV);
+		}
 		
 		/* Save last known format for placeholder rendering */
 		if (dev->fmt)
