@@ -6,8 +6,9 @@ An improved, modern Linux driver for the Elgato 4K60 Pro mk.2 capture card.
 > **Kernel Compatibility Verification**
 >
 > This driver has been rigorously tested and validated for stability on the following kernels:
-> *   **Arch Linux**: Kernel `6.18.3-arch1-1`
-> *   **Fedora Workstation**: Kernel `6.17.12-300.fc43.x86_64`
+> * **Arch Linux**: Kernel `6.18.3-arch1-1` — Works perfectly with standard configuration.
+> * **Fedora**: Kernel `6.17.12-300.fc43.x86_64` — Works perfectly with standard configuration.
+> * **Debian**: Kernel `6.12.57+deb13-amd64` — **Note:** The OBS version from `dnf`/repositories is currently broken and crashes when accessing the capture card. Debian users **must** use the **Flatpak** version of OBS for stable operation.
 
 ## Features
 
