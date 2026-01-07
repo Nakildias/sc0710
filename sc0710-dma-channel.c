@@ -456,11 +456,7 @@ int sc0710_dma_channel_alloc(struct sc0710_dev *dev, u32 nr, enum sc0710_channel
 	/* allocate the descriptor table, its contigious. */
 	ch->pt_size = PAGE_SIZE * 2;
 
-    #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 18, 0)
-    ch->pt_cpu = dma_alloc_coherent(&((struct pci_dev *)dev->pci)->dev, ch->pt_size, &ch->pt_dma, GFP_ATOMIC);
-    #else
-    ch->pt_cpu = pci_alloc_consistent(dev->pci, ch->pt_size, &ch->pt_dma);
-    #endif
+	ch->pt_cpu = dma_alloc_coherent(&dev->pci->dev, ch->pt_size, &ch->pt_dma, GFP_ATOMIC);
 	if (ch->pt_cpu == 0)
 		return -1;
 
@@ -570,11 +566,7 @@ int sc0710_dma_channel_resize(struct sc0710_dev *dev, u32 nr, enum sc0710_channe
 	/* allocate the descriptor table, its contigious. */
 	ch->pt_size = PAGE_SIZE * 2;
 
-    #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 18, 0)
-    ch->pt_cpu = dma_alloc_coherent(&((struct pci_dev *)dev->pci)->dev, ch->pt_size, &ch->pt_dma, GFP_ATOMIC);
-    #else
-    ch->pt_cpu = pci_alloc_consistent(dev->pci, ch->pt_size, &ch->pt_dma);
-    #endif
+	ch->pt_cpu = dma_alloc_coherent(&dev->pci->dev, ch->pt_size, &ch->pt_dma, GFP_ATOMIC);
 	if (ch->pt_cpu == 0)
 		return -1;
 
