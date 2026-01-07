@@ -715,9 +715,15 @@ static int sc0710_video_open(struct file *file)
 	mutex_unlock(&ch->lock);
 
 	v4l2_fh_init(&fh->fh, vdev);
-	v4l2_fh_add(&fh->fh);
-
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6,18,0)
+	/* New API: v4l2_fh_add() sets file->private_data automatically */
+	v4l2_fh_add(&fh->fh, file);
+	/* But we use our own fh struct, so override private_data */
 	file->private_data = fh;
+#else
+	v4l2_fh_add(&fh->fh);
+	file->private_data = fh;
+#endif
 
 	dprintk(0, "%s() new client opened, videousers=%d\n", __func__, ch->videousers);
 
@@ -758,7 +764,11 @@ static int sc0710_video_release(struct file *file)
 	dprintk(0, "%s() videousers=%d\n", __func__, ch->videousers);
 	mutex_unlock(&ch->lock);
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6,18,0)
+	v4l2_fh_del(&fh->fh, file);
+#else
 	v4l2_fh_del(&fh->fh);
+#endif
 	v4l2_fh_exit(&fh->fh);
 
 	file->private_data = NULL;
