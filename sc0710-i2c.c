@@ -29,7 +29,7 @@
 #define I2C_DEV__ARM_MCU (0x32 << 1)
 #define I2C_DEV__UNKNOWN (0x33 << 1)
 
-#if 0
+#if 1 /* Enable I2C write for tone mapping control */
 static int didack(struct sc0710_dev *dev)
 {
 	u32 v;
@@ -72,7 +72,7 @@ static u8 busread(struct sc0710_dev *dev)
 	return v;
 }
 
-#if 0
+#if 1 /* Enable I2C write for MCU commands */
 /* Assumes 8 bit device address and 8 bit sub address. */
 static int sc0710_i2c_write(struct sc0710_dev *dev, u8 devaddr8bit, u8 *wbuf, int wlen)
 {
@@ -100,6 +100,25 @@ static int sc0710_i2c_write(struct sc0710_dev *dev, u8 devaddr8bit, u8 *wbuf, in
 	return 0; /* Success */
 }
 #endif
+
+/* Public I2C write function */
+int sc0710_i2c_write_mcu(struct sc0710_dev *dev, u8 subaddr, u8 *data, int len)
+{
+	u8 wbuf[16];
+	int ret;
+
+	if (len > 15)
+		return -EINVAL;
+
+	wbuf[0] = subaddr;
+	memcpy(&wbuf[1], data, len);
+
+	mutex_lock(&dev->signalMutex);
+	ret = sc0710_i2c_write(dev, I2C_DEV__ARM_MCU, wbuf, len + 1);
+	mutex_unlock(&dev->signalMutex);
+
+	return ret;
+}
 
 static int __sc0710_i2c_writeread(struct sc0710_dev *dev, u8 devaddr8bit, u8 *wbuf, int wlen, u8 *rbuf, int rlen)
 {
@@ -330,7 +349,7 @@ int sc0710_i2c_read_hdmi_status(struct sc0710_dev *dev)
 		printk("%s ret = %d\n", __func__, ret);
 		return -1;
 	}
-#if 0
+#if 0 /* Debug: Disabled - multiple printk calls don't combine on modern kernels */
 	printk("%s    hdmi: ", dev->name);
 	for (i = 0; i < sizeof(rbuf); i++)
 		printk("%02x ", rbuf[i]);
@@ -369,6 +388,12 @@ int sc0710_i2c_read_hdmi_status(struct sc0710_dev *dev)
 		default:
 			dev->colorspace = CS_UNDEFINED;
 		}
+
+		/* Default EOTF to SDR - safer than assuming HDR.
+		 * TODO: Parse actual EOTF from HDR DR InfoFrame if available.
+		 * HDR DR InfoFrame EOTF field: 0=SDR, 2=SMPTE 2084/PQ, 3=HLG
+		 */
+		dev->eotf = EOTF_SDR;
 
 		/* Save old timings to detect changes */
 		new_pixelLineV = rbuf[0x05] << 8 | rbuf[0x04];
@@ -424,6 +449,7 @@ int sc0710_i2c_read_hdmi_status(struct sc0710_dev *dev)
 		dev->interlaced = 0;
 		dev->colorimetry = BT_UNDEFINED;
 		dev->colorspace = CS_UNDEFINED;
+		dev->eotf = EOTF_SDR;
 	}
 
 	mutex_unlock(&dev->signalMutex);

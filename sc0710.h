@@ -280,6 +280,15 @@ struct sc0710_i2c {
 	u32                        i2c_rc;
 };
 
+/* HDMI EOTF (Electro-Optical Transfer Function) from HDR InfoFrame */
+enum sc0710_eotf_e
+{
+	EOTF_SDR = 0,        /* Traditional SDR gamma (~2.4) */
+	EOTF_HDR_PQ = 1,     /* HDR10 / SMPTE ST 2084 */
+	EOTF_HDR_HLG = 2,    /* Hybrid Log-Gamma */
+	EOTF_UNKNOWN = 255,
+};
+
 enum sc0710_colorimetry_e
 {
 	BT_UNDEFINED = 0,
@@ -365,6 +374,7 @@ struct sc0710_dev {
 	const struct sc0710_format *last_fmt;  /* Last active format for placeholders */
 	enum sc0710_colorimetry_e  colorimetry;
 	enum sc0710_colorspace_e   colorspace;
+	enum sc0710_eotf_e         eotf;       /* Detected/forced EOTF for HDR */
 
 	/* Procamp */
 	s32                        brightness;
@@ -413,6 +423,7 @@ int sc0710_i2c_read_hdmi_status(struct sc0710_dev *dev);
 int sc0710_i2c_read_status2(struct sc0710_dev *dev);
 int sc0710_i2c_read_status3(struct sc0710_dev *dev);
 int sc0710_i2c_read_procamp(struct sc0710_dev *dev);
+int sc0710_i2c_write_mcu(struct sc0710_dev *dev, u8 subaddr, u8 *data, int len);
 
 /* -formats.c */
 void sc0710_format_initialize(void);

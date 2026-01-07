@@ -26,6 +26,20 @@
 
 static int video_debug = 1;
 
+/* Module parameter to override EOTF detection
+ * 0 = auto-detect (default), 1 = force SDR, 2 = force HDR/PQ, 3 = force HLG
+ */
+static int force_eotf = 0;
+module_param(force_eotf, int, 0644);
+MODULE_PARM_DESC(force_eotf, "Force EOTF: 0=auto, 1=SDR, 2=HDR-PQ, 3=HLG");
+
+/* Module parameter to override quantization range
+ * 0 = auto (default), 1 = force limited range (16-235), 2 = force full range (0-255)
+ */
+static int force_quantization = 0;
+module_param(force_quantization, int, 0644);
+MODULE_PARM_DESC(force_quantization, "Force quantization: 0=auto, 1=limited, 2=full");
+
 #define dprintk(level, fmt, arg...)\
         do { if (video_debug >= level)\
                 printk(KERN_DEBUG "%s: " fmt, dev->name, ## arg);\
@@ -69,14 +83,30 @@ static enum v4l2_colorspace sc0710_get_v4l2_colorspace(struct sc0710_dev *dev)
 }
 
 /* Map detected colorimetry to V4L2 transfer function.
- * BT.2020 with HDR typically uses PQ (SMPTE 2084) or HLG.
- * We default to PQ for HDR10 compatibility when BT.2020 is detected.
+ * BT.2020 can be SDR (gamma ~2.4), HDR10 (PQ/SMPTE 2084), or HLG.
+ * Use detected EOTF from InfoFrame, or allow manual override via force_eotf.
  */
 static enum v4l2_xfer_func sc0710_get_v4l2_xfer_func(struct sc0710_dev *dev)
 {
-	if (dev->colorimetry == BT_2020)
-		return V4L2_XFER_FUNC_SMPTE2084;  /* PQ for HDR10 */
-	return V4L2_XFER_FUNC_DEFAULT;
+	/* Allow manual override via module parameter */
+	switch (force_eotf) {
+	case 1: return V4L2_XFER_FUNC_DEFAULT;     /* Force SDR */
+	case 2: return V4L2_XFER_FUNC_SMPTE2084;   /* Force HDR-PQ */
+	case 3: return V4L2_XFER_FUNC_SMPTE2084;   /* HLG (V4L2 lacks specific HLG) */
+	}
+
+	/* Auto-detection based on detected EOTF from HDMI InfoFrame */
+	switch (dev->eotf) {
+	case EOTF_HDR_PQ:
+		return V4L2_XFER_FUNC_SMPTE2084;
+	case EOTF_HDR_HLG:
+		return V4L2_XFER_FUNC_SMPTE2084;  /* Closest V4L2 approximation */
+	case EOTF_SDR:
+	case EOTF_UNKNOWN:
+	default:
+		/* SDR: use default gamma (~2.2/2.4) */
+		return V4L2_XFER_FUNC_DEFAULT;
+	}
 }
 
 /* Map detected colorimetry to V4L2 Y'CbCr encoding */
@@ -90,9 +120,19 @@ static enum v4l2_ycbcr_encoding sc0710_get_v4l2_ycbcr_enc(struct sc0710_dev *dev
 	}
 }
 
-/* Get quantization range - BT.2020 uses limited range by default */
+/* Get quantization range
+ * Limited range (16-235) vs Full range (0-255) can cause washed-out appearance
+ * if mismatched between source and sink.
+ */
 static enum v4l2_quantization sc0710_get_v4l2_quantization(struct sc0710_dev *dev)
 {
+	/* Allow manual override via module parameter */
+	switch (force_quantization) {
+	case 1: return V4L2_QUANTIZATION_LIM_RANGE;  /* Force limited (16-235) */
+	case 2: return V4L2_QUANTIZATION_FULL_RANGE; /* Force full (0-255) */
+	}
+
+	/* Auto: BT.2020 typically uses limited range, sRGB uses full */
 	if (dev->colorimetry == BT_2020)
 		return V4L2_QUANTIZATION_LIM_RANGE;
 	return V4L2_QUANTIZATION_DEFAULT;

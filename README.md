@@ -84,6 +84,34 @@ The driver is engineered for seamless integration with modern streaming and play
 > [!TIP]
 > **Multi-Client Power**: Because of the re-engineered architecture, you can keep OBS open while simultaneously sharing your capture card on Discord.
 
+## Roadmap
+
+Features planned or under investigation for future releases:
+
+### High Priority
+- [ ] **HDR to SDR Tonemapping Control** — Toggle the card's built-in hardware tonemapping via module parameter
+- [ ] **P010 (10-bit) Pixel Format** — Enable proper HDR capture for applications that support it
+- [ ] **EDID Mode Switching** — Support for 4k60 Pro, Passthrough, and Merged EDID modes
+
+### Medium Priority
+- [ ] **XRGB 4:4:4 Pixel Format** — Full chroma capture for PC/desktop sources
+- [ ] **REC.601 Colorspace** — Proper colorimetry reporting for standard definition devices
+- [ ] **High Refresh Rates** — 1080p @ 240Hz, 1440p @ 144Hz support
+
+### Completed
+- [x] Multi-client streaming support
+- [x] 4K60 and 1080p120 capture
+- [x] Signal loss recovery with color bars
+- [x] DKMS integration
+- [x] Hotplug stability fixes
+
+> [!CAUTION]
+> **Reverse Engineering Required**
+> 
+> Features like EDID mode switching and HDR tonemapping control require additional reverse engineering of the card's ARM MCU communication protocol. The Windows driver sends specific I2C commands to configure these settings, but the exact register addresses and command sequences are currently unknown.
+> 
+> If you have experience with logic analyzers, I2C sniffing, or have captured register writes from the Windows Elgato 4K Capture Utility, contributions would be greatly appreciated!
+
 ## Credits
 This project is built upon the incredible reverse engineering and initial development work of:
 *   **@stoth68000** (Steven Toth)
