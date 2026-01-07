@@ -255,17 +255,29 @@ AUTOINSTALL="yes"
 MAKE[0]="make KVERSION=\$kernelver"
 EOF
 
-    # Clean old DKMS
+    # Check for existing DKMS installation (any version)
     if dkms status | grep -q "$DRV_NAME"; then
-        dkms remove -m "$DRV_NAME" -v "$DRV_VERSION" --all >/dev/null 2>&1 || true
+        warning "DKMS already has $DRV_NAME installed."
+        if confirm "Remove existing and reinstall?" "Y"; then
+            msg2 "Removing all existing DKMS versions..."
+            # Remove all versions found
+            for ver in $(dkms status | grep "$DRV_NAME" | sed 's/.*\/\([^,]*\),.*/\1/'); do
+                dkms remove -m "$DRV_NAME" -v "$ver" --all >/dev/null 2>&1 || true
+            done
+        else
+            msg2 "Skipping DKMS rebuild. Keeping existing installation."
+            USE_DKMS=false
+        fi
     fi
 
-    msg2 "Building and Installing via DKMS..."
-    dkms add -m "$DRV_NAME" -v "$DRV_VERSION" >/dev/null
-    if ! dkms build -m "$DRV_NAME" -v "$DRV_VERSION" >/dev/null; then
-        die "DKMS Build failed. Check make.log."
+    if [ "$USE_DKMS" = true ]; then
+        msg2 "Building and Installing via DKMS..."
+        dkms add -m "$DRV_NAME" -v "$DRV_VERSION" >/dev/null
+        if ! dkms build -m "$DRV_NAME" -v "$DRV_VERSION" >/dev/null; then
+            die "DKMS Build failed. Check make.log."
+        fi
+        dkms install -m "$DRV_NAME" -v "$DRV_VERSION" --force >/dev/null
     fi
-    dkms install -m "$DRV_NAME" -v "$DRV_VERSION" --force >/dev/null
 
 else
     # --- MANUAL PATH ---
@@ -353,39 +365,8 @@ case "\$1" in
         ;;
     update)
         echo "Checking for updates..."
-        # 1. Clear old DKMS build
-        dkms remove -m $DRV_NAME -v $DRV_VERSION --all >/dev/null 2>&1 || true
-
-        # 2. Pull fresh source
-        echo "Downloading latest source from GitHub..."
-        TEMP=\$(mktemp -d)
-        if git clone --depth 1 $REPO_URL "\$TEMP"; then
-            rm -rf "$SRC_DEST"/*
-            cp -r "\$TEMP"/* "$SRC_DEST/"
-            rm -rf "\$TEMP"
-
-            # 3. RE-GENERATE DKMS.CONF (The missing piece)
-            cat > "$SRC_DEST/dkms.conf" <<EOD
-PACKAGE_NAME="$DRV_NAME"
-PACKAGE_VERSION="$DRV_VERSION"
-BUILT_MODULE_NAME[0]="$DRV_NAME"
-DEST_MODULE_LOCATION[0]="/kernel/drivers/media/pci/"
-AUTOINSTALL="yes"
-MAKE[0]="make KVERSION=\\\$kernelver"
-EOD
-
-            # 4. Rebuild
-            echo "Rebuilding and installing driver..."
-            if dkms install -m $DRV_NAME -v $DRV_VERSION --force; then
-                \$0 restart
-                echo -e "\${GREEN}[SUCCESS] Update complete.\${NC}"
-            else
-                echo -e "\${RED}[ERROR] DKMS build failed.\${NC}"
-            fi
-        else
-            echo -e "\${RED}[ERROR] Download failed. Update aborted.\${NC}"
-            rm -rf "\$TEMP"
-        fi
+        echo "Re-running installer from GitHub..."
+        exec bash -c "\$(curl -fsSL https://raw.githubusercontent.com/Nakildias/sc0710/main/install-sc0710.sh)"
         ;;
     remove)
         echo "Uninstalling driver and utility..."
