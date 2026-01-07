@@ -1,6 +1,10 @@
-# Elgato 4K60 Pro mk.2 Linux Driver
+# Elgato 4K60 Pro MK.2 Linux Driver
+[![Kernel Compatibility](https://img.shields.io/badge/Kernel-6.12%20--%206.18%2B-blueviolet)](https://github.com/Nakildias/sc0710)
+[![License: GPL v2](https://img.shields.io/badge/License-GPL%20v2-blue.svg)](https://github.com/Nakildias/sc0710/blob/main/LICENSE)
+[![Status](https://img.shields.io/badge/Status-Maintained-success)](#)
 
-An improved, modern Linux driver for the Elgato 4K60 Pro mk.2 capture card.
+A high-performance, multi-client Linux driver for the Elgato 4K60 Pro mk.2. 
+This project is a modern reimagining of the original driver, engineered for stability on current kernels.
 
 > [!IMPORTANT]
 > **Kernel Compatibility Verification**
@@ -14,7 +18,7 @@ An improved, modern Linux driver for the Elgato 4K60 Pro mk.2 capture card.
 
 This enhanced driver architecture delivers enterprise-grade stability and extended functionality over the reference implementation:
 
-*   **Modern Kernel Compatibility**: Re-engineered codebase ensuring seamless compilation and operation on bleeding-edge Linux kernels (tested on 6.18+).
+*   **Modern Kernel Compatibility**: Re-engineered codebase ensuring seamless compilation and operation on bleeding-edge Linux kernels.
 *   **Fail-Safe Signal Generation**: Implements automatic SMPTE color bar generation during signal loss or physical disconnection. This maintains the V4L2 buffer stream, preventing consumer application capture failures or pipeline crashes.
 *   **Automated DKMS Lifecycle**: Fully integrated Dynamic Kernel Module Support (DKMS). The driver automatically recompiles and links against new kernel headers during system updates, ensuring persistent availability without manual intervention.
 *   **Concurrent Access Architecture**: Unlocks multi-client capabilities, allowing simultaneous stream acquisition by multiple applications.
@@ -22,58 +26,63 @@ This enhanced driver architecture delivers enterprise-grade stability and extend
 *   **Resilient Hotplug Mechanism**: Hardened interrupt handling for HDMI hotplug events, eliminating kernel panics and hard lockups during physical cable reconnections.
 *   **Atomic Signal Restoration**: Corrected frame alignment and synchronization logic prevents image tearing or buffer desynchronization upon signal restoration.
 
-## Installation
+# Installation
 
-### Method 1: One-Line Installation (Recommended)
-This command will download and run the installation script. It handles dependencies and driver installation automatically.
+## Quick Install (Recommended)
+This command automatically handles dependencies, compiles the driver, and installs it for you.
 
 ```bash
 sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/Nakildias/sc0710/main/install-sc0710.sh)"
 ```
 
-### Method 2: Manual Installation via Script
-If you prefer to inspect the code first:
+---
 
-1.  **Clone the repository:**
-    ```bash
-    git clone https://github.com/Nakildias/sc0710.git
-    cd sc0710
-    ```
+## Help & Advanced Usage
 
-2.  **Run the installer:**
-    ```bash
-    chmod +x install-sc0710.sh
-    sudo ./install-sc0710.sh
-    ```
+### Dependencies
+If you need to compile manually, ensure you have the necessary kernel headers and build tools installed for your distribution:
 
-### Method 3: Manual Compilation (Advanced)
-Only use this if you cannot use the script for some reason.
+| Distro | Dependencies Command |
+|--------|---------------------|
+| **Arch** | `sudo pacman -S base-devel linux-headers git` |
+| **Debian** | `sudo apt install build-essential linux-headers-$(uname -r) git` |
+| **Fedora** | `sudo dnf install kernel-devel kernel-headers gcc make git` |
 
-1.  **Install Prerequisites:**
-    *   **Arch/Manjaro:** `sudo pacman -S base-devel linux-headers git`
-    *   **Debian/Ubuntu:** `sudo apt install build-essential linux-headers-$(uname -r) git`
-    *   **Fedora:** `sudo dnf install kernel-devel kernel-headers gcc make git`
+### Manual Compilation
+To compile the driver from source:
 
-2.  **Compile:**
-    ```bash
-    make
-    ```
+```bash
+git clone https://github.com/Nakildias/sc0710 && cd ./sc0710 && make
+```
 
-3.  **Load:**
-    ```bash
-    sudo insmod sc0710.ko
-    ```
-    *Note: You may need to manually load dependencies like `videodev`, `videobuf2-v4l2`, `videobuf2-vmalloc` first.*
+### Driver Management
+Commands to manually load or unload the kernel module:
 
-4.  **Install (Permanent):**
-    Copy `sc0710.ko` to `/lib/modules/$(uname -r)/kernel/drivers/media/pci/` and run `sudo depmod -a`.
+**Load Driver:**
+```bash
+sudo insmod sc0710.ko
+```
+*(Note: If you have issues, you may need to manually load dependencies like `videodev` first.)*
+
+**Unload Driver:**
+```bash
+sudo rmmod sc0710
+```
 
 ## Usage
-Once loaded, the device will appear as a standard V4L2 device (e.g., `/dev/video0`). You can use it with any compatible software such as:
-*   OBS Studio
-*   FFmpeg
-*   VLC
-*   Discord
+
+Once the driver is loaded, the card will be recognized as **Elgato 4k60 Pro mk.2** (typically `/dev/video0`). 
+
+### Compatible Software
+The driver is engineered for seamless integration with modern streaming and playback tools:
+
+* **OBS Studio**: Full 4K60 support with multi-client capabilities.
+* **FFmpeg**: Optimized for high-bandwidth raw video acquisition.
+* **VLC Media Player**: Low-latency hardware preview.
+* **Discord**: Native camera support for high-quality screen sharing.
+
+> [!TIP]
+> **Multi-Client Power**: Because of the re-engineered architecture, you can keep OBS open while simultaneously sharing your capture card on Discord.
 
 ## Credits
 This project is built upon the incredible reverse engineering and initial development work of:
