@@ -256,7 +256,9 @@ MAKE[0]="make KVERSION=\$kernelver"
 EOF
 
     # Check for existing DKMS installation (any version)
-    if dkms status | grep -q "$DRV_NAME"; then
+    msg2 "Checking for existing DKMS installation..."
+    DKMS_STATUS=$(dkms status 2>/dev/null || true)
+    if echo "$DKMS_STATUS" | grep -q "$DRV_NAME"; then
         warning "DKMS already has $DRV_NAME installed."
         if confirm "Remove existing and reinstall?" "Y"; then
             msg2 "Removing all existing DKMS versions..."
