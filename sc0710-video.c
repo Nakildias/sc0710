@@ -57,6 +57,47 @@ const char *sc0710_colorspace_ascii(enum sc0710_colorspace_e val)
 	}
 }
 
+/* Map detected colorimetry to V4L2 colorspace */
+static enum v4l2_colorspace sc0710_get_v4l2_colorspace(struct sc0710_dev *dev)
+{
+	switch (dev->colorimetry) {
+	case BT_601:  return V4L2_COLORSPACE_SMPTE170M;
+	case BT_709:  return V4L2_COLORSPACE_REC709;
+	case BT_2020: return V4L2_COLORSPACE_BT2020;
+	default:      return V4L2_COLORSPACE_SRGB;
+	}
+}
+
+/* Map detected colorimetry to V4L2 transfer function.
+ * BT.2020 with HDR typically uses PQ (SMPTE 2084) or HLG.
+ * We default to PQ for HDR10 compatibility when BT.2020 is detected.
+ */
+static enum v4l2_xfer_func sc0710_get_v4l2_xfer_func(struct sc0710_dev *dev)
+{
+	if (dev->colorimetry == BT_2020)
+		return V4L2_XFER_FUNC_SMPTE2084;  /* PQ for HDR10 */
+	return V4L2_XFER_FUNC_DEFAULT;
+}
+
+/* Map detected colorimetry to V4L2 Y'CbCr encoding */
+static enum v4l2_ycbcr_encoding sc0710_get_v4l2_ycbcr_enc(struct sc0710_dev *dev)
+{
+	switch (dev->colorimetry) {
+	case BT_2020: return V4L2_YCBCR_ENC_BT2020;
+	case BT_709:  return V4L2_YCBCR_ENC_709;
+	case BT_601:  return V4L2_YCBCR_ENC_601;
+	default:      return V4L2_YCBCR_ENC_DEFAULT;
+	}
+}
+
+/* Get quantization range - BT.2020 uses limited range by default */
+static enum v4l2_quantization sc0710_get_v4l2_quantization(struct sc0710_dev *dev)
+{
+	if (dev->colorimetry == BT_2020)
+		return V4L2_QUANTIZATION_LIM_RANGE;
+	return V4L2_QUANTIZATION_DEFAULT;
+}
+
 #define FILL_MODE_COLORBARS 0
 #define FILL_MODE_GREENSCREEN 1
 #define FILL_MODE_BLUESCREEN 2
@@ -195,6 +236,7 @@ static struct sc0710_format formats[] =
 	{ 2640, 1125, 1920, 1080, 0, 5000, 50000, 1000, 8, 0, "1920x1080p50",    V4L2_DV_BT_CEA_1920X1080P50 },
 	{ 2200, 1125, 1920, 1080, 0, 6000, 60000, 1000, 8, 0, "1920x1080p60",    V4L2_DV_BT_CEA_1920X1080P60 },
 
+	{ 4400, 2250, 3840, 2160, 0, 5994, 60000, 1001, 8, 0, "3840x2160p59.94", V4L2_DV_BT_CEA_3840X2160P60 },
 	{ 4400, 2250, 3840, 2160, 0, 6000, 60000, 1000, 8, 0, "3840x2160p60",    V4L2_DV_BT_CEA_3840X2160P60 },
 };
 
@@ -389,7 +431,10 @@ static int vidioc_g_fmt_vid_cap(struct file *file, void *priv, struct v4l2_forma
 	f->fmt.pix.field = V4L2_FIELD_NONE;
 	f->fmt.pix.bytesperline = fmt->width * 2;
 	f->fmt.pix.sizeimage = fmt->framesize;
-	f->fmt.pix.colorspace = V4L2_COLORSPACE_SRGB;
+	f->fmt.pix.colorspace = sc0710_get_v4l2_colorspace(dev);
+	f->fmt.pix.xfer_func = sc0710_get_v4l2_xfer_func(dev);
+	f->fmt.pix.ycbcr_enc = sc0710_get_v4l2_ycbcr_enc(dev);
+	f->fmt.pix.quantization = sc0710_get_v4l2_quantization(dev);
 
 	return 0;
 }
@@ -409,7 +454,10 @@ static int vidioc_try_fmt_vid_cap(struct file *file, void *priv, struct v4l2_for
 	f->fmt.pix.field = V4L2_FIELD_NONE;
 	f->fmt.pix.bytesperline = fmt->width * 2;
 	f->fmt.pix.sizeimage = fmt->framesize;
-	f->fmt.pix.colorspace = V4L2_COLORSPACE_SRGB;
+	f->fmt.pix.colorspace = sc0710_get_v4l2_colorspace(dev);
+	f->fmt.pix.xfer_func = sc0710_get_v4l2_xfer_func(dev);
+	f->fmt.pix.ycbcr_enc = sc0710_get_v4l2_ycbcr_enc(dev);
+	f->fmt.pix.quantization = sc0710_get_v4l2_quantization(dev);
 
 	return 0;
 }
