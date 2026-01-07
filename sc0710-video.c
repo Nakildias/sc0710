@@ -715,7 +715,7 @@ static int sc0710_video_open(struct file *file)
 	mutex_unlock(&ch->lock);
 
 	v4l2_fh_init(&fh->fh, vdev);
-	v4l2_fh_add(&fh->fh, file);
+	v4l2_fh_add(&fh->fh);
 
 	file->private_data = fh;
 
@@ -758,7 +758,7 @@ static int sc0710_video_release(struct file *file)
 	dprintk(0, "%s() videousers=%d\n", __func__, ch->videousers);
 	mutex_unlock(&ch->lock);
 
-	v4l2_fh_del(&fh->fh, file);
+	v4l2_fh_del(&fh->fh);
 	v4l2_fh_exit(&fh->fh);
 
 	file->private_data = NULL;
