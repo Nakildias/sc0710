@@ -51,11 +51,7 @@ void sc0710_dma_chains_free(struct sc0710_dma_channel *ch)
 	int i;
 
 	/* Free up the SG table */
-    #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 18, 0)
-    dma_free_coherent(&((struct pci_dev *)ch->dev->pci)->dev, ch->pt_size, ch->pt_cpu, ch->pt_dma);
-    #else
-    pci_free_consistent(ch->dev->pci, ch->pt_size, ch->pt_cpu, ch->pt_dma);
-    #endif
+	dma_free_coherent(&ch->dev->pci->dev, ch->pt_size, ch->pt_cpu, ch->pt_dma);
 
 	for (i = 0; i < ch->numDescriptorChains; i++) {
 		sc0710_dma_chain_free(ch, i);
