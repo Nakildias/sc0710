@@ -2,8 +2,12 @@
 
 An improved, modern Linux driver for the Elgato 4K60 Pro mk.2 capture card.
 
-> [!NOTE]
-> This driver has been specifically tested and optimized for **Kernel 6.18.3-arch1-1**.
+> [!IMPORTANT]
+> **Kernel Compatibility Verification**
+>
+> This driver has been rigorously tested and validated for stability on the following kernels:
+> *   **Arch Linux**: Kernel `6.18.3-arch1-1`
+> *   **Fedora Workstation**: Kernel `6.17.12-300.fc43.x86_64`
 
 ## Features
 
