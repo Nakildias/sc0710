@@ -142,8 +142,6 @@ msg "Initializing SC0710 Driver Installer..."
 # 1. Dependency Check
 msg2 "Checking system dependencies..."
 
-check_kernel_consistency
-
 # 1. Detect Package Manager Strategy
 PKG_MANAGER=""
 OS_ID=""
@@ -189,6 +187,8 @@ case "$PKG_MANAGER" in
         warning "Could not detect a supported package manager (apt/pacman/dnf). Assuming dependencies are met."
         ;;
 esac
+
+check_kernel_consistency
 
 # 2. Existing Driver Check & Smart Unload
 if lsmod | grep -q "$DRV_NAME"; then
