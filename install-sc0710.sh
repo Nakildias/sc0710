@@ -15,6 +15,9 @@ if [[ $EUID -ne 0 ]]; then
     fi
 fi
 
+# --- Ensure sbin paths are in PATH (Debian root fix) ---
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
+
 # --- Safety & Strict Mode ---
 set -euo pipefail
 IFS=$'\n\t'
