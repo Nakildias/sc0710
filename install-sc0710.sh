@@ -275,6 +275,17 @@ case "$PKG_MANAGER" in
     dnf)
         # RedHat / Dnf based
         msg2 "Installing dependencies (dnf)..."
+        
+        # Fedora splits kernel modules into separate packages
+        # Ensure the full kernel-modules package is installed (not just -core)
+        KERNEL_MODULES_PKG="kernel-modules-$(uname -r)"
+        if ! rpm -q "$KERNEL_MODULES_PKG" >/dev/null 2>&1; then
+            msg2 "Installing missing kernel modules package..."
+            if ! dnf install -y "$KERNEL_MODULES_PKG" 2>&1 | tee -a "$LOG_FILE"; then
+                warning "Could not install $KERNEL_MODULES_PKG - some features may not work"
+            fi
+        fi
+        
         if ! dnf install -y kernel-devel kernel-headers gcc make git dkms 2>&1 | tee -a "$LOG_FILE"; then
             error "Failed to install dependencies via dnf"
             exit 1
@@ -504,7 +515,23 @@ if [[ ${#FAILED_DEPS[@]} -gt 0 ]]; then
     echo -e "${YELLOW}${DEP_ERRORS}${NC}"
     echo -e "  This indicates a problem with your kernel package, not the driver."
     echo -e "  Possible solutions:"
-    echo -e "    1. Reinstall kernel modules: ${BOLD}sudo dnf reinstall kernel-modules${NC}"
+    
+    # Show distro-specific reinstall command
+    case "$PKG_MANAGER" in
+        pacman)
+            echo -e "    1. Reinstall kernel: ${BOLD}sudo pacman -S linux linux-headers${NC}"
+            ;;
+        apt)
+            echo -e "    1. Reinstall kernel modules: ${BOLD}sudo apt reinstall linux-modules-$(uname -r)${NC}"
+            ;;
+        dnf)
+            echo -e "    1. Reinstall kernel modules: ${BOLD}sudo dnf reinstall kernel-modules-$(uname -r)${NC}"
+            ;;
+        *)
+            echo -e "    1. Reinstall your kernel and kernel modules package"
+            ;;
+    esac
+    
     echo -e "    2. Downgrade to a working kernel version"
     echo -e "    3. Wait for a kernel update from your distribution"
     echo ""
