@@ -226,11 +226,37 @@ fi
 # 2. Execute Installation based on Strategy
 case "$PKG_MANAGER" in
     pacman)
-        # Arch / Pacman based
-        if ! pacman -Qi base-devel linux-headers git dkms >/dev/null 2>&1; then
-            msg2 "Installing missing dependencies (pacman)..."
-            # CHANGED: -S --needed (Prevents system breakage)
-            pacman -S --needed --noconfirm base-devel linux-headers git dkms >/dev/null
+        # Arch / Pacman based (including Manjaro, EndeavourOS)
+        msg2 "Installing missing dependencies (pacman)..."
+        
+        # Determine correct headers package
+        HEADERS_PKG="linux-headers"
+        if [[ "$OS_ID" == "manjaro" ]]; then
+            # Manjaro uses versioned kernel packages like linux618-headers
+            # Extract major.minor from kernel version (e.g., 6.18.3 -> 618)
+            KERNEL_MAJOR=$(echo "$KERNEL_VER" | cut -d. -f1)
+            KERNEL_MINOR=$(echo "$KERNEL_VER" | cut -d. -f2)
+            MANJARO_HEADERS="linux${KERNEL_MAJOR}${KERNEL_MINOR}-headers"
+            
+            # Check if the Manjaro-specific package exists
+            if pacman -Si "$MANJARO_HEADERS" >/dev/null 2>&1; then
+                HEADERS_PKG="$MANJARO_HEADERS"
+                log "Manjaro detected: using $HEADERS_PKG"
+            else
+                warning "Could not find $MANJARO_HEADERS, trying generic linux-headers"
+            fi
+        fi
+        
+        # Install dependencies
+        pacman -S --needed --noconfirm base-devel "$HEADERS_PKG" git dkms >/dev/null 2>&1 || true
+        
+        # Verify headers are actually installed
+        if [[ ! -d "/lib/modules/$KERNEL_VER/build" ]]; then
+            error "Kernel headers for $KERNEL_VER are still missing after install attempt."
+            if [[ "$OS_ID" == "manjaro" ]]; then
+                echo -e "  ${YELLOW}Manjaro users:${NC} Try: ${BOLD}sudo pacman -S linux${KERNEL_MAJOR}${KERNEL_MINOR}-headers${NC}"
+            fi
+            exit 1
         fi
         ;;
     apt)
