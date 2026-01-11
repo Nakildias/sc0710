@@ -449,54 +449,61 @@ fi
 # 7. Final Load
 msg2 "Loading module..."
 
-# Check if required kernel modules exist
-REQUIRED_MODULES=("videodev" "videobuf2_common" "videobuf2_v4l2" "videobuf2_vmalloc" "snd_pcm")
-MISSING_MODULES=()
+# Try to load dependency modules and track failures
+FAILED_DEPS=()
 
-for mod in "${REQUIRED_MODULES[@]}"; do
-    # Check if module file exists (handles both .ko and .ko.xz/.ko.zst)
-    if ! find "/lib/modules/$KERNEL_VER/kernel" -name "${mod}.ko*" 2>/dev/null | grep -q .; then
-        MISSING_MODULES+=("$mod")
+load_dep() {
+    local mod="$1"
+    local modname="${mod//-/_}"  # modprobe uses - but lsmod uses _
+    
+    if ! lsmod | grep -q "^${modname}"; then
+        if ! modprobe "$mod" 2>/dev/null; then
+            FAILED_DEPS+=("$mod")
+            return 1
+        fi
     fi
-done
+    return 0
+}
 
-if [[ ${#MISSING_MODULES[@]} -gt 0 ]]; then
+load_dep "videodev"
+load_dep "videobuf2-common"
+load_dep "videobuf2-v4l2"
+load_dep "videobuf2-vmalloc"
+load_dep "snd-pcm"
+
+# Show error if dependencies failed
+if [[ ${#FAILED_DEPS[@]} -gt 0 ]]; then
     echo ""
     echo -e "${RED}═══════════════════════════════════════════════════════════════${NC}"
     echo -e "${RED}  KERNEL MODULE ISSUE DETECTED${NC}"
     echo -e "${RED}═══════════════════════════════════════════════════════════════${NC}"
-    echo -e "  The following required kernel modules are missing:"
-    for mod in "${MISSING_MODULES[@]}"; do
+    echo -e "  The following required kernel modules failed to load:"
+    for mod in "${FAILED_DEPS[@]}"; do
         echo -e "    ${YELLOW}•${NC} $mod"
     done
     echo ""
     echo -e "  This indicates a problem with your kernel package, not the driver."
     echo -e "  Possible solutions:"
     echo -e "    1. Reinstall kernel modules: ${BOLD}sudo dnf reinstall kernel-modules${NC}"
-    echo -e "    2. Downgrade to a working kernel"
+    echo -e "    2. Downgrade to a working kernel version"
     echo -e "    3. Wait for a kernel update from your distribution"
+    echo ""
+    echo -e "  Run ${BOLD}dmesg | tail -30${NC} for more details."
     echo -e "${RED}═══════════════════════════════════════════════════════════════${NC}"
     echo ""
-    log "ERROR: Missing kernel modules: ${MISSING_MODULES[*]}"
-    warning "Attempting to load anyway, but it will likely fail..."
+    log "ERROR: Failed to load kernel modules: ${FAILED_DEPS[*]}"
 fi
-
-# Explicitly load dependency modules first (some distros don't auto-load)
-modprobe videodev 2>/dev/null || true
-modprobe videobuf2-common 2>/dev/null || true
-modprobe videobuf2-v4l2 2>/dev/null || true
-modprobe videobuf2-vmalloc 2>/dev/null || true
-modprobe snd-pcm 2>/dev/null || true
 
 # Load the driver
 if ! modprobe "$DRV_NAME" 2>&1; then
     echo ""
     error "Failed to load $DRV_NAME module."
-    echo -e "  Check ${BOLD}dmesg | tail -30${NC} for details."
     log "ERROR: modprobe $DRV_NAME failed"
     echo ""
     warning "The driver was installed but could not be loaded."
     warning "It may work after a reboot, or there may be a kernel compatibility issue."
+else
+    msg2 "Driver loaded successfully!"
 fi
 
 # 8. Install CLI Tool
