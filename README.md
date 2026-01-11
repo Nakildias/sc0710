@@ -84,19 +84,17 @@ The driver is engineered for seamless integration with modern streaming and play
 > [!TIP]
 > **Multi-Client Power**: Because of the re-engineered architecture, you can keep OBS open while simultaneously sharing your capture card on Discord.
 
+> [!TIP]
+> **EDID Switching**: You can change the EDID on windows and the setting will stay applied in linux, so if you need 1080p 240hz setting it on windows is the way to go for now.
+
 ## Roadmap
 
-Features planned or under investigation for future releases:
-
-### High Priority
-- [ ] **HDR to SDR Tonemapping Control** — Toggle the card's built-in hardware tonemapping via module parameter
-- [ ] **P010 (10-bit) Pixel Format** — Enable proper HDR capture for applications that support it
-- [ ] **EDID Mode Switching** — Support for 4k60 Pro, Passthrough, and Merged EDID modes
-
-### Medium Priority
-- [ ] **XRGB 4:4:4 Pixel Format** — Full chroma capture for PC/desktop sources
-- [ ] **REC.601 Colorspace** — Proper colorimetry reporting for standard definition devices
-- [ ] **High Refresh Rates** — 1080p @ 240Hz, 1440p @ 144Hz support
+### Current Goals
+- **Kernel Compatibility** — Keeping the card functional on future kernels
+- **Stability Improvements** — Enhancing reliability and error handling
+- **Driver-Level Features** — Features that don't require hardware register manipulation
+- **Resolution-Switch Recovery** — Making the card recover properly when changing resolution on source
+- **BMP Support for no signal** — Making the video display the classic Elgato no signal image instead of colorbars
 
 ### Completed
 - [x] Multi-client streaming support
@@ -104,13 +102,34 @@ Features planned or under investigation for future releases:
 - [x] Signal loss recovery with color bars
 - [x] DKMS integration
 - [x] Hotplug stability fixes
+- [x] Professional installer with logging
 
-> [!CAUTION]
-> **Reverse Engineering Required**
+### On Hold — Requires Reverse Engineering
+
+> [!WARNING]
+> **Hardware Feature Development Paused**
 > 
-> Features like EDID mode switching and HDR tonemapping control require additional reverse engineering of the card's ARM MCU communication protocol. The Windows driver sends specific I2C commands to configure these settings, but the exact register addresses and command sequences are currently unknown.
+> The following features require reading/writing to the capture card's ARM MCU via I2C commands. After extensive investigation, the device remains a black box — the exact register addresses, command sequences, and communication protocols are unknown or uncertain to be accurate.
 > 
-> If you have experience with logic analyzers, I2C sniffing, or have captured register writes from the Windows Elgato 4K Capture Utility, contributions would be greatly appreciated!
+> **If you have RE experience and want to help, contributions are welcome!**
+
+| Feature | Status | Why It's Hard |
+|---------|--------|---------------|
+| HDR to SDR Tonemapping Toggle | On Hold | Requires unknown I2C commands to ARM MCU |
+| P010 (10-bit) Pixel Format | On Hold | Hardware pixel format configuration unknown |
+| EDID Mode Switching | On Hold | EEPROM write protocol not fully understood |
+| Firmware Version Readback | On Hold | MCU register layout unknown |
+| XRGB 4:4:4 Pixel Format | On Hold | Chroma configuration registers unknown |
+
+### How to Contribute to On-Hold Features
+
+If you have experience with:
+- Logic analyzers / I2C bus sniffing
+- PCIe protocol analysis
+- Windows driver reverse engineering
+- ARM MCU debugging
+
+You can help by capturing register writes from the Windows Elgato 4K Capture Utility and submitting traces. Any contributions will be reviewed and merged.
 
 ## Credits
 This project is built upon the incredible reverse engineering and initial development work of:
