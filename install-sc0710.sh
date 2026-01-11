@@ -449,13 +449,55 @@ fi
 # 7. Final Load
 msg2 "Loading module..."
 
+# Check if required kernel modules exist
+REQUIRED_MODULES=("videodev" "videobuf2_common" "videobuf2_v4l2" "videobuf2_vmalloc" "snd_pcm")
+MISSING_MODULES=()
+
+for mod in "${REQUIRED_MODULES[@]}"; do
+    # Check if module file exists (handles both .ko and .ko.xz/.ko.zst)
+    if ! find "/lib/modules/$KERNEL_VER/kernel" -name "${mod}.ko*" 2>/dev/null | grep -q .; then
+        MISSING_MODULES+=("$mod")
+    fi
+done
+
+if [[ ${#MISSING_MODULES[@]} -gt 0 ]]; then
+    echo ""
+    echo -e "${RED}═══════════════════════════════════════════════════════════════${NC}"
+    echo -e "${RED}  KERNEL MODULE ISSUE DETECTED${NC}"
+    echo -e "${RED}═══════════════════════════════════════════════════════════════${NC}"
+    echo -e "  The following required kernel modules are missing:"
+    for mod in "${MISSING_MODULES[@]}"; do
+        echo -e "    ${YELLOW}•${NC} $mod"
+    done
+    echo ""
+    echo -e "  This indicates a problem with your kernel package, not the driver."
+    echo -e "  Possible solutions:"
+    echo -e "    1. Reinstall kernel modules: ${BOLD}sudo dnf reinstall kernel-modules${NC}"
+    echo -e "    2. Downgrade to a working kernel"
+    echo -e "    3. Wait for a kernel update from your distribution"
+    echo -e "${RED}═══════════════════════════════════════════════════════════════${NC}"
+    echo ""
+    log "ERROR: Missing kernel modules: ${MISSING_MODULES[*]}"
+    warning "Attempting to load anyway, but it will likely fail..."
+fi
+
 # Explicitly load dependency modules first (some distros don't auto-load)
 modprobe videodev 2>/dev/null || true
 modprobe videobuf2-common 2>/dev/null || true
 modprobe videobuf2-v4l2 2>/dev/null || true
 modprobe videobuf2-vmalloc 2>/dev/null || true
 modprobe snd-pcm 2>/dev/null || true
-modprobe "$DRV_NAME"
+
+# Load the driver
+if ! modprobe "$DRV_NAME" 2>&1; then
+    echo ""
+    error "Failed to load $DRV_NAME module."
+    echo -e "  Check ${BOLD}dmesg | tail -30${NC} for details."
+    log "ERROR: modprobe $DRV_NAME failed"
+    echo ""
+    warning "The driver was installed but could not be loaded."
+    warning "It may work after a reboot, or there may be a kernel compatibility issue."
+fi
 
 # 8. Install CLI Tool
 msg2 "Installing CLI utility..."
