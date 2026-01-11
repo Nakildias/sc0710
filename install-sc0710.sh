@@ -437,9 +437,9 @@ if confirm "Load driver automatically on boot?" "Y"; then
     msg2 "Enabling autostart..."
     echo "$DRV_NAME" > "/etc/modules-load.d/${DRV_NAME}.conf"
 
-    # Optional: Add softdeps if needed for stability
+    # Add softdeps for all required modules (V4L2 + ALSA)
     cat > "/etc/modprobe.d/${DRV_NAME}.conf" <<EOF
-softdep $DRV_NAME pre: videodev videobuf2-v4l2 videobuf2-vmalloc
+softdep $DRV_NAME pre: videodev videobuf2-v4l2 videobuf2-vmalloc videobuf2-common snd-pcm
 EOF
 else
     msg2 "Autostart disabled. Load manually with 'modprobe $DRV_NAME'."
@@ -448,6 +448,13 @@ fi
 
 # 7. Final Load
 msg2 "Loading module..."
+
+# Explicitly load dependency modules first (some distros don't auto-load)
+modprobe videodev 2>/dev/null || true
+modprobe videobuf2-common 2>/dev/null || true
+modprobe videobuf2-v4l2 2>/dev/null || true
+modprobe videobuf2-vmalloc 2>/dev/null || true
+modprobe snd-pcm 2>/dev/null || true
 modprobe "$DRV_NAME"
 
 # 8. Install CLI Tool
