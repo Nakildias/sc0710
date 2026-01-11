@@ -263,18 +263,33 @@ case "$PKG_MANAGER" in
         # Debian / Apt based
         msg2 "Installing dependencies (apt)..."
         export DEBIAN_FRONTEND=noninteractive
-        apt-get update -qq
-        apt-get install -y -qq build-essential linux-headers-"$(uname -r)" git dkms >/dev/null
+        apt-get update -qq 2>&1 | tee -a "$LOG_FILE"
+        if ! apt-get install -y build-essential linux-headers-"$(uname -r)" git dkms 2>&1 | tee -a "$LOG_FILE"; then
+            error "Failed to install dependencies via apt"
+            exit 1
+        fi
         ;;
     dnf)
         # RedHat / Dnf based
         msg2 "Installing dependencies (dnf)..."
-        dnf install -y -q kernel-devel kernel-headers gcc make git dkms >/dev/null
+        if ! dnf install -y kernel-devel kernel-headers gcc make git dkms 2>&1 | tee -a "$LOG_FILE"; then
+            error "Failed to install dependencies via dnf"
+            exit 1
+        fi
         ;;
     *)
         warning "Could not detect a supported package manager (apt/pacman/dnf). Assuming dependencies are met."
         ;;
 esac
+
+# Verify critical tools are available
+if ! command -v dkms >/dev/null 2>&1; then
+    error "DKMS is not installed. Please install it manually:"
+    echo -e "  Debian/Ubuntu: ${BOLD}sudo apt install dkms${NC}"
+    echo -e "  Fedora/RHEL:   ${BOLD}sudo dnf install dkms${NC}"
+    echo -e "  Arch:          ${BOLD}sudo pacman -S dkms${NC}"
+    exit 1
+fi
 
 check_kernel_consistency
 
