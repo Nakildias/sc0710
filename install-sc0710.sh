@@ -451,14 +451,18 @@ msg2 "Loading module..."
 
 # Try to load dependency modules and track failures
 FAILED_DEPS=()
+DEP_ERRORS=""
 
 load_dep() {
     local mod="$1"
     local modname="${mod//-/_}"  # modprobe uses - but lsmod uses _
     
     if ! lsmod | grep -q "^${modname}"; then
-        if ! modprobe "$mod" 2>/dev/null; then
+        local err
+        err=$(modprobe "$mod" 2>&1)
+        if [[ $? -ne 0 ]]; then
             FAILED_DEPS+=("$mod")
+            DEP_ERRORS+="  ${mod}: ${err}\n"
             return 1
         fi
     fi
@@ -478,28 +482,32 @@ if [[ ${#FAILED_DEPS[@]} -gt 0 ]]; then
     echo -e "${RED}  KERNEL MODULE ISSUE DETECTED${NC}"
     echo -e "${RED}═══════════════════════════════════════════════════════════════${NC}"
     echo -e "  The following required kernel modules failed to load:"
-    for mod in "${FAILED_DEPS[@]}"; do
-        echo -e "    ${YELLOW}•${NC} $mod"
-    done
     echo ""
+    echo -e "${YELLOW}${DEP_ERRORS}${NC}"
     echo -e "  This indicates a problem with your kernel package, not the driver."
     echo -e "  Possible solutions:"
     echo -e "    1. Reinstall kernel modules: ${BOLD}sudo dnf reinstall kernel-modules${NC}"
     echo -e "    2. Downgrade to a working kernel version"
     echo -e "    3. Wait for a kernel update from your distribution"
     echo ""
-    echo -e "  Run ${BOLD}dmesg | tail -30${NC} for more details."
+    echo -e "${BOLD}Recent kernel messages:${NC}"
+    dmesg | tail -10 | sed 's/^/  /'
     echo -e "${RED}═══════════════════════════════════════════════════════════════${NC}"
     echo ""
     log "ERROR: Failed to load kernel modules: ${FAILED_DEPS[*]}"
 fi
 
 # Load the driver
-if ! modprobe "$DRV_NAME" 2>&1; then
+DRIVER_ERR=$(modprobe "$DRV_NAME" 2>&1)
+if [[ $? -ne 0 ]]; then
     echo ""
     error "Failed to load $DRV_NAME module."
-    log "ERROR: modprobe $DRV_NAME failed"
+    echo -e "  ${YELLOW}Error: ${DRIVER_ERR}${NC}"
     echo ""
+    echo -e "${BOLD}Recent kernel messages:${NC}"
+    dmesg | tail -10 | sed 's/^/  /'
+    echo ""
+    log "ERROR: modprobe $DRV_NAME failed: $DRIVER_ERR"
     warning "The driver was installed but could not be loaded."
     warning "It may work after a reboot, or there may be a kernel compatibility issue."
 else
