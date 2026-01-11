@@ -465,11 +465,11 @@ load_dep() {
     return 0
 }
 
-load_dep "videodev"
-load_dep "videobuf2-common"
-load_dep "videobuf2-v4l2"
-load_dep "videobuf2-vmalloc"
-load_dep "snd-pcm"
+load_dep "videodev" || true
+load_dep "videobuf2-common" || true
+load_dep "videobuf2-v4l2" || true
+load_dep "videobuf2-vmalloc" || true
+load_dep "snd-pcm" || true
 
 # Show error if dependencies failed
 if [[ ${#FAILED_DEPS[@]} -gt 0 ]]; then
