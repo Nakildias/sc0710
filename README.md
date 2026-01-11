@@ -24,7 +24,7 @@ This enhanced driver architecture delivers enterprise-grade stability and extend
 *   **Concurrent Access Architecture**: Unlocks multi-client capabilities, allowing simultaneous stream acquisition by multiple applications.
 *   **High-Bandwidth Throughput**: Optimized Direct Memory Access (DMA) pathing for consistent 4K 60fps capture performance (subject to host PCIe bandwidth availability).
 *   **Resilient Hotplug Mechanism**: Hardened interrupt handling for HDMI hotplug events, eliminating kernel panics and hard lockups during physical cable reconnections.
-*   **Atomic Signal Restoration**: Corrected frame alignment and synchronization logic prevents image tearing or buffer desynchronization upon signal restoration.
+*   **Signal Restoration**: Corrected frame alignment and synchronization logic prevents image tearing or buffer desynchronization upon signal restoration.
 
 # Installation
 
@@ -44,9 +44,9 @@ If you need to compile manually, ensure you have the necessary kernel headers an
 
 | Distro | Dependencies Command |
 |--------|---------------------|
-| **Arch** | `sudo pacman -S base-devel linux-headers git` |
-| **Debian** | `sudo apt install build-essential linux-headers-$(uname -r) git` |
-| **Fedora** | `sudo dnf install kernel-devel kernel-headers gcc make git` |
+| **Arch** | `sudo pacman -S base-devel linux-headers git dkms` |
+| **Debian** | `sudo apt install build-essential linux-headers-$(uname -r) git dkms` |
+| **Fedora** | `sudo dnf install kernel-modules-$(uname -r) kernel-devel kernel-headers gcc make git dkms` |
 
 ### Manual Compilation
 To compile the driver from source:
