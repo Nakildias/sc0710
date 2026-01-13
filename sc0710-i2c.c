@@ -158,7 +158,7 @@ static int __sc0710_i2c_writeread(struct sc0710_dev *dev, u8 devaddr8bit, u8 *wb
 	}
 
 	/* Write out subaddress (single byte) */
-	/* TODO: We only suppport single byte sub-addresses. */
+	/* Note: Hardware currently only uses single byte sub-addresses. */
 	sc_write(dev, 0, BAR0_3108, 0x00000000 | i2c_subaddr);
 
 	/* Wait for the device ack */
@@ -273,8 +273,21 @@ static void sc0710_reset_dma_frame_sync(struct sc0710_dev *dev)
 			/* Stop the DMA hardware */
 			sc_write(dev, 1, ch->reg_dma_control_w1c, 0x00000001);
 			
-			/* Small delay to let hardware quiesce */
-			usleep_range(2000, 3000);
+			/* Longer delay to ensure all in-flight DMA transactions complete.
+			 * This prevents race conditions where DMA completion processing
+			 * could occur with stale buffer state during resize.
+			 */
+			usleep_range(5000, 6000);
+			
+			/* Delete timeout timer to prevent it firing with stale buffer
+			 * state during resize operations.
+			 */
+			timer_delete_sync(&ch->timeout);
+			
+			/* Memory barrier to ensure DMA stop is visible to all CPUs
+			 * before we clear the writeback metadata.
+			 */
+			mb();
 			
 			/* Clear all writeback metadata */
 			for (i = 0; i < ch->numDescriptorChains; i++) {
@@ -287,6 +300,11 @@ static void sc0710_reset_dma_frame_sync(struct sc0710_dev *dev)
 						*(dca->wbm[1]) = 0;
 				}
 			}
+			
+			/* Write memory barrier to ensure metadata clear is visible
+			 * before we proceed with resize.
+			 */
+			wmb();
 			
 			/* Reset descriptor counter */
 			ch->dma_completed_descriptor_count_last = 0;
@@ -332,7 +350,7 @@ int sc0710_i2c_read_hdmi_status(struct sc0710_dev *dev)
 	int ret;
 	int i;
 	u8 wbuf[1]    = { 0x00 /* Subaddress */ };
-	u8 rbuf[0x1a] = { 0    /* response buffer */};
+	u8 rbuf[0x14] = { 0    /* response buffer */};
 	u32 was_locked;
 
 	/* We're going to update dev->fmt and other shared state, so take the lock early 
@@ -350,17 +368,16 @@ int sc0710_i2c_read_hdmi_status(struct sc0710_dev *dev)
 		printk("%s ret = %d\n", __func__, ret);
 		return -1;
 	}
-#if 0 /* Debug: Disabled - multiple printk calls don't combine on modern kernels */
-	printk("%s    hdmi: ", dev->name);
-	for (i = 0; i < sizeof(rbuf); i++)
-		printk("%02x ", rbuf[i]);
-	printk("\n");
-#endif
+
 	if (rbuf[8]) {
 		u32 new_pixelLineH, new_pixelLineV;
 		int timing_changed = 0;
 		
 		dev->locked = 1;
+		
+		/* If we have a lock, a cable is definitely connected */
+		dev->cable_connected = 1;
+		dev->unlocked_no_timing_count = 0; /* Reset counter on lock */
 		
 		switch ((rbuf[0x0d] & 0x30) >> 4) {
 		case 0x1:
@@ -396,19 +413,26 @@ int sc0710_i2c_read_hdmi_status(struct sc0710_dev *dev)
 		 */
 		dev->eotf = EOTF_SDR;
 
+
 		/* Save old timings to detect changes */
 		new_pixelLineV = rbuf[0x05] << 8 | rbuf[0x04];
 		new_pixelLineH = rbuf[0x07] << 8 | rbuf[0x06];
 		
 		/* Detect timing change (quick replug or resolution change) */
 		if (was_locked && dev->pixelLineH > 0 && dev->pixelLineV > 0) {
-			if (new_pixelLineH != dev->pixelLineH || new_pixelLineV != dev->pixelLineV) {
+			if (new_pixelLineH != dev->pixelLineH || new_pixelLineV != dev->pixelLineV ||
+			    rbuf[0x0c] != dev->last_hint_interval || rbuf[0x0d] != dev->last_hint_flags) {
 				timing_changed = 1;
-				printk(KERN_INFO "%s: HDMI timing changed (%dx%d -> %dx%d)\n",
-					dev->name, dev->pixelLineH, dev->pixelLineV,
-					new_pixelLineH, new_pixelLineV);
+				if (sc0710_debug_mode) {
+					printk(KERN_INFO "%s: HDMI timing/rate changed (%dx%d@%x/%x -> %dx%d@%x/%x)\n",
+						dev->name, dev->pixelLineH, dev->pixelLineV, dev->last_hint_interval, dev->last_hint_flags,
+						new_pixelLineH, new_pixelLineV, rbuf[0x0c], rbuf[0x0d]);
+				}
 			}
 		}
+		
+		dev->last_hint_interval = rbuf[0x0c];
+		dev->last_hint_flags = rbuf[0x0d];
 
 		dev->width = rbuf[0x0b] << 8 | rbuf[0x0a];
 		dev->height = rbuf[0x09] << 8 | rbuf[0x08];
@@ -419,12 +443,51 @@ int sc0710_i2c_read_hdmi_status(struct sc0710_dev *dev)
 		if (dev->interlaced)
 			dev->height *= 2;
 
-		dev->fmt = sc0710_format_find_by_timing(dev->pixelLineH, dev->pixelLineV);
+
+
+
+		if (timing_changed || !was_locked) {
+			u32 fps_target = 0;
+			u8 hint_interval = rbuf[0x0c];
+			u8 hint_flags = rbuf[0x0d];
+
+			/* DEBUG: Print raw I2C response on change */
+			if (sc0710_debug_mode) {
+				printk(KERN_INFO "%s: HDMI raw: ", dev->name);
+				for (i = 0; i < 0x14; i++)
+					printk(KERN_CONT "%02x ", rbuf[i]);
+				printk(KERN_CONT "\n");
+			}
+
+			/* Differentiate FPS based on I2C hints:
+			 * Byte 12 (0x0C) appears to be frame interval (approx 3600/FPS).
+			 * Byte 13 (0x0D) also varies for 120Hz.
+			 */
+			if (hint_interval == 0x78) { /* ~120 -> 30Hz or 120Hz */
+				if (hint_flags == 0x10)
+					fps_target = 120; /* 1080p120 */
+				else
+					fps_target = 30;  /* 1080p30 (flags=0x50) */
+			} else if (hint_interval == 0x3C) { /* ~60 -> 60Hz */
+				fps_target = 60;
+			}
+
+			/* Use rate hint to differentiate modes (e.g. 1080p30 vs 1080p120) */
+			dev->fmt = sc0710_format_find_by_timing_and_rate(dev->pixelLineH, dev->pixelLineV, fps_target);
+		}
 		
 		/* Debug: show timing when format not found */
 		if (!dev->fmt) {
 			printk(KERN_INFO "%s: Unknown timing %dx%d (add to formats table)\n",
 				dev->name, dev->pixelLineH, dev->pixelLineV);
+		}
+		
+		/* Log format detection on timing change or signal restore */
+		if (timing_changed || !was_locked) {
+			if (dev->fmt) {
+				printk(KERN_INFO "%s: Detected timing %dx%d -> format: %s\n",
+					dev->name, dev->pixelLineH, dev->pixelLineV, dev->fmt->name);
+			}
 		}
 		
 		/* Save last known format for placeholder rendering */
@@ -438,17 +501,77 @@ int sc0710_i2c_read_hdmi_status(struct sc0710_dev *dev)
 			mutex_unlock(&dev->signalMutex);
 			
 			/* Wait for HDMI signal to stabilize.
-			 * A 150ms delay gives the source time to fully establish the link.
+			 * A 300ms delay gives the source time to fully establish the link.
+			 * Shorter delays can result in processing during signal transition,
+			 * leading to format/buffer mismatches and potential kernel panics.
 			 */
-			msleep(150);
+			msleep(300);
 			
 			printk(KERN_INFO "%s: Resynchronizing DMA frames\n", dev->name);
 			sc0710_reset_dma_frame_sync(dev);
 			return 0; /* Success */
 		}
 	} else {
+		/* No signal detected - check if cable is connected.
+		 * When a cable is connected (but no valid video signal),
+		 * bytes 4-7 contain timing data from EDID negotiation.
+		 * When no cable is connected, bytes 4-7 are all zero.
+		 * 
+		 * IMPORTANT: When receiving an unsupported timing (e.g., 4K@120Hz),
+		 * the hardware may briefly lock and then unlock repeatedly.
+		 * During unlock, rbuf[4-7] may be zero even though a cable IS connected.
+		 * 
+		 * State machine for cable detection:
+		 * - If timing data present: cable connected, reset counter
+		 * - If no timing but counter < threshold: assume cable still connected
+		 * - If no timing and counter >= threshold: cable disconnected
+		 * This allows transitioning from "No Signal" to "No Device" after
+		 * confirming no activity for several consecutive polls.
+		 */
+		int timing_present = (rbuf[4] | rbuf[5] | rbuf[6] | rbuf[7]);
+		
+
+		if (sc0710_debug_mode) {
+			printk(KERN_INFO "%s: DEBUG: rbuf[8]=%02x (lock), rbuf[4-7]=%02x %02x %02x %02x => timing_present=%d, was_locked=%d, count=%d\n",
+				dev->name, rbuf[8], rbuf[4], rbuf[5], rbuf[6], rbuf[7], 
+				timing_present, was_locked, dev->unlocked_no_timing_count);
+		}
+		
+		/* Determine cable status using state machine */
+		if (timing_present) {
+			/* Timing data present - cable definitely connected */
+			dev->cable_connected = 1;
+			dev->unlocked_no_timing_count = 0;
+		} else {
+			/* No timing data - increment counter */
+			dev->unlocked_no_timing_count++;
+			
+			/* Require 3 consecutive polls with no timing to confirm cable removal.
+			 * This prevents false "No Device" during unsupported timing lock cycling.
+			 * With ~200ms polling interval, this is about 600ms confirmation time.
+			 */
+			if (dev->unlocked_no_timing_count >= 3) {
+				dev->cable_connected = 0;
+			} else {
+				/* Still in grace period - assume cable connected */
+				dev->cable_connected = 1;
+				if (sc0710_debug_mode) {
+					printk(KERN_INFO "%s: No timing data, count=%d/3, assuming cable still connected\n",
+						dev->name, dev->unlocked_no_timing_count);
+				}
+			}
+		}
+		
+		if (sc0710_debug_mode) {
+			printk(KERN_INFO "%s: STATUS: %s (cable_connected=%d)\n",
+				dev->name,
+				dev->cable_connected ? "NO SIGNAL (cable present)" : "NO DEVICE (cable unplugged)",
+				dev->cable_connected);
+		}
+		
 		dev->fmt = NULL;
 		dev->locked = 0;
+
 		dev->width = 0;
 		dev->height = 0;
 		dev->pixelLineH = 0;
@@ -475,10 +598,12 @@ int sc0710_i2c_read_status2(struct sc0710_dev *dev)
 		return -1;
 	}
 
-	printk("%s status2: ", dev->name);
-	for (i = 0; i < sizeof(rbuf); i++)
-		printk("%02x ", rbuf[i]);
-	printk("\n");
+	if (sc0710_debug_mode) {
+		printk("%s status2: ", dev->name);
+		for (i = 0; i < sizeof(rbuf); i++)
+			printk("%02x ", rbuf[i]);
+		printk("\n");
+	}
 
 	return 0; /* Success */
 }
@@ -495,10 +620,12 @@ int sc0710_i2c_read_status3(struct sc0710_dev *dev)
 		return -1;
 	}
 
-	printk("%s status3: ", dev->name);
-	for (i = 0; i < sizeof(rbuf); i++)
-		printk("%02x ", rbuf[i]);
-	printk("\n");
+	if (sc0710_debug_mode) {
+		printk("%s status3: ", dev->name);
+		for (i = 0; i < sizeof(rbuf); i++)
+			printk("%02x ", rbuf[i]);
+		printk("\n");
+	}
 
 	return 0; /* Success */
 }
@@ -521,52 +648,24 @@ int sc0710_i2c_read_procamp(struct sc0710_dev *dev)
 	dev->saturation = rbuf[3];
 	dev->hue        = (s8)rbuf[4];
 
-	printk("%s procamp: ", dev->name);
-	for (i = 0; i < sizeof(rbuf); i++)
-		printk("%02x ", rbuf[i]);
-	printk("\n");
+	if (sc0710_debug_mode) {
+		printk("%s procamp: ", dev->name);
+		for (i = 0; i < sizeof(rbuf); i++)
+			printk("%02x ", rbuf[i]);
+		printk("\n");
 
-	printk("%s procamp: brightness %d contrast %d saturation %d hue %d\n",
-		dev->name,
-		dev->brightness,
-		dev->contrast,
-		dev->saturation,
-		dev->hue);
-
-	return 0; /* Success */
-}
-
-#if 0
-static int sc0710_i2c_cfg_unknownpart(struct sc0710_dev *dev)
-{
-	int ret;
-	u8 wbuf[5] = { 0xab, 0x03, 0x12, 0x34, 0x57 };
-
-	ret = sc0710_i2c_write(dev, I2C_DEV__UNKNOWN, &wbuf[0], sizeof(wbuf));
-	if (ret < 0) {
-		printk("%s ret = %d\n", __func__, ret);
-		return -1;
+		printk("%s procamp: brightness %d contrast %d saturation %d hue %d\n",
+			dev->name,
+			dev->brightness,
+			dev->contrast,
+			dev->saturation,
+			dev->hue);
 	}
 
-	printk("%s() success\n", __func__);
 	return 0; /* Success */
 }
 
-static int sc0710_i2c_cfg_unknownpart2(struct sc0710_dev *dev)
-{
-	int ret;
-	u8 wbuf[2] = { 0x10, 0x01 };
 
-	ret = sc0710_i2c_write(dev, I2C_DEV__ARM_MCU, &wbuf[0], sizeof(wbuf));
-	if (ret < 0) {
-		printk("%s ret = %d\n", __func__, ret);
-		return -1;
-	}
-
-	printk("%s() success\n", __func__);
-	return 0; /* Success */
-}
-#endif
 
 int sc0710_i2c_initialize(struct sc0710_dev *dev)
 {
