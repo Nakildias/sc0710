@@ -51,9 +51,10 @@ unsigned int dma_status = 0;
 module_param(dma_status, int, 0644);
 MODULE_PARM_DESC(dma_status, "Manually start or stop dma activities (def:0 Stopped)");
 
-static unsigned int debug;
-module_param(debug, int, 0644);
-MODULE_PARM_DESC(debug, "enable debug messages");
+unsigned int sc0710_debug_mode = 0;
+module_param_named(debug, sc0710_debug_mode, int, 0644);
+MODULE_PARM_DESC(debug, "enable debug messages (0=off, 1=on)");
+EXPORT_SYMBOL(sc0710_debug_mode);
 
 unsigned int msi_enable = 0;
 module_param_named(msi_enable, msi_enable, int, 0644);
@@ -64,7 +65,7 @@ module_param_array(card,  int, NULL, 0444);
 MODULE_PARM_DESC(card, "card type");
 
 #define dprintk(level, fmt, arg...)\
-	do { if (debug >= level)\
+	do { if (sc0710_debug_mode >= level)\
 		printk(KERN_DEBUG "%s: " fmt, dev->name, ## arg);\
 	} while (0)
 
@@ -72,7 +73,7 @@ static unsigned int sc0710_devcount;
 static DEFINE_MUTEX(devlist);
 LIST_HEAD(sc0710_devlist);
 
-void sc_andor(struct sc0710_dev *dev, int bar, u32 reg, u32 mask, u32 value)
+static void sc_andor(struct sc0710_dev *dev, int bar, u32 reg, u32 mask, u32 value)
 {
 	u32 newval = (readl(dev->lmmio[bar]+((reg)>>2)) & ~(mask)) | ((value) & (mask));
 	writel(newval, dev->lmmio[bar]+((reg)>>2));
@@ -387,18 +388,7 @@ static int sc0710_thread_dma_function(void *data)
 		if (thread_dma_active == 0)
 			continue;
 
-#if 0
-		if (lastDMAStatus == 0 && dma_status == 1) {
-			/* Spin up the dma */
-			dma_status = 2;
-			sc0710_dma_channels_start(dev);
-		} else
-		if (lastDMAStatus == 2 && dma_status == 0) {
-			/* Shutdown the dma */
-			dma_status = 0;
-			sc0710_dma_channels_stop(dev);
-		}
-#endif
+
 		lastDMAStatus = dma_status;
 
 		/* Other parts of the driver need to guarantee that
