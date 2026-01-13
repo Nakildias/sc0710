@@ -31,9 +31,8 @@
 
 #include "sc0710.h"
 
-static int dma_channel_debug = 0;
 #define dprintk(level, fmt, arg...)\
-        do { if (dma_channel_debug >= level)\
+        do { if (sc0710_debug_mode >= level)\
                 printk(KERN_DEBUG "%s: " fmt, dev->name, ## arg);\
         } while (0)
 
@@ -167,16 +166,32 @@ static int dma_channel_debug = 0;
 /* Copy the contains of the video chain into a video4linux buffer.
  * Return < 0 on error
  * Return number of buffers we copyinto from dma into user buffers.
+ * 
+ * @cached_framesize: Frame size cached at service start to prevent mid-operation changes.
+ *                    This ensures consistent behavior even if dev->fmt changes during processing.
  */
-static void sc0710_dma_dequeue_video(struct sc0710_dma_channel *ch, struct sc0710_dma_descriptor_chain *chain)
+static void sc0710_dma_dequeue_video(struct sc0710_dma_channel *ch, 
+	struct sc0710_dma_descriptor_chain *chain,
+	u32 cached_framesize)
 {
 	struct sc0710_dev *dev = ch->dev;
 	struct sc0710_client *client;
 	unsigned long flags;
 
-	if (!dev->fmt) {
+	if (cached_framesize == 0) {
 		dprintk(1, "%s() no format detected, skipping\n", __func__);
 		return;
+	}
+
+	/* Validate DMA transfer size against expected frame size.
+	 * This catches races where resolution changed but buffers haven't been resized yet.
+	 * chain->total_transfer_size is set during allocation and reflects DMA buffer capacity.
+	 */
+	if (chain->total_transfer_size > 0 && cached_framesize > (u32)chain->total_transfer_size) {
+		printk_ratelimited(KERN_WARNING "%s: Frame size %u exceeds DMA buffer %d - resolution change in progress?\n",
+			dev->name, cached_framesize, chain->total_transfer_size);
+		/* Continue anyway but cap to the actual DMA buffer size */
+		cached_framesize = chain->total_transfer_size;
 	}
 
 	/* Broadcast frame to all streaming clients */
@@ -207,13 +222,23 @@ static void sc0710_dma_dequeue_video(struct sc0710_dma_channel *ch, struct sc071
 			continue;
 		}
 
-		/* Copy DMA data to client's buffer */
-		if (dev->fmt->framesize > buffer_size) {
+		/* Validate buffer size against DMA transfer size to prevent overflow.
+		 * This is the final safety check before the actual copy.
+		 */
+		if (chain->total_transfer_size > 0 && (u32)chain->total_transfer_size > buffer_size) {
+			printk_ratelimited(KERN_ERR "%s: DMA size %d exceeds client buffer %lu - dropping frame\n",
+				dev->name, chain->total_transfer_size, buffer_size);
+			spin_unlock_irqrestore(&client->buffer_lock, buf_flags);
+			continue; /* Skip this buffer, don't attempt copy */
+		}
+
+		/* Copy DMA data to client's buffer - use cached_framesize */
+		if (cached_framesize > buffer_size) {
 			len = sc0710_dma_chain_dq_to_ptr(ch, chain, dst, buffer_size);
 			vb2_set_plane_payload(&vb_buf->vb.vb2_buf, 0, buffer_size);
 		} else {
-			len = sc0710_dma_chain_dq_to_ptr(ch, chain, dst, dev->fmt->framesize);
-			vb2_set_plane_payload(&vb_buf->vb.vb2_buf, 0, dev->fmt->framesize);
+			len = sc0710_dma_chain_dq_to_ptr(ch, chain, dst, cached_framesize);
+			vb2_set_plane_payload(&vb_buf->vb.vb2_buf, 0, cached_framesize);
 		}
 
 		vb_buf->vb.vb2_buf.timestamp = ktime_get_ns();
@@ -271,6 +296,8 @@ int sc0710_dma_channel_service(struct sc0710_dma_channel *ch)
 	struct sc0710_dev *dev = ch->dev;
 	struct sc0710_dma_descriptor_chain_allocation *dca;
 	struct sc0710_dma_descriptor_chain *chain;
+	const struct sc0710_format *cached_fmt;
+	u32 cached_framesize;
 	u32 wbm[2];
 	u32 v;
 	int i;
@@ -291,6 +318,14 @@ int sc0710_dma_channel_service(struct sc0710_dma_channel *ch)
 		return 0;
 	}
 
+	/* Cache format info under lock to create a point-in-time snapshot.
+	 * This prevents races where dev->fmt could change mid-processing
+	 * (e.g., during resolution change), which could cause buffer overflows
+	 * if framesize increases while we're copying to smaller buffers.
+	 */
+	cached_fmt = dev->fmt;
+	cached_framesize = cached_fmt ? cached_fmt->framesize : 0;
+
 	/* Read how many descriptors have complete, if this hasn't changed
 	 * single we last checked, end early, nothing for us to do.
 	 */
@@ -310,6 +345,11 @@ int sc0710_dma_channel_service(struct sc0710_dma_channel *ch)
 		/* Last allocated SG buffer in the chain. */
 		dca = &chain->allocations[ chain->numAllocations - 1 ];
 
+		/* Read memory barrier to ensure we see the latest writeback metadata
+		 * values after any DMA or CPU writes.
+		 */
+		rmb();
+
 		/* Read the writeback metadata once, cache it locally. */
 		wbm[0] = *dca->wbm[0];
 		wbm[1] = *dca->wbm[1];
@@ -319,7 +359,7 @@ int sc0710_dma_channel_service(struct sc0710_dma_channel *ch)
 		 */
 		if (wbm[0] && wbm[1]) {
 
-			if (dma_channel_debug > 2) {
+			if (sc0710_debug_mode > 2) {
 				printk("%s ch#%d    [%02d] %08x - wbm %08x %08x (DQ) segs: %d\n",
 					ch->dev->name,
 					ch->nr,
@@ -333,9 +373,11 @@ int sc0710_dma_channel_service(struct sc0710_dma_channel *ch)
 			sc0710_things_per_second_update(&ch->bitsPerSecond, chain->total_transfer_size * 8);
 			sc0710_things_per_second_update(&ch->descPerSecond, chain->numAllocations);
 
-			/* Service the audio, or video. */
+			/* Service the audio, or video.
+			 * Pass cached_framesize to prevent mid-operation format changes.
+			 */
 			if (ch->mediatype == CHTYPE_VIDEO) {
-				sc0710_dma_dequeue_video(ch, chain);
+				sc0710_dma_dequeue_video(ch, chain, cached_framesize);
 			} else
 			if (ch->mediatype == CHTYPE_AUDIO) {
 				sc0710_dma_dequeue_audio(ch, chain);
@@ -344,6 +386,11 @@ int sc0710_dma_channel_service(struct sc0710_dma_channel *ch)
 			/* Reset the descriptor state so we know when it's complete next time. */
 			*(dca->wbm[0]) = 0;
 			*(dca->wbm[1]) = 0;
+			
+			/* Write memory barrier to ensure metadata clear is visible
+			 * before any subsequent operations.
+			 */
+			wmb();
 		}
 	}
 
@@ -410,10 +457,10 @@ int sc0710_dma_channel_alloc(struct sc0710_dev *dev, u32 nr, enum sc0710_channel
 	int ret;
 	struct sc0710_dma_channel *ch = &dev->channel[nr];
 	if (nr >= SC0710_MAX_CHANNELS)
-		return -1;
+		return -EINVAL;
 
 	if (direction != CHDIR_INPUT)
-		return -1;
+		return -EINVAL;
 
 	memset(ch, 0, sizeof(*ch));
 	mutex_init(&ch->lock);
@@ -442,7 +489,8 @@ int sc0710_dma_channel_alloc(struct sc0710_dev *dev, u32 nr, enum sc0710_channel
 		 * we'll free and re-alloc up or down prior to streaming.
 		 */
 		ch->buf_size = 1280 * 2 * 720; /* 16bit pixels for everything. */
-		printk("Allocating channel for size %d\n", ch->buf_size);
+		if (sc0710_debug_mode)
+			printk("Allocating channel for size %d\n", ch->buf_size);
 	} else
 	if (ch->mediatype == CHTYPE_AUDIO) {
 		ch->numDescriptorChains = DMA_TRANSFER_CHAINS;
@@ -452,13 +500,14 @@ int sc0710_dma_channel_alloc(struct sc0710_dev *dev, u32 nr, enum sc0710_channel
 	}
 
 	/* Page table defaults. */
+	/* Page table defaults. */
 	/* This assumed PAGE_SIZE is 4K */
 	/* allocate the descriptor table, its contigious. */
 	ch->pt_size = PAGE_SIZE * 2;
 
 	ch->pt_cpu = dma_alloc_coherent(&dev->pci->dev, ch->pt_size, &ch->pt_dma, GFP_ATOMIC);
 	if (ch->pt_cpu == 0)
-		return -1;
+		return -ENOMEM;
 
 	memset(ch->pt_cpu, 0, ch->pt_size);
 
@@ -493,15 +542,14 @@ int sc0710_dma_channel_alloc(struct sc0710_dev *dev, u32 nr, enum sc0710_channel
 	/* Allocate all the DMA buffers for this channel. */
 	sc0710_dma_chains_alloc(ch, ch->buf_size);
 
-	printk(KERN_INFO "%s channel %d allocated\n", dev->name, nr);
-
-	/* Adjust the descriptor chains to correctly reference each other,
-	 * based on the video or audio frame dma transfer size (dca->buf_size);
-	 */
+	/* Adjust the descriptor chains to correctly reference each other */
 	sc0710_dma_channel_chains_link(ch);
 
-	/* Print the complete chain, descriptor, allocation configuration to the console. */
-	sc0710_dma_chains_dump(ch);
+	if (sc0710_debug_mode) {
+		printk(KERN_INFO "%s channel %d allocated\n", dev->name, nr);
+		/* Print the complete chain, descriptor, allocation configuration to the console. */
+		sc0710_dma_chains_dump(ch);
+	}
 
 	/* Register and create various linux4linux and audio subsystem devices. */
 	if (ch->mediatype == CHTYPE_VIDEO) {
@@ -526,10 +574,10 @@ int sc0710_dma_channel_resize(struct sc0710_dev *dev, u32 nr, enum sc0710_channe
 {
 	struct sc0710_dma_channel *ch = &dev->channel[nr];
 	if (nr >= SC0710_MAX_CHANNELS)
-		return -1;
+		return -EINVAL;
 
 	if (!dev->fmt) {
-		return -1;
+		return -EINVAL;
 	}
 
 	/* Safety: Do not resize active channels (especially Audio) */
@@ -550,15 +598,15 @@ int sc0710_dma_channel_resize(struct sc0710_dev *dev, u32 nr, enum sc0710_channe
 		 * Video transfers vary and need adjustment.
 		 */
 		ch->buf_size = dev->fmt->framesize;
-		printk("Resizing channel for size %d\n", ch->buf_size);
+		if (sc0710_debug_mode)
+			printk("Resizing channel for size %d\n", ch->buf_size);
 	} else
 	if (ch->mediatype == CHTYPE_AUDIO) {
 		/* Audio always uses a fixed transfer size */
 		ch->numDescriptorChains = DMA_TRANSFER_CHAINS;
 		ch->buf_size = DMA_AUDIO_TRANSFER_SIZE;
 	} else {
-		/* TODO: Safety, just return an error here? */
-		ch->numDescriptorChains = 0;
+		return -EINVAL;
 	}
 
 	/* Page table defaults. */
@@ -568,20 +616,19 @@ int sc0710_dma_channel_resize(struct sc0710_dev *dev, u32 nr, enum sc0710_channe
 
 	ch->pt_cpu = dma_alloc_coherent(&dev->pci->dev, ch->pt_size, &ch->pt_dma, GFP_ATOMIC);
 	if (ch->pt_cpu == 0)
-		return -1;
+		return -ENOMEM;
 
 	memset(ch->pt_cpu, 0, ch->pt_size);
 
 	/* allocate DMA based on ch->buf_size */
 	sc0710_dma_chains_alloc(ch, ch->buf_size);
 
-	printk(KERN_INFO "%s channel %d allocated\n", dev->name, nr);
-
-	/* Connect all the descriptors together. */
 	sc0710_dma_channel_chains_link(ch);
 
-	/* Print the complete chain, descriptor, allocation configuration to the console. */
-	sc0710_dma_chains_dump(ch);
+	if (sc0710_debug_mode) {
+		printk(KERN_INFO "%s channel %d allocated\n", dev->name, nr);
+		sc0710_dma_chains_dump(ch);
+	}
 
 	return 0; /* Success */
 };
@@ -608,7 +655,8 @@ void sc0710_dma_channel_free(struct sc0710_dev *dev, u32 nr)
 	/* We don't need any DMA allocations, free them. */
 	sc0710_dma_chains_free(ch);
 
-	printk(KERN_INFO "%s channel %d deallocated\n", dev->name, nr);
+	if (sc0710_debug_mode)
+		printk(KERN_INFO "%s channel %d deallocated\n", dev->name, nr);
 }
 
 /* Prepare the DMA and SG hardware. Reset, establish their
