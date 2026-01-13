@@ -70,6 +70,9 @@
 
 #define SC0710_VERSION_CODE KERNEL_VERSION(1, 0, 0)
 
+/* Global debug mode - extern declaration for use in all source files */
+extern unsigned int sc0710_debug_mode;
+
 #define SC0710_MAX_CHANNELS 2
 
 /* A chain contains 1..SC0710_MAX_CHAIN_DESCRIPTORS descriptors,
@@ -375,6 +378,10 @@ struct sc0710_dev {
 	enum sc0710_colorimetry_e  colorimetry;
 	enum sc0710_colorspace_e   colorspace;
 	enum sc0710_eotf_e         eotf;       /* Detected/forced EOTF for HDR */
+	u32                        cable_connected; /* 5V sense: cable physically present */
+	u32                        unlocked_no_timing_count; /* Consecutive polls with no lock and no timing */
+
+
 
 	/* Procamp */
 	s32                        brightness;
@@ -384,6 +391,9 @@ struct sc0710_dev {
 
 	/* V4L2 */
 	struct v4l2_device         v4l2_dev;
+	/* I2C Hint tracking for change detection */
+	u8 last_hint_interval;
+	u8 last_hint_flags;
 };
 
 struct sc0710_fh
@@ -429,6 +439,11 @@ int sc0710_i2c_write_mcu(struct sc0710_dev *dev, u8 subaddr, u8 *data, int len);
 void sc0710_format_initialize(void);
 const struct sc0710_format *sc0710_format_find_by_timing(u32 timingH, u32 timingV);
 const struct sc0710_format *sc0710_get_default_format(void);
+
+
+const struct sc0710_format *sc0710_format_find_by_timing_and_rate(u32 timingH, u32 timingV, u32 target_fps);
+
+
 
 /* -dma-channel.c */
 int  sc0710_dma_channel_alloc(struct sc0710_dev *dev, u32 nr, enum sc0710_channel_dir_e direction, u32 baseaddr,
