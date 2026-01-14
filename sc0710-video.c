@@ -694,8 +694,8 @@ static int vidioc_g_fmt_vid_cap(struct file *file, void *priv, struct v4l2_forma
 	struct sc0710_dev *dev = ch->dev;
 	const struct sc0710_format *fmt;
 
-	/* Use real format if available, otherwise use default */
-	fmt = dev->fmt ? dev->fmt : sc0710_get_default_format();
+	/* Use real format if available, otherwise use lastfmt, then default */
+	fmt = dev->fmt ? dev->fmt : (dev->last_fmt ? dev->last_fmt : sc0710_get_default_format());
 
 	f->fmt.pix.width = fmt->width;
 	f->fmt.pix.height = fmt->height;
@@ -717,8 +717,8 @@ static int vidioc_try_fmt_vid_cap(struct file *file, void *priv, struct v4l2_for
 	struct sc0710_dev *dev = ch->dev;
 	const struct sc0710_format *fmt;
 
-	/* Use real format if available, otherwise use default */
-	fmt = dev->fmt ? dev->fmt : sc0710_get_default_format();
+	/* Use real format if available, otherwise use lastfmt, then default */
+	fmt = dev->fmt ? dev->fmt : (dev->last_fmt ? dev->last_fmt : sc0710_get_default_format());
 
 	f->fmt.pix.width = fmt->width;
 	f->fmt.pix.height = fmt->height;
@@ -827,8 +827,8 @@ static int sc0710_queue_setup(struct vb2_queue *q,
 	struct sc0710_dev *dev = ch->dev;
 	const struct sc0710_format *fmt;
 
-	/* Use real format if available, otherwise use default */
-	fmt = dev->fmt ? dev->fmt : sc0710_get_default_format();
+	/* Use real format if available, otherwise use lastfmt, then default */
+	fmt = dev->fmt ? dev->fmt : (dev->last_fmt ? dev->last_fmt : sc0710_get_default_format());
 
 	if (*num_buffers < 2)
 		*num_buffers = 2;
@@ -848,8 +848,8 @@ static int sc0710_buf_prepare(struct vb2_buffer *vb)
 	struct sc0710_dev *dev = ch->dev;
 	const struct sc0710_format *fmt;
 
-	/* Use real format if available, otherwise use default */
-	fmt = dev->fmt ? dev->fmt : sc0710_get_default_format();
+	/* Use real format if available, otherwise use lastfmt, then default */
+	fmt = dev->fmt ? dev->fmt : (dev->last_fmt ? dev->last_fmt : sc0710_get_default_format());
 
 	if (vb2_plane_size(vb, 0) < fmt->framesize) {
 		dprintk(0, "%s() buffer too small (%lu < %u)\n",
@@ -1261,11 +1261,8 @@ static void sc0710_vid_timeout(struct timer_list *t)
 	unsigned long flags, buf_flags;
 	int any_streaming = 0;
 
-	/* Always use default format for placeholder frames to match buffer allocation.
-	 * Using last_fmt can cause buffer overflow if last format was 4K but
-	 * current buffers were allocated with default (1080p) size.
-	 */
-	fmt = sc0710_get_default_format();
+	/* Use lastfmt for placeholder frames to render at last known resolution */
+	fmt = dev->last_fmt ? dev->last_fmt : sc0710_get_default_format();
 
 	/* If we have real signal, DMA is handling frame delivery, just reschedule */
 	if (dev->fmt != NULL && dev->locked) {
