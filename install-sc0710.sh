@@ -207,23 +207,26 @@ msg "Initializing SC0710 Driver Installer..."
 # 1. Dependency Check
 msg2 "Checking system dependencies..."
 
-# 1. Detect Package Manager Strategy
+# Detect Package Manager Strategy
 PKG_MANAGER=""
 OS_ID=""
+OS_ID_LIKE=""
 
-# Try to read ID from file
 if [ -f /etc/os-release ]; then
     . /etc/os-release
     OS_ID="$ID"
+    OS_ID_LIKE="${ID_LIKE:-}"
 fi
 
-# Logic: Check ID matches OR check if command exists
-if [[ "$OS_ID" =~ ^(arch|manjaro|endeavouros)$ ]] || command -v pacman >/dev/null 2>&1; then
+# Check if it's a Fedora-based distro (check both ID and ID_LIKE)
+if [[ "$OS_ID" =~ ^(fedora|rhel|centos|almalinux|rocky|ol)$ ]] || \
+   [[ "$OS_ID_LIKE" =~ (fedora|rhel) ]] || \
+   command -v dnf >/dev/null 2>&1; then
+    PKG_MANAGER="dnf"
+elif [[ "$OS_ID" =~ ^(arch|manjaro|endeavouros)$ ]] || command -v pacman >/dev/null 2>&1; then
     PKG_MANAGER="pacman"
 elif [[ "$OS_ID" =~ ^(debian|ubuntu|pop|linuxmint|kali|raspbian)$ ]] || command -v apt-get >/dev/null 2>&1; then
     PKG_MANAGER="apt"
-elif [[ "$OS_ID" =~ ^(fedora|rhel|centos|almalinux)$ ]] || command -v dnf >/dev/null 2>&1; then
-    PKG_MANAGER="dnf"
 fi
 
 # 2. Execute Installation based on Strategy
