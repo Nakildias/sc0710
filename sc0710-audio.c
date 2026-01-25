@@ -20,7 +20,7 @@
 
 #include "sc0710.h"
 
-static unsigned int audio_debug = 2;
+static unsigned int audio_debug = 0;
 module_param(audio_debug, int, 0644);
 MODULE_PARM_DESC(audio_debug, "enable debug messages [audio]");
 
@@ -72,13 +72,7 @@ int sc0710_audio_deliver_samples(struct sc0710_dev *dev, struct sc0710_dma_chann
 		return -1;
 	}
 
-#if 0
-	dprintk(1, "%s() wrote %d samples stride %d\n", __func__, samplesPerChannel, strideBytes);
-	for (i = 0; i < 128; i++)
-		printk(" %02x", *(ptr + i));
-	printk("\n");
-	//return 0;
-#endif
+
 
 	/* Hardware is going to give is a series of s16 words in the following format:
 	 *    L1  R1  L2  R2  L3  R3  L4  R4
@@ -379,7 +373,7 @@ int sc0710_audio_register(struct sc0710_dev *dev)
 
 	snd_card_set_dev(card, &dev->pci->dev);
 
-	dprintk(0, "Registered ALSA audio device %p card %p\n",
+	dprintk(1, "Registered ALSA audio device %p card %p\n",
 		channel->audio_dev, channel->audio_dev->card);
 	return 0;
 

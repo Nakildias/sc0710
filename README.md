@@ -19,7 +19,9 @@ This project is a modern reimagining of the original driver, engineered for stab
 This enhanced driver architecture delivers enterprise-grade stability and extended functionality over the reference implementation:
 
 *   **Modern Kernel Compatibility**: Re-engineered codebase ensuring seamless compilation and operation on bleeding-edge Linux kernels.
-*   **Fail-Safe Signal Generation**: Implements automatic SMPTE color bar generation during signal loss or physical disconnection. This maintains the V4L2 buffer stream, preventing consumer application capture failures or pipeline crashes.
+*   **Hybrid-Optimized Status Images**: Implements high-fidelity "No Signal" and "No Device" status images using a memory-efficient gradient + sparse overlay architecture. This replaces generic colorbars with the classic Elgato branding while maintaining a minimal memory footprint (~90% reduction vs. raw BMP).
+*   **Smart Connection Sensing**: Dynamically differentiates between a missing HDMI cable (No Device) and an active cable with no video sync (No Signal) using a dedicated state machine.
+*   **Global Debug Control**: Unified debugging system across all driver modules (Core, Video, Audio, DMA, I2C) via a single master switch.
 *   **Automated DKMS Lifecycle**: Fully integrated Dynamic Kernel Module Support (DKMS). The driver automatically recompiles and links against new kernel headers during system updates, ensuring persistent availability without manual intervention.
 *   **Concurrent Access Architecture**: Unlocks multi-client capabilities, allowing simultaneous stream acquisition by multiple applications.
 *   **High-Bandwidth Throughput**: Optimized Direct Memory Access (DMA) pathing for consistent 4K 60fps capture performance (subject to host PCIe bandwidth availability).
@@ -56,6 +58,21 @@ git clone https://github.com/Nakildias/sc0710 && cd ./sc0710 && make
 ```
 
 ### Driver Management
+
+#### Using the CLI Tool
+The driver includes a dedicated CLI for real-time management:
+
+*   `sc0710-cli -l, --load`: Load the driver module
+*   `sc0710-cli -u, --unload`: Unload the driver module
+*   `sc0710-cli -r, --restart`: Restart the driver module
+*   `sc0710-cli -s, --status`: Show detailed signal, DKMS, and module status
+*   `sc0710-cli -d, --debug`: Toggle verbose debug mode on/off (persistent)
+*   `sc0710-cli -it, --image-toggle`: Toggle between Status Images and Colorbars (persistent)
+*   `sc0710-cli -U, --update`: Check for updates and reinstall from GitHub
+*   `sc0710-cli -R, --remove`: Completely uninstall the driver and CLI tool
+*   `sc0710-cli -v, --version`: Show installed driver version
+
+#### Manual Loading/Unloading
 Commands to manually load or unload the kernel module:
 
 **Load Driver:**
@@ -94,7 +111,7 @@ The driver is engineered for seamless integration with modern streaming and play
 - **Stability Improvements** — Enhancing reliability and error handling
 - **Driver-Level Features** — Features that don't require hardware register manipulation
 - **Resolution-Switch Recovery** — Making the card recover properly when changing resolution on source
-- **BMP Support for no signal** — Making the video display the classic Elgato no signal image instead of colorbars
+- **Parameter Persistence** — Integrated CLI support for saving driver preferences to /etc/modprobe.d/ automatically.
 
 ### Completed
 - [x] Multi-client streaming support
@@ -103,6 +120,8 @@ The driver is engineered for seamless integration with modern streaming and play
 - [x] DKMS integration
 - [x] Hotplug stability fixes
 - [x] Professional installer with logging
+- [x] BMP Support for No Signal: Added the classic No Signal & No Device images using hybrid-optimized YUYV headers.
+- [x] Smart Cable Detection: Differentiates between physical disconnection and signal loss.
 
 ### On Hold — Requires Reverse Engineering
 

@@ -32,9 +32,8 @@
 
 #include "sc0710.h"
 
-static int dma_chain_debug = 2;
 #define dprintk(level, fmt, arg...)\
-        do { if (dma_chain_debug >= level)\
+        do { if (sc0710_debug_mode >= level)\
                 printk(KERN_DEBUG "%s: " fmt, dev->name, ## arg);\
         } while (0)
 
@@ -143,13 +142,13 @@ int sc0710_dma_chain_alloc(struct sc0710_dma_channel *ch, int nr, int total_tran
 		dca->buf_size = size;
 		dca->buf_cpu = dma_alloc_coherent(&dev->pci->dev, dca->buf_size, &dca->buf_dma, GFP_ATOMIC);
 		if (dca->buf_cpu == 0)
-			return -1;
+			return -ENOMEM;
 
 		memset(dca->buf_cpu, 0, dca->buf_size);
 
 		if (++chain->numAllocations == SC0710_MAX_CHAIN_DESCRIPTORS) {
 			/* We can't fit the transfer in our statically allocated structs. */
-			return -1;
+			return -ENOMEM;
 		}
 		dca++;
 		rem -= size;

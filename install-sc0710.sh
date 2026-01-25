@@ -26,7 +26,7 @@ IFS=$'\n\t'
 REPO_URL="https://github.com/Nakildias/sc0710.git"
 VERSION_URL="https://raw.githubusercontent.com/Nakildias/sc0710/main/version"
 DRV_NAME="sc0710"
-DRV_VERSION="01.11.26-1"
+DRV_VERSION="2026.01.24-1"
 SRC_DEST="/usr/src/${DRV_NAME}-${DRV_VERSION}"
 KERNEL_VER="$(uname -r)"
 
@@ -586,6 +586,17 @@ if [[ \$EUID -ne 0 ]]; then
     exec sudo "\$0" "\$@"
 fi
 
+# --- Persistence Function ---
+save_config() {
+    # Read current values (default to 0/1 if not readable, though we check module load first)
+    local dbg=\$(cat /sys/module/sc0710/parameters/debug 2>/dev/null || echo 0)
+    local img=\$(cat /sys/module/sc0710/parameters/use_status_images 2>/dev/null || echo 1)
+    
+    # Write to modprobe config
+    echo "options sc0710 debug=\$dbg use_status_images=\$img" > /etc/modprobe.d/sc0710-params.conf
+    echo -e "\${BLUE}[PERSIST]\${NC} Settings saved to /etc/modprobe.d/sc0710-params.conf"
+}
+
 # --- Version Check Function ---
 check_version() {
     local REMOTE_VERSION
@@ -617,6 +628,8 @@ show_help() {
     echo -e "    \${BOLD}-u, --unload\${NC}     Unload the driver module"
     echo -e "    \${BOLD}-r, --restart\${NC}    Restart the driver module"
     echo -e "    \${BOLD}-s, --status\${NC}     Show DKMS and module status"
+    echo -e "    \${BOLD}-d, --debug\${NC}      Toggle debug mode on/off"
+    echo -e "    \${BOLD}-it, --image-toggle\${NC} Toggle status images on/off"
     echo -e "    \${BOLD}-U, --update\${NC}     Check for updates and reinstall"
     echo -e "    \${BOLD}-R, --remove\${NC}     Completely uninstall driver and CLI"
     echo -e "    \${BOLD}-v, --version\${NC}    Show version information"
@@ -665,11 +678,107 @@ case "\$1" in
         echo -e "\${BLUE}::\${NC} \${BOLD}Kernel Module\${NC}"
         if lsmod | grep -q \$DRV_NAME; then
             echo -e "   \${GREEN}●\${NC} Module is loaded"
-            lsmod | grep \$DRV_NAME | awk '{print "   Size: " \$2 " bytes, Used by: " \$3 " processes"}'
+            lsmod | grep \$DRV_NAME | awk '{print "   Size: " \$2 " bytes, Used by: " \$3 " processes"}' | head -1
         else
             echo -e "   \${RED}○\${NC} Module is not loaded"
         fi
+        echo ""
+        echo -e "\${BLUE}::\${NC} \${BOLD}Signal Status\${NC}"
+        if [[ -f /proc/sc0710-state ]]; then
+            # Parse the state proc file for signal info
+            PROC_INFO=\$(cat /proc/sc0710-state 2>/dev/null)
+            # Check for HDMI line - if it shows "no signal" or actual format
+            HDMI_LINE=\$(echo "\$PROC_INFO" | grep "HDMI:" | head -1)
+            if [[ -n "\$HDMI_LINE" ]]; then
+                if echo "\$HDMI_LINE" | grep -q "no signal"; then
+                    echo -e "   \${YELLOW}○\${NC} No signal detected"
+                else
+                    # Extract format info from HDMI line
+                    # Format: "        HDMI: 1920x1080p60 -- 1920x1080p (2200x1125)"
+                    FMT_NAME=\$(echo "\$HDMI_LINE" | sed 's/.*HDMI: \([^ ]*\).*/\1/')
+                    RESOLUTION=\$(echo "\$HDMI_LINE" | sed 's/.*-- \([^ ]*\).*/\1/')
+                    TIMING=\$(echo "\$HDMI_LINE" | grep -oP '\([0-9]+x[0-9]+\)' | tr -d '()')
+                    echo -e "   \${GREEN}●\${NC} Signal locked"
+                    echo -e "   Format: \${BOLD}\${FMT_NAME}\${NC}"
+                    if [[ -n "\$RESOLUTION" && "\$RESOLUTION" != "\$HDMI_LINE" ]]; then
+                        echo -e "   Resolution: \${RESOLUTION}"
+                    fi
+                    if [[ -n "\$TIMING" ]]; then
+                        echo -e "   Total timing: \${TIMING}"
+                    fi
+                fi
+            else
+                echo -e "   \${RED}○\${NC} Could not read HDMI status"
+            fi
+        else
+            # Fallback to dmesg if proc not available
+            LAST_FMT=\$(dmesg 2>/dev/null | grep -E "sc0710.*Detected timing|sc0710.*DTC created" | tail -1)
+            if [[ -n "\$LAST_FMT" ]]; then
+                # Clean up the message
+                FMT_MSG=\$(echo "\$LAST_FMT" | sed 's/.*sc0710[^:]*: //')
+                echo -e "   Last detected: \${FMT_MSG}"
+            else
+                echo -e "   \${RED}○\${NC} No signal info available (check dmesg)"
+            fi
+        fi
+        echo ""
+        echo -e "\${BLUE}::\${NC} \${BOLD}Debug Mode\${NC}"
+        if [[ -f /sys/module/sc0710/parameters/debug ]]; then
+            DBG_STATE=\$(cat /sys/module/sc0710/parameters/debug)
+            if [[ "\$DBG_STATE" == "1" ]]; then
+                echo -e "   \${YELLOW}●\${NC} Debug mode enabled (verbose logging)"
+            else
+                echo -e "   \${GREEN}○\${NC} Debug mode disabled (quiet)"
+            fi
+        else
+            echo -e "   \${RED}○\${NC} Parameter not available (module not loaded)"
+        fi
+        echo ""
+        echo -e "\${BLUE}::\${NC} \${BOLD}Status Images\${NC}"
+        if [[ -f /sys/module/sc0710/parameters/use_status_images ]]; then
+            IMG_STATE=\$(cat /sys/module/sc0710/parameters/use_status_images)
+            if [[ "\$IMG_STATE" == "1" ]]; then
+                echo -e "   \${GREEN}●\${NC} Status images enabled (No Signal/No Device BMP)"
+            else
+                echo -e "   \${YELLOW}○\${NC} Status images disabled (showing colorbars)"
+            fi
+        else
+            echo -e "   \${RED}○\${NC} Parameter not available (module not loaded)"
+        fi
+        echo ""
+
         ;;
+    -d|--debug)
+        if [[ ! -f /sys/module/sc0710/parameters/debug ]]; then
+            echo -e "\${RED}[ERROR]\${NC} Module not loaded. Load it first with: sc0710-cli --load"
+            exit 1
+        fi
+        CURRENT=\$(cat /sys/module/sc0710/parameters/debug)
+        if [[ "\$CURRENT" == "1" ]]; then
+            echo 0 > /sys/module/sc0710/parameters/debug
+            echo -e "\${GREEN}[OK]\${NC} Debug mode disabled (quiet)"
+        else
+            echo 1 > /sys/module/sc0710/parameters/debug
+            echo -e "\${YELLOW}[OK]\${NC} Debug mode enabled (check dmesg for output)"
+        fi
+        save_config
+        ;;
+    -it|--image-toggle)
+        if [[ ! -f /sys/module/sc0710/parameters/use_status_images ]]; then
+            echo -e "\${RED}[ERROR]\${NC} Module not loaded. Load it first with: sc0710-cli --load"
+            exit 1
+        fi
+        CURRENT=\$(cat /sys/module/sc0710/parameters/use_status_images)
+        if [[ "\$CURRENT" == "1" ]]; then
+            echo 0 > /sys/module/sc0710/parameters/use_status_images
+            echo -e "\${YELLOW}[OK]\${NC} Status images disabled (showing colorbars)"
+        else
+            echo 1 > /sys/module/sc0710/parameters/use_status_images
+            echo -e "\${GREEN}[OK]\${NC} Status images enabled (No Signal/No Device BMP)"
+        fi
+        save_config
+        ;;
+
     -U|--update)
         echo -e "\${BLUE}::\${NC} Checking for updates..."
         echo -e "\${BLUE}::\${NC} Re-running installer from GitHub..."
@@ -711,6 +820,9 @@ echo -e "      ${BOLD}sc0710-cli -s${NC}  or  ${BOLD}--status${NC}   Check drive
 echo -e "      ${BOLD}sc0710-cli -l${NC}  or  ${BOLD}--load${NC}     Load driver"
 echo -e "      ${BOLD}sc0710-cli -u${NC}  or  ${BOLD}--unload${NC}   Unload driver"
 echo -e "      ${BOLD}sc0710-cli -r${NC}  or  ${BOLD}--restart${NC}  Reload driver"
+echo -e "      ${BOLD}sc0710-cli -d${NC}  or  ${BOLD}--debug${NC}    Toggle debug output"
+echo -e "      ${BOLD}sc0710-cli -it${NC} or  ${BOLD}--image-toggle${NC}  Toggle status images"
+echo -e ""
 echo -e "      ${BOLD}sc0710-cli -U${NC}  or  ${BOLD}--update${NC}   Pull latest & rebuild"
 echo -e "      ${BOLD}sc0710-cli -R${NC}  or  ${BOLD}--remove${NC}   Complete uninstall"
 echo -e "      ${BOLD}sc0710-cli -h${NC}  or  ${BOLD}--help${NC}     Show all options"

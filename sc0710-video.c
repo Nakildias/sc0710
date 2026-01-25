@@ -21,6 +21,7 @@
 #include <linux/module.h>
 #include <linux/moduleparam.h>
 #include <linux/init.h>
+#include <linux/vmalloc.h>
 
 #include "sc0710.h"
 
@@ -40,8 +41,15 @@ static int force_quantization = 0;
 module_param(force_quantization, int, 0644);
 MODULE_PARM_DESC(force_quantization, "Force quantization: 0=auto, 1=limited, 2=full");
 
+/* Module parameter to enable status images (No Signal/No Device BMP)
+ * 1 = show BMP images (default), 0 = show colorbars
+ */
+int use_status_images = 1;
+module_param(use_status_images, int, 0644);
+MODULE_PARM_DESC(use_status_images, "Show status images (1) or colorbars (0)");
+
 #define dprintk(level, fmt, arg...)\
-        do { if (video_debug >= level)\
+        do { if (sc0710_debug_mode && video_debug >= level)\
                 printk(KERN_DEBUG "%s: " fmt, dev->name, ## arg);\
         } while (0)
 
@@ -143,6 +151,16 @@ static enum v4l2_quantization sc0710_get_v4l2_quantization(struct sc0710_dev *de
 #define FILL_MODE_BLUESCREEN 2
 #define FILL_MODE_BLACKSCREEN 3
 #define FILL_MODE_REDSCREEN 4
+#define FILL_MODE_NOSIGNAL 5
+#define FILL_MODE_NODEVICE 6
+
+/* Include hybrid-optimized status image header (gradient + sparse overlays) */
+#include "sc0710-img-hybrid-optimized.h"
+
+/* Static buffers for generated status images */
+static unsigned char *nosignal_frame_buffer = NULL;
+static unsigned char *nodevice_frame_buffer = NULL;
+static int status_frames_generated = 0;
 
 /* 75% IRE colorbars */
 static unsigned char colorbars[7][4] =
@@ -159,12 +177,110 @@ static unsigned char blackscreen[4] = { 0x00, 0x80, 0x00, 0x80 };
 static unsigned char bluescreen[4] = { 0x1d, 0xff, 0x1d, 0x6b };
 static unsigned char redscreen[4] = { 0x39, 0x5f, 0x39, 0xe0 };
 
+/* Helper function to scale and copy a status image to the destination buffer.
+ * Uses nearest-neighbor scaling to convert source image to target size.
+ * Source is in YUYV format (2 bytes per pixel).
+ */
+static void fill_frame_from_image(unsigned char *dest_frame,
+	unsigned int dest_width, unsigned int dest_height,
+	const unsigned char *src_data,
+	unsigned int src_width, unsigned int src_height)
+{
+	unsigned int dest_y, dest_x;
+	unsigned int dest_row_bytes = dest_width * 2;
+	unsigned int src_row_bytes = src_width * 2;
+
+	if (!dest_frame || !src_data || src_width == 0 || src_height == 0 || dest_width == 0 || dest_height == 0) {
+		printk_ratelimited(KERN_ERR "sc0710: fill_frame_from_image invalid params\n");
+		return;
+	}
+
+	for (dest_y = 0; dest_y < dest_height; dest_y++) {
+		/* Calculate source Y coordinate (nearest neighbor) */
+		unsigned int src_y = (dest_y * src_height) / dest_height;
+		const unsigned char *src_row = src_data + (src_y * src_row_bytes);
+		unsigned char *dest_row = dest_frame + (dest_y * dest_row_bytes);
+
+		for (dest_x = 0; dest_x < dest_width; dest_x += 2) {
+			/* Calculate source X coordinate (YUYV is 2 pixels per 4 bytes) */
+			unsigned int src_x = ((dest_x * src_width) / dest_width) & ~1;
+			const unsigned char *src_pixel = src_row + (src_x * 2);
+			unsigned char *dest_pixel = dest_row + (dest_x * 2);
+
+			/* Copy YUYV macropixel (4 bytes = 2 pixels) */
+			memcpy(dest_pixel, src_pixel, 4);
+		}
+	}
+}
+
+/* Generate status frames from hybrid-optimized gradient + overlay data.
+ * Called once lazily on first use.
+ */
+static void generate_status_frames_if_needed(void)
+{
+	unsigned int frame_size = STATUS_IMAGE_WIDTH * STATUS_IMAGE_HEIGHT * 2;
+	
+	if (status_frames_generated)
+		return;
+	
+	/* Allocate buffers for generated frames */
+	nosignal_frame_buffer = vmalloc(frame_size);
+	nodevice_frame_buffer = vmalloc(frame_size);
+	
+	if (!nosignal_frame_buffer || !nodevice_frame_buffer) {
+		if (nosignal_frame_buffer)
+			vfree(nosignal_frame_buffer);
+		if (nodevice_frame_buffer)
+			vfree(nodevice_frame_buffer);
+		nosignal_frame_buffer = NULL;
+		nodevice_frame_buffer = NULL;
+		printk(KERN_WARNING "sc0710: Failed to allocate status frame buffers\n");
+		return;
+	}
+	
+	/* Generate frames from gradient + overlays */
+	generate_status_frame(nosignal_frame_buffer, gradient_y_lut, &nosignal_sprite);
+
+	generate_status_frame(nodevice_frame_buffer, gradient_y_lut, &nodevice_sprite);
+	
+	status_frames_generated = 1;
+	printk(KERN_INFO "sc0710: Generated status frames from hybrid-optimized data\n");
+}
+
 static void fill_frame(struct sc0710_dma_channel *ch,
 	unsigned char *dest_frame, unsigned int width,
 	unsigned int height, unsigned int fillmode)
 {
 	unsigned int width_bytes = width * 2;
 	unsigned int i, divider;
+
+	/* Handle status images with scaling */
+	if (fillmode == FILL_MODE_NOSIGNAL && use_status_images) {
+		if (nosignal_frame_buffer) {
+			fill_frame_from_image(dest_frame, width, height,
+				nosignal_frame_buffer,
+				STATUS_IMAGE_WIDTH,
+				STATUS_IMAGE_HEIGHT);
+			return;
+		}
+		/* Fall through to colorbars if generation failed */
+	}
+
+	if (fillmode == FILL_MODE_NODEVICE && use_status_images) {
+		if (nodevice_frame_buffer) {
+			fill_frame_from_image(dest_frame, width, height,
+				nodevice_frame_buffer,
+				STATUS_IMAGE_WIDTH,
+				STATUS_IMAGE_HEIGHT);
+			return;
+		}
+		/* Fall through to colorbars if generation failed */
+	}
+
+	/* Fall back to colorbars if status images disabled */
+	if ((fillmode == FILL_MODE_NOSIGNAL || fillmode == FILL_MODE_NODEVICE)
+		&& !use_status_images)
+		fillmode = FILL_MODE_COLORBARS;
 
 	if (fillmode > FILL_MODE_REDSCREEN)
 		fillmode = FILL_MODE_BLACKSCREEN;
@@ -253,19 +369,43 @@ static void fill_frame(struct sc0710_dma_channel *ch,
 #define SUPPORT_INTERLACED 0
 static struct sc0710_format formats[] =
 {
+	/* 640x480 - VGA */
+	{  800,  525,  640,  480, 0, 6000, 60000, 1000, 8, 0, "640x480p60",      V4L2_DV_BT_DMT_640X480P60 },
+	{  832,  520,  640,  480, 0, 7500, 75000, 1000, 8, 0, "640x480p75",      V4L2_DV_BT_DMT_640X480P75 },
+
+	/* 720x480 - SD NTSC */
 #if SUPPORT_INTERLACED
 	{  858,  262,  720,  240, 1, 2997, 30000, 1001, 8, 0, "720x480i29.97",   V4L2_DV_BT_CEA_720X480I59_94 },
 #endif
 	{  858,  525,  720,  480, 0, 5994, 60000, 1001, 8, 0, "720x480p59.94",   V4L2_DV_BT_CEA_720X480P59_94 },
 
+	/* 720x576 - SD PAL */
 #if SUPPORT_INTERLACED
 	{  864,  312,  720,  288, 1, 2500, 25000, 1000, 8, 0, "720x576i25",      V4L2_DV_BT_CEA_720X576I50 },
 #endif
+	{  864,  625,  720,  576, 0, 5000, 50000, 1000, 8, 0, "720x576p50",      V4L2_DV_BT_CEA_720X576P50 },
 
+	/* 800x600 - SVGA */
+	{ 1056,  628,  800,  600, 0, 6000, 60000, 1000, 8, 0, "800x600p60",      V4L2_DV_BT_DMT_800X600P60 },
+	{ 1040,  666,  800,  600, 0, 7500, 75000, 1000, 8, 0, "800x600p75",      V4L2_DV_BT_DMT_800X600P75 },
+	{  960,  636,  800,  600, 0, 11997, 120000, 1001, 8, 0, "800x600p119.97", V4L2_DV_BT_DMT_800X600P75 },
+	{ 1056,  636,  800,  600, 0, 11988, 120000, 1001, 8, 0, "800x600p119.88", V4L2_DV_BT_DMT_800X600P75 },
+	{ 1056,  636,  800,  600, 0, 12000, 120000, 1000, 8, 0, "800x600p120",    V4L2_DV_BT_DMT_800X600P75 },
+
+	/* 1024x768 - XGA */
+	{ 1344,  806, 1024,  768, 0, 6000, 60000, 1000, 8, 0, "1024x768p60",     V4L2_DV_BT_DMT_1024X768P60 },
+	{ 1312,  800, 1024,  768, 0, 7500, 75000, 1000, 8, 0, "1024x768p75",     V4L2_DV_BT_DMT_1024X768P75 },
+
+	/* 1280x720 - HD 720p */
 	{ 1980,  750, 1280,  720, 0, 5000, 50000, 1000, 8, 0, "1280x720p50",     V4L2_DV_BT_CEA_1280X720P50 },
 	{ 1650,  750, 1280,  720, 0, 5994, 60000, 1001, 8, 0, "1280x720p59.94",  V4L2_DV_BT_CEA_1280X720P60 },
 	{ 1650,  750, 1280,  720, 0, 6000, 60000, 1000, 8, 0, "1280x720p60",     V4L2_DV_BT_CEA_1280X720P60 },
 
+	/* 1280x1024 - SXGA */
+	{ 1688, 1066, 1280, 1024, 0, 6000, 60000, 1000, 8, 0, "1280x1024p60",    V4L2_DV_BT_DMT_1280X1024P60 },
+	{ 1688, 1066, 1280, 1024, 0, 7500, 75000, 1000, 8, 0, "1280x1024p75",    V4L2_DV_BT_DMT_1280X1024P75 },
+
+	/* 1920x1080 - Full HD */
 #if SUPPORT_INTERLACED
 	{ 2640,  562, 1920,  540, 1, 2500, 25000, 1000, 8, 0, "1920x1080i25",    V4L2_DV_BT_CEA_1920X1080I50 },
 	{ 2200,  562, 1920,  540, 1, 2997, 30000, 1001, 8, 0, "1920x1080i29.97", V4L2_DV_BT_CEA_1920X1080I60 },
@@ -283,7 +423,12 @@ static struct sc0710_format formats[] =
 	{ 2080, 1310, 1920, 1080, 0, 24000, 240000, 1000, 8, 0, "1920x1080p240",   V4L2_DV_BT_CEA_1920X1080P60 },
 	{ 2080, 1310, 1920, 1080, 0, 23976, 240000, 1001, 8, 0, "1920x1080p239.76", V4L2_DV_BT_CEA_1920X1080P60 },
 
-	/* 1440p formats - 2560x1440 */
+	/* 1920x1200 - WUXGA */
+	{ 2592, 1245, 1920, 1200, 0, 6000, 60000, 1000, 8, 0, "1920x1200p60",    V4L2_DV_BT_DMT_1920X1200P60 },
+	/* CVT Reduced Blanking variant */
+	{ 2080, 1235, 1920, 1200, 0, 6000, 60000, 1000, 8, 0, "1920x1200p60rb",  V4L2_DV_BT_DMT_1920X1200P60 },
+
+	/* 2560x1440 - QHD/WQHD */
 	/* Multiple timing variants detected from different sources */
 	{ 2720, 1481, 2560, 1440, 0, 12000, 120000, 1000, 8, 0, "2560x1440p120a",  V4L2_DV_BT_CEA_1920X1080P60 },
 	{ 2720, 1524, 2560, 1440, 0, 12000, 120000, 1000, 8, 0, "2560x1440p120b",  V4L2_DV_BT_CEA_1920X1080P60 },
@@ -291,11 +436,28 @@ static struct sc0710_format formats[] =
 	/* CVT and alternate timings */
 	{ 2720, 1510, 2560, 1440, 0, 12000, 120000, 1000, 8, 0, "2560x1440p120alt", V4L2_DV_BT_CEA_1920X1080P60 },
 	{ 2640, 1490, 2560, 1440, 0, 12000, 120000, 1000, 8, 0, "2560x1440p120cvt", V4L2_DV_BT_CEA_1920X1080P60 },
+	/* 60Hz variants */
+	{ 2720, 1481, 2560, 1440, 0, 6000, 60000, 1000, 8, 0, "2560x1440p60",     V4L2_DV_BT_CEA_1920X1080P60 },
+	{ 2720, 1500, 2560, 1440, 0, 6000, 60000, 1000, 8, 0, "2560x1440p60alt",  V4L2_DV_BT_CEA_1920X1080P60 },
 	/* 144Hz variants */
 	{ 2720, 1527, 2560, 1440, 0, 14400, 144000, 1000, 8, 0, "2560x1440p144",   V4L2_DV_BT_CEA_1920X1080P60 },
 
+	/* 3840x2160 - 4K UHD */
+	{ 5500, 2250, 3840, 2160, 0, 2400, 24000, 1000, 8, 0, "3840x2160p24",    V4L2_DV_BT_CEA_3840X2160P24 },
+	{ 5280, 2250, 3840, 2160, 0, 2500, 25000, 1000, 8, 0, "3840x2160p25",    V4L2_DV_BT_CEA_3840X2160P25 },
+	{ 4400, 2250, 3840, 2160, 0, 3000, 30000, 1000, 8, 0, "3840x2160p30",    V4L2_DV_BT_CEA_3840X2160P30 },
+	{ 5280, 2250, 3840, 2160, 0, 5000, 50000, 1000, 8, 0, "3840x2160p50",    V4L2_DV_BT_CEA_3840X2160P50 },
 	{ 4400, 2250, 3840, 2160, 0, 5994, 60000, 1001, 8, 0, "3840x2160p59.94", V4L2_DV_BT_CEA_3840X2160P60 },
 	{ 4400, 2250, 3840, 2160, 0, 6000, 60000, 1000, 8, 0, "3840x2160p60",    V4L2_DV_BT_CEA_3840X2160P60 },
+	/* Alternate 4K timings with larger blanking */
+	{ 5500, 2250, 3840, 2160, 0, 4800, 48000, 1000, 8, 0, "3840x2160p48",    V4L2_DV_BT_CEA_3840X2160P60 },
+
+	/* 4096x2160 - DCI 4K */
+	{ 4400, 2250, 4096, 2160, 0, 2400, 24000, 1000, 8, 0, "4096x2160p24",    V4L2_DV_BT_CEA_3840X2160P24 },
+	{ 4400, 2250, 4096, 2160, 0, 2500, 25000, 1000, 8, 0, "4096x2160p25",    V4L2_DV_BT_CEA_3840X2160P25 },
+	{ 4400, 2250, 4096, 2160, 0, 3000, 30000, 1000, 8, 0, "4096x2160p30",    V4L2_DV_BT_CEA_3840X2160P30 },
+	{ 4400, 2250, 4096, 2160, 0, 5000, 50000, 1000, 8, 0, "4096x2160p50",    V4L2_DV_BT_CEA_3840X2160P50 },
+	{ 4400, 2250, 4096, 2160, 0, 6000, 60000, 1000, 8, 0, "4096x2160p60",    V4L2_DV_BT_CEA_3840X2160P60 },
 };
 
 /* Default format for no-signal mode (1920x1080p60) */
@@ -344,6 +506,58 @@ const struct sc0710_format *sc0710_format_find_by_timing(u32 timingH, u32 timing
 
 	return NULL;
 }
+
+const struct sc0710_format *sc0710_format_find_by_timing_and_rate(u32 timingH, u32 timingV, u32 target_fps)
+{
+	unsigned int i;
+	const struct sc0710_format *best_fmt = NULL;
+	u32 best_diff = 0xFFFFFFFF;
+
+	if (sc0710_debug_mode)
+		printk(KERN_INFO "sc0710: Match TargetFPS=%u\n", target_fps);
+
+	for (i = 0; i < ARRAY_SIZE(formats); i++) {
+		if ((formats[i].timingH == timingH) && (formats[i].timingV == timingV)) {
+			u32 fps = formats[i].fpsX100 / 100;
+			u32 diff;
+
+			/* If no hint, return first match (legacy behavior) */
+			if (target_fps == 0) {
+				printk(KERN_INFO "sc0710: No FPS Hint -> Pick %s\n", formats[i].name);
+				return &formats[i];
+			}
+
+			/* Calculate difference between format FPS and target */
+			if (fps > target_fps)
+				diff = fps - target_fps;
+			else
+				diff = target_fps - fps;
+
+			if (sc0710_debug_mode)
+				printk(KERN_INFO "sc0710: Cand %s FPS=%u Diff=%u\n", formats[i].name, fps, diff);
+
+			/* Special handling: If hint implies 60Hz (0x3C), allow 120Hz matches 
+			 * as they are often reported ambiguously or 120 is multiple of 60.
+			 * Favor exact match first, but keep track.
+			 */
+			
+			if (diff < best_diff) {
+				best_diff = diff;
+				best_fmt = &formats[i];
+			}
+			
+			/* Exact match optimization */
+			if (diff == 0)
+				return &formats[i];
+		}
+	}
+
+	return best_fmt;
+}
+
+
+
+
 
 static int vidioc_s_dv_timings(struct file *file, void *_fh, struct v4l2_dv_timings *timings)
 {
@@ -480,8 +694,8 @@ static int vidioc_g_fmt_vid_cap(struct file *file, void *priv, struct v4l2_forma
 	struct sc0710_dev *dev = ch->dev;
 	const struct sc0710_format *fmt;
 
-	/* Use real format if available, otherwise use default */
-	fmt = dev->fmt ? dev->fmt : sc0710_get_default_format();
+	/* Use real format if available, otherwise use lastfmt, then default */
+	fmt = dev->fmt ? dev->fmt : (dev->last_fmt ? dev->last_fmt : sc0710_get_default_format());
 
 	f->fmt.pix.width = fmt->width;
 	f->fmt.pix.height = fmt->height;
@@ -503,8 +717,8 @@ static int vidioc_try_fmt_vid_cap(struct file *file, void *priv, struct v4l2_for
 	struct sc0710_dev *dev = ch->dev;
 	const struct sc0710_format *fmt;
 
-	/* Use real format if available, otherwise use default */
-	fmt = dev->fmt ? dev->fmt : sc0710_get_default_format();
+	/* Use real format if available, otherwise use lastfmt, then default */
+	fmt = dev->fmt ? dev->fmt : (dev->last_fmt ? dev->last_fmt : sc0710_get_default_format());
 
 	f->fmt.pix.width = fmt->width;
 	f->fmt.pix.height = fmt->height;
@@ -613,8 +827,8 @@ static int sc0710_queue_setup(struct vb2_queue *q,
 	struct sc0710_dev *dev = ch->dev;
 	const struct sc0710_format *fmt;
 
-	/* Use real format if available, otherwise use default */
-	fmt = dev->fmt ? dev->fmt : sc0710_get_default_format();
+	/* Use real format if available, otherwise use lastfmt, then default */
+	fmt = dev->fmt ? dev->fmt : (dev->last_fmt ? dev->last_fmt : sc0710_get_default_format());
 
 	if (*num_buffers < 2)
 		*num_buffers = 2;
@@ -634,8 +848,8 @@ static int sc0710_buf_prepare(struct vb2_buffer *vb)
 	struct sc0710_dev *dev = ch->dev;
 	const struct sc0710_format *fmt;
 
-	/* Use real format if available, otherwise use default */
-	fmt = dev->fmt ? dev->fmt : sc0710_get_default_format();
+	/* Use real format if available, otherwise use lastfmt, then default */
+	fmt = dev->fmt ? dev->fmt : (dev->last_fmt ? dev->last_fmt : sc0710_get_default_format());
 
 	if (vb2_plane_size(vb, 0) < fmt->framesize) {
 		dprintk(0, "%s() buffer too small (%lu < %u)\n",
@@ -670,6 +884,10 @@ static int sc0710_start_streaming(struct vb2_queue *q, unsigned int count)
 	int ret;
 
 	dprintk(1, "%s(ch#%d)\\n", __func__, ch->nr);
+
+	/* Ensure status images are generated (safe process context here) */
+	if (use_status_images)
+		generate_status_frames_if_needed();
 
 	/* Mark this client as streaming */
 	client->streaming = true;
@@ -831,7 +1049,7 @@ static int sc0710_video_open(struct file *file)
 	file->private_data = fh;
 #endif
 
-	dprintk(0, "%s() new client opened, videousers=%d\n", __func__, ch->videousers);
+	dprintk(2, "%s() new client opened, videousers=%d\n", __func__, ch->videousers);
 
 	return 0;
 }
@@ -844,7 +1062,7 @@ static int sc0710_video_release(struct file *file)
 	struct sc0710_dev *dev = ch->dev;
 	unsigned long flags;
 
-	dprintk(1, "%s() dev=%s\n", __func__, video_device_node_name(vdev));
+	dprintk(2, "%s() dev=%s\n", __func__, video_device_node_name(vdev));
 
 	/* Release the per-client VB2 queue */
 	if (fh->client) {
@@ -867,7 +1085,7 @@ static int sc0710_video_release(struct file *file)
 
 	mutex_lock(&ch->lock);
 	ch->videousers--;
-	dprintk(0, "%s() videousers=%d\n", __func__, ch->videousers);
+	dprintk(2, "%s() videousers=%d\n", __func__, ch->videousers);
 	mutex_unlock(&ch->lock);
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6,18,0)
@@ -1043,10 +1261,7 @@ static void sc0710_vid_timeout(struct timer_list *t)
 	unsigned long flags, buf_flags;
 	int any_streaming = 0;
 
-	/* Use last known format for placeholder, or default if never had signal.
-	 * This ensures colorbars fill the entire buffer (e.g., 4K buffers when
-	 * returning from 4K signal).
-	 */
+	/* Use lastfmt for placeholder frames to render at last known resolution */
 	fmt = dev->last_fmt ? dev->last_fmt : sc0710_get_default_format();
 
 	/* If we have real signal, DMA is handling frame delivery, just reschedule */
@@ -1076,9 +1291,26 @@ static void sc0710_vid_timeout(struct timer_list *t)
 		if (!list_empty(&client->buffer_list)) {
 			buf = list_first_entry(&client->buffer_list, struct sc0710_buffer, list);
 
-		dst = vb2_plane_vaddr(&buf->vb.vb2_buf, 0);
+			dst = vb2_plane_vaddr(&buf->vb.vb2_buf, 0);
+			if (!dst) {
+				if (sc0710_debug_mode)
+					printk_ratelimited(KERN_ERR "%s: vb2_plane_vaddr returned NULL\n", dev->name);
+				spin_unlock_irqrestore(&client->buffer_lock, buf_flags);
+				continue;
+			}
+
 			if (dst) {
-				fill_frame(ch, dst, fmt->width, fmt->height, FILL_MODE_COLORBARS);
+				/* Choose image based on cable status:
+				 * - cable_connected: Show "No Signal" (device connected but no video)
+				 * - !cable_connected: Show "No Device" (nothing plugged in)
+				 */
+				int fillmode = dev->cable_connected ? FILL_MODE_NOSIGNAL : FILL_MODE_NODEVICE;
+				if (sc0710_debug_mode) {
+					printk_ratelimited(KERN_INFO "%s: fill_frame: cable_connected=%d => fillmode=%s\n",
+						dev->name, dev->cable_connected,
+						fillmode == FILL_MODE_NOSIGNAL ? "NOSIGNAL" : "NODEVICE");
+				}
+				fill_frame(ch, dst, fmt->width, fmt->height, fillmode);
 				vb2_set_plane_payload(&buf->vb.vb2_buf, 0, fmt->framesize);
 			}
 
@@ -1168,10 +1400,11 @@ int sc0710_video_register(struct sc0710_dma_channel *ch)
 		-1);
 	if (err < 0) {
 		printk(KERN_INFO "%s: can't register video device\n", dev->name);
-		return -1;
+		return -EIO;
 	}
 
-	printk(KERN_INFO "%s: registered device %s [v4l2]\n",
+	if (sc0710_debug_mode)
+		printk(KERN_INFO "%s: registered device %s [v4l2]\n",
 	       dev->name, video_device_node_name(&ch->vdev));
 
 	return 0; /* Success */
