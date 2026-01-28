@@ -69,6 +69,7 @@
 #include "sc0710-reg.h"
 
 #define SC0710_VERSION_CODE KERNEL_VERSION(1, 0, 0)
+#define SC0710_DRV_VERSION "2026.01.28-1"
 
 /* Global debug mode - extern declaration for use in all source files */
 extern unsigned int sc0710_debug_mode;

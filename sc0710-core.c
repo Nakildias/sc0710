@@ -632,10 +632,8 @@ static struct pci_driver sc0710_pci_driver = {
 
 static int __init sc0710_init(void)
 {
-	printk(KERN_INFO "sc0710 driver version %d.%d.%d loaded\n",
-	       (SC0710_VERSION_CODE >> 16) & 0xff,
-	       (SC0710_VERSION_CODE >>  8) & 0xff,
-	       SC0710_VERSION_CODE & 0xff);
+	printk(KERN_INFO "sc0710 driver version %s loaded\n",
+	       SC0710_DRV_VERSION);
 #ifdef SNAPSHOT
 	printk(KERN_INFO "sc0710: snapshot date %04d-%02d-%02d\n",
 	       SNAPSHOT/10000, (SNAPSHOT/100)%100, SNAPSHOT%100);

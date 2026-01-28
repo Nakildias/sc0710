@@ -68,9 +68,7 @@ void sc0710_dma_channels_stop(struct sc0710_dev *dev)
 	sc_clr(dev, 0, BAR0_00D0, 0x0001);
 
 	for (i = 0; i < SC0710_MAX_CHANNELS; i++) {
-		if (dev->channel[i].mediatype == CHTYPE_VIDEO) {
-			ret = sc0710_dma_channel_stop(&dev->channel[i]);
-		}
+		ret = sc0710_dma_channel_stop(&dev->channel[i]);
 	}
 }
 
@@ -104,9 +102,7 @@ int sc0710_dma_channels_start(struct sc0710_dev *dev)
 
 	/* Start all DMA channels. */
 	for (i = 0; i < SC0710_MAX_CHANNELS; i++) {
-		if (dev->channel[i].mediatype == CHTYPE_VIDEO) {
-			ret = sc0710_dma_channel_start(&dev->channel[i]);
-		}
+		ret = sc0710_dma_channel_start(&dev->channel[i]);
 	}
 
 	sc_set(dev, 0, BAR0_00D0, 0x0001);

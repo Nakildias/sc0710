@@ -26,7 +26,7 @@ IFS=$'\n\t'
 REPO_URL="https://github.com/Nakildias/sc0710.git"
 VERSION_URL="https://raw.githubusercontent.com/Nakildias/sc0710/main/version"
 DRV_NAME="sc0710"
-DRV_VERSION="2026.01.24-1"
+DRV_VERSION="2026.01.28-1"
 SRC_DEST="/usr/src/${DRV_NAME}-${DRV_VERSION}"
 KERNEL_VER="$(uname -r)"
 

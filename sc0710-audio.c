@@ -18,6 +18,7 @@
  *  Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
  */
 
+#include <linux/vmalloc.h>
 #include "sc0710.h"
 
 static unsigned int audio_debug = 0;
@@ -195,9 +196,9 @@ static int snd_sc0710_hw_capture_params(struct snd_pcm_substream *substream,
 	if (runtime->dma_area) {
 		if (runtime->dma_bytes > size)
 			return 0;
-		kfree(runtime->dma_area);
+		vfree(runtime->dma_area);
 	}
-	runtime->dma_area = kzalloc(size, GFP_KERNEL);
+	runtime->dma_area = vzalloc(size);
 	if (!runtime->dma_area)
 		return -ENOMEM;
 	else
@@ -248,18 +249,9 @@ static int snd_sc0710_capture_trigger(struct snd_pcm_substream *substream, int c
 
 	switch (cmd) {
 	case SNDRV_PCM_TRIGGER_START:
-		/* Start h/w */
-		/* sc0710_dma_channel_start(&dev->channel[1]); */
-		/* Can't call directly because declare is in another file, use lookup?
-		 * or assume it's linked.
-		 * Wait, sc0710-audio.c likely includes sc0710.h which declares it.
-		 */
-		sc0710_dma_channel_start(&dev->channel[1]);
 		return 0;
 
 	case SNDRV_PCM_TRIGGER_STOP:
-		/* Stop h/w */
-		sc0710_dma_channel_stop(&dev->channel[1]);
 		return 0;
 
 	default:
@@ -280,7 +272,7 @@ static struct page *snd_pcm_pd_get_page(struct snd_pcm_substream *subs,
 {
 	void *pageptr = subs->runtime->dma_area + offset;
 	/* printk("%s()\n", __func__); */
-	return virt_to_page(pageptr);
+	return vmalloc_to_page(pageptr);
 }
 
 static struct snd_pcm_ops pcm_capture_ops =

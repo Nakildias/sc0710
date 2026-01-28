@@ -64,7 +64,7 @@ static u8 busread(struct sc0710_dev *dev)
 //printk("readbus %08x\n", v);
 		if ((v == 0x0000008c) || (v == 0x000000ac))
 			break;
-		usleep_range(100, 150); /* More scheduler-friendly than udelay */
+		udelay(100);
 	}
 
 	v = sc_read(dev, 0, BAR0_310C);
@@ -143,18 +143,17 @@ static int __sc0710_i2c_writeread(struct sc0710_dev *dev, u8 devaddr8bit, u8 *wb
 	/* Wait for the device ack */
 	while (cnt > 0) {
 		if (time_after(jiffies, timeout)) {
-			printk(KERN_ERR "%s: I2C timeout waiting for device ack\n", __func__);
-			return -ETIMEDOUT;
+			return 0;
 		}
 		v = sc_read(dev, 0, BAR0_3104);
 		if (v == 0x00000044)
 			break;
-		usleep_range(50, 80);
+		udelay(50);
 		cnt--;
 	}
 	//dprintk(0, "Read 3104 %08x at cnt %d -- 44?\n", v, cnt);
 	if (cnt <= 0) {
-		return -ETIMEDOUT;
+		return 0;
 	}
 
 	/* Write out subaddress (single byte) */
@@ -165,13 +164,12 @@ static int __sc0710_i2c_writeread(struct sc0710_dev *dev, u8 devaddr8bit, u8 *wb
 	cnt = 16;
 	while (cnt > 0) {
 		if (time_after(jiffies, timeout)) {
-			printk(KERN_ERR "%s: I2C timeout waiting for subaddr ack\n", __func__);
-			return -ETIMEDOUT;
+			return 0;
 		}
 		v = sc_read(dev, 0, BAR0_3104);
 		if (v == 0x000000c4)
 			break;
-		usleep_range(50, 80);
+		udelay(50);
 		cnt--;
 	}
 	//dprintk(0, "Read 3104 %08x at cnt %d -- c4?\n", v, cnt);
@@ -542,6 +540,19 @@ int sc0710_i2c_read_hdmi_status(struct sc0710_dev *dev)
 			/* Timing data present - cable definitely connected */
 			dev->cable_connected = 1;
 			dev->unlocked_no_timing_count = 0;
+			
+			/* Valid "No Signal" state (Cable connected, but not locked) */
+			dev->fmt = NULL;
+			dev->locked = 0;
+
+			dev->width = 0;
+			dev->height = 0;
+			dev->pixelLineH = 0;
+			dev->pixelLineV = 0;
+			dev->interlaced = 0;
+			dev->colorimetry = BT_UNDEFINED;
+			dev->colorspace = CS_UNDEFINED;
+			dev->eotf = EOTF_SDR;
 		} else {
 			/* No timing data - increment counter */
 			dev->unlocked_no_timing_count++;
@@ -552,6 +563,18 @@ int sc0710_i2c_read_hdmi_status(struct sc0710_dev *dev)
 			 */
 			if (dev->unlocked_no_timing_count >= 3) {
 				dev->cable_connected = 0;
+
+				dev->fmt = NULL;
+				dev->locked = 0;
+
+				dev->width = 0;
+				dev->height = 0;
+				dev->pixelLineH = 0;
+				dev->pixelLineV = 0;
+				dev->interlaced = 0;
+				dev->colorimetry = BT_UNDEFINED;
+				dev->colorspace = CS_UNDEFINED;
+				dev->eotf = EOTF_SDR;
 			} else {
 				/* Still in grace period - assume cable connected */
 				dev->cable_connected = 1;
@@ -568,18 +591,6 @@ int sc0710_i2c_read_hdmi_status(struct sc0710_dev *dev)
 				dev->cable_connected ? "NO SIGNAL (cable present)" : "NO DEVICE (cable unplugged)",
 				dev->cable_connected);
 		}
-		
-		dev->fmt = NULL;
-		dev->locked = 0;
-
-		dev->width = 0;
-		dev->height = 0;
-		dev->pixelLineH = 0;
-		dev->pixelLineV = 0;
-		dev->interlaced = 0;
-		dev->colorimetry = BT_UNDEFINED;
-		dev->colorspace = CS_UNDEFINED;
-		dev->eotf = EOTF_SDR;
 	}
 
 	mutex_unlock(&dev->signalMutex);
