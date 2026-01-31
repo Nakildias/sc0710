@@ -46,6 +46,8 @@ NC='\033[0m' # No Color
 NOCONFIRM=false
 FORCE_INSTALL=false
 TEMP_DIR=""
+VIDEO_GROUP_CHANGED=false
+
 
 # --- Essential Files (for verification) ---
 ESSENTIAL_FILES=("sc0710.h" "sc0710-core.c" "sc0710-video.c" "Makefile")
@@ -160,6 +162,29 @@ check_root() {
     fi
 }
 
+check_video_group() {
+    # Check if users are in the video group to access the capture card
+    local users
+    # Get users with UID >= 1000 (usually human users)
+    users=$(awk -F: '$3 >= 1000 && $3 < 65000 {print $1}' /etc/passwd)
+    
+    for user in $users; do
+        if id "$user" >/dev/null 2>&1; then
+            if ! groups "$user" | grep -q "\bvideo\b"; then
+                msg2 "Adding user '$user' to the 'video' group..."
+                if usermod -aG video "$user"; then
+                    log "Added user $user to video group"
+                    VIDEO_GROUP_CHANGED=true
+                else
+                    warning "Failed to add '$user' to video group. Run: sudo usermod -aG video $user"
+                fi
+            else
+                log "User '$user' is already in video group"
+            fi
+        fi
+    done
+}
+
 # Set trap AFTER root check to avoid permission issues during cleanup
 setup_trap() {
     trap cleanup EXIT INT TERM
@@ -204,7 +229,10 @@ log "=== SC0710 Driver Installation Started ==="
 log "Version: $DRV_VERSION | Kernel: $KERNEL_VER"
 msg "Initializing SC0710 Driver Installer..."
 
-# 1. Dependency Check
+# 1. Permission Check
+check_video_group
+
+# 2. Dependency Check
 msg2 "Checking system dependencies..."
 
 # Detect Package Manager Strategy
@@ -829,3 +857,14 @@ echo -e "      ${BOLD}sc0710-cli -h${NC}  or  ${BOLD}--help${NC}     Show all op
 echo ""
 echo -e " ${BLUE}->${NC} Installation log available at: ${BOLD}$LOG_FILE${NC}"
 echo ""
+
+if [ "$VIDEO_GROUP_CHANGED" = true ]; then
+    echo -e "${YELLOW}╔═══════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${YELLOW}║                 IMPORTANT NOTICE                          ║${NC}"
+    echo -e "${YELLOW}╠═══════════════════════════════════════════════════════════╣${NC}"
+    echo -e "${YELLOW}║${NC}  User permissions have been updated.                      ${YELLOW}║${NC}"
+    echo -e "${YELLOW}║${NC}  You ${BOLD}MUST REBOOT${NC} or ${BOLD}LOG OUT${NC} and back in for changes       ${YELLOW}║${NC}"
+    echo -e "${YELLOW}║${NC}  to take effect. OBS will NOT detect the card otherwise.  ${YELLOW}║${NC}"
+    echo -e "${YELLOW}╚═══════════════════════════════════════════════════════════╝${NC}"
+    echo ""
+fi
