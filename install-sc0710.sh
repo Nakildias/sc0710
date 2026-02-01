@@ -26,7 +26,12 @@ IFS=$'\n\t'
 REPO_URL="https://github.com/Nakildias/sc0710.git"
 VERSION_URL="https://raw.githubusercontent.com/Nakildias/sc0710/main/version"
 DRV_NAME="sc0710"
-DRV_VERSION="$(cat version)"
+# Fetch from local version file if exists, otherwise fetch from GitHub
+if [[ -f "version" ]]; then
+    DRV_VERSION="$(cat version | tr -d '[:space:]')"
+else
+    DRV_VERSION=$(curl -fsSL "$VERSION_URL" | tr -d '[:space:]')
+fi
 SRC_DEST="/usr/src/${DRV_NAME}-${DRV_VERSION}"
 KERNEL_VER="$(uname -r)"
 
