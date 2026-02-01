@@ -43,10 +43,17 @@ This driver is available on the AUR for automatic updates on Arch Linux.
 > [!Note]
 > It doesn't come with sc0710-cli utility when installed with the AUR.
 
+
 ```bash
 yay -S sc0710-dkms-git
 # or whatever aur helper you use
 ```
+
+> [!Warning]
+> If you want to use it right away without rebooting you can run
+> ```bash
+> sudo modprobe sc0710
+> ```
 
 ---
 
