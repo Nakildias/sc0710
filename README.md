@@ -2,6 +2,7 @@
 [![Kernel Compatibility](https://img.shields.io/badge/Kernel-6.12%20--%206.18%2B-blueviolet)](https://github.com/Nakildias/sc0710)
 [![License: GPL v2](https://img.shields.io/badge/License-GPL%20v2-blue.svg)](https://github.com/Nakildias/sc0710/blob/main/LICENSE)
 [![Status](https://img.shields.io/badge/Status-Maintained-success)](#)
+[![AUR version](https://img.shields.io/aur/version/sc0710-dkms-git?logo=arch-linux)](https://aur.archlinux.org/packages/sc0710-dkms-git)
 
 A high-performance, multi-client Linux driver for the Elgato 4K60 Pro mk.2. 
 This project is a modern reimagining of the original driver, engineered for stability on current kernels.
@@ -10,7 +11,7 @@ This project is a modern reimagining of the original driver, engineered for stab
 > **Kernel Compatibility Verification**
 >
 > This driver has been rigorously tested and validated for stability on the following kernels:
-> * **Arch Linux**: Kernel `6.18.3-arch1-1` — Works perfectly with standard configuration.
+> * **Arch Linux**: Kernel `6.18.7-arch1-1` — Works perfectly with standard configuration.
 > * **Fedora**: Kernel `6.17.12-300.fc43.x86_64` — Works perfectly with standard configuration.
 > * **Debian**: Kernel `6.12.57+deb13-amd64` — **Note:** The OBS version from `dnf`/repositories is currently broken and crashes when accessing the capture card. Debian users **must** use the **Flatpak** version of OBS for stable operation.
 
@@ -30,11 +31,21 @@ This enhanced driver architecture delivers enterprise-grade stability and extend
 
 # Installation
 
-## Quick Install (Recommended)
+## Universal Install (Arch Linux, Debian & Fedora)
 This command automatically handles dependencies, compiles the driver, and installs it for you.
 
 ```bash
 sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/Nakildias/sc0710/main/install-sc0710.sh)"
+```
+
+## Arch Linux (Standalone Driver)
+This driver is available on the AUR for automatic updates on Arch Linux. 
+> [!Note]
+> It doesn't come with sc0710-cli utility when installed with the AUR.
+
+```bash
+yay -S sc0710-dkms-git
+# or whatever aur helper you use
 ```
 
 ---
