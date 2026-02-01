@@ -10,8 +10,9 @@ obj-m += sc0710.o
 TARFILES = Makefile *.h *.c *.txt *.md
 
 KVERSION = $(shell uname -r)
+VERSION := $(shell cat version)
 all:
-	make -C /lib/modules/$(KVERSION)/build M=$(PWD) modules
+	make -C /lib/modules/$(KVERSION)/build M=$(PWD) EXTRA_CFLAGS="-DSC0710_DRV_VERSION=\\\"$(VERSION)\\\"" modules
 clean:
 	make -C /lib/modules/$(KVERSION)/build M=$(PWD) clean
 
