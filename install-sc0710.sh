@@ -786,7 +786,7 @@ case "\$1" in
                         elif [[ "\$SUBVEN:\$SUBDEV" == "1cfa:0012" ]]; then
                             BOARD_NAME="Elgato 4K Pro"
                         elif [[ "\$SUBVEN:\$SUBDEV" == "1cfa:0006" ]]; then
-                            BOARD_NAME="Elgato 4k60 Pro mk.2 (1cfa:0006)"
+                            BOARD_NAME="Elgato HD60 Pro (1cfa:0006)"
                         else
                             BOARD_NAME="UNKNOWN/GENERIC"
                         fi
@@ -795,6 +795,11 @@ case "\$1" in
                     echo -e "   \${GREEN}●\${NC} Device at PCI \${BOLD}\${PCI_ADDR}\${NC}"
                     echo -e "     Board: \${BOARD_NAME}"
                     echo -e "     Hardware: \${VEN}:\${DEV} (Subsys: \${SUBVEN}:\${SUBDEV})"
+                    
+                    if [[ "\$SUBVEN:\$SUBDEV" == "1cfa:0006" ]]; then
+                        echo -e "     \${RED}⚠ WARNING:\${NC} This is an Elgato HD60 Pro."
+                        echo -e "     \${RED}          \${NC} It is an entirely different chipset and is \${BOLD}INCOMPATIBLE\${NC} with this driver."
+                    fi
                 fi
             done
             if [[ \$FOUND_CARDS -eq 0 ]]; then
