@@ -1,4 +1,4 @@
-# Elgato 4K60 Pro MK.2 Linux Driver
+# Elgato 4K60 Pro MK.2 (1cfa:000e) and Elgato 4K Pro (1cfa:0012) Linux Driver
 
 [![Kernel Compatibility](https://img.shields.io/badge/Kernel-6.12%20--%206.18%2B-blueviolet)](https://github.com/Nakildias/sc0710)
 [![AUR version](https://img.shields.io/aur/version/sc0710-dkms-git?logo=arch-linux)](https://aur.archlinux.org/packages/sc0710-dkms-git)
@@ -9,8 +9,8 @@
 [![GitHub stars](https://img.shields.io/github/stars/Nakildias/sc0710?style=flat)](https://github.com/Nakildias/sc0710/stargazers)
 [![GitHub issues](https://img.shields.io/github/issues/Nakildias/sc0710)](https://github.com/Nakildias/sc0710/issues)
 
-High-performance, multi-client Linux driver for the Elgato 4K60 Pro mk.2 PCI-e capture card. Engineered for stability on modern kernels (6.12+).
-*For older kernels, please use the original [stoth68000/sc0710](https://github.com/stoth68000/sc0710) repository.*
+High-performance, multi-client Linux driver for the Elgato 4K60 Pro MK.2 and Elgato 4K Pro PCI-e capture card. Engineered for stability on modern kernels (6.12+).
+*For older kernels, please use the original [stoth68000/sc0710](https://github.com/stoth68000/sc0710) repository (Only for MK.2).*
 
 ## Kernel Compatibility
 
@@ -81,4 +81,6 @@ The `sc0710-cli` tool (installed via the automatic script) provides real-time co
 *   **EDID Switching (On Hold):** EEPROM write protocol unknown. (Workaround: Set EDID in Windows first).
 
 ## Credits
-Based on original reverse engineering by **[Steven Toth (@stoth68000)](https://github.com/stoth68000)** and subsequent work by **[@Subtixx](https://github.com/Subtixx)**.
+* ### Based on original reverse engineering by **[Steven Toth (@stoth68000)](https://github.com/stoth68000)** and subsequent work by **[@Subtixx](https://github.com/Subtixx)**.
+
+* ### Thanks to **[Onhil (@Onhil)](https://github.com/Onhil)** for his work on the Elgato 4K Pro
