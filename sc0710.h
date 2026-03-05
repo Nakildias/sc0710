@@ -98,9 +98,11 @@ extern unsigned int sc0710_debug_mode;
 #define SC0710_BOARD_NOAUTO              UNSET
 #define SC0710_BOARD_UNKNOWN             0
 #define SC0710_BOARD_ELGATEO_4KP60_MK2   1
+#define SC0710_BOARD_ELGATEO_4KP60_MK2_R2 2 /* 1cfa:0006 variant, BAR[5] config */
 
 struct sc0710_board {
 	char *name;
+	int   bar1_index; /* PCI BAR index for config registers (1 or 5) */
 };
 
 struct sc0710_subid {
@@ -351,6 +353,7 @@ struct sc0710_dev {
 	unsigned char              pci_rev, pci_lat;
 	u32                        __iomem *lmmio[2];
 	u8                         __iomem *bmmio[2];
+	u32                        bar1_size; /* Size of config BAR in bytes (for bounds checking) */
 
 	/* A kernel thread to keep the HDMI video frontend alive. */
  	struct task_struct         *kthread_hdmi;

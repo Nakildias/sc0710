@@ -645,12 +645,12 @@ check_version() {
     if [[ -n "\$REMOTE_VERSION" && "\$REMOTE_VERSION" != "\$CURRENT_VERSION" ]]; then
         echo ""
         echo -e "\${YELLOW}╔═══════════════════════════════════════════════════════════╗\${NC}"
-        echo -e "\${YELLOW}║              UPDATE AVAILABLE                             ║\${NC}"
+        echo -e "\${YELLOW}║   UPDATE AVAILABLE                                        ║\${NC}"
         echo -e "\${YELLOW}╠═══════════════════════════════════════════════════════════╣\${NC}"
-        echo -e "\${YELLOW}║\${NC}  Current: \${RED}\${CURRENT_VERSION}\${NC}"
-        printf "\${YELLOW}║\${NC}  Latest:  \${GREEN}%-47s\${NC}\n" "\$REMOTE_VERSION"
+        echo -e "\${YELLOW}║\${NC}  Current: \${RED}\${CURRENT_VERSION}\${NC}                                    \${YELLOW}║\${NC}"
+        printf "\${YELLOW}║\${NC}  Latest:  \${GREEN}%-47s\${NC} \${YELLOW}║\${NC}\n" "\$REMOTE_VERSION"
         echo -e "\${YELLOW}╠═══════════════════════════════════════════════════════════╣\${NC}"
-        echo -e "\${YELLOW}║\${NC}  Run \${BOLD}sc0710-cli -U\${NC} or \${BOLD}sc0710-cli --update\${NC} to update"
+        echo -e "\${YELLOW}║\${NC}  Run \${BOLD}sc0710-cli -U\${NC} or \${BOLD}sc0710-cli --update\${NC} to update       \${YELLOW}║\${NC}"
         echo -e "\${YELLOW}╚═══════════════════════════════════════════════════════════╝\${NC}"
         echo ""
     fi
@@ -757,6 +757,44 @@ case "\$1" in
             fi
         else
             echo -e "   \${RED}○\${NC} Module is not loaded"
+        fi
+        echo ""
+        echo -e "\${BLUE}::\${NC} \${BOLD}Card Information\${NC}"
+        if lsmod | grep -q \$DRV_NAME; then
+            FOUND_CARDS=0
+            for pcidir in /sys/bus/pci/drivers/sc0710/0*; do
+                if [[ -d "\$pcidir" ]]; then
+                    FOUND_CARDS=1
+                    PCI_ADDR=\$(basename "\$pcidir")
+                    SUBVEN=\$(cat "\$pcidir/subsystem_vendor" 2>/dev/null | grep -iE '0x[0-9a-f]+' -o | sed 's/0x//' )
+                    SUBDEV=\$(cat "\$pcidir/subsystem_device" 2>/dev/null | grep -iE '0x[0-9a-f]+' -o | sed 's/0x//' )
+                    VEN=\$(cat "\$pcidir/vendor" 2>/dev/null | grep -iE '0x[0-9a-f]+' -o | sed 's/0x//' )
+                    DEV=\$(cat "\$pcidir/device" 2>/dev/null | grep -iE '0x[0-9a-f]+' -o | sed 's/0x//' )
+                    
+                    # Try to parse exact board name from dmesg
+                    BOARD_NAME=\$(dmesg 2>/dev/null | grep -E "sc0710.*subsystem: \${SUBVEN}:\${SUBDEV}.*board:" | tail -1 | sed 's/.*board: \([^\[]*\).*/\1/' | sed 's/ *$//')
+                    
+                    if [[ -z "\$BOARD_NAME" ]]; then
+                        # Fallbacks
+                        if [[ "\$SUBVEN:\$SUBDEV" == "1cfa:000e" || "\$SUBVEN:\$SUBDEV" == "1cfa:0012" ]]; then
+                            BOARD_NAME="Elgato 4k60 Pro mk.2"
+                        elif [[ "\$SUBVEN:\$SUBDEV" == "1cfa:0006" ]]; then
+                            BOARD_NAME="Elgato 4k60 Pro mk.2 (1cfa:0006)"
+                        else
+                            BOARD_NAME="UNKNOWN/GENERIC"
+                        fi
+                    fi
+                    
+                    echo -e "   \${GREEN}●\${NC} Device at PCI \${BOLD}\${PCI_ADDR}\${NC}"
+                    echo -e "     Board: \${BOARD_NAME}"
+                    echo -e "     Hardware: \${VEN}:\${DEV} (Subsys: \${SUBVEN}:\${SUBDEV})"
+                fi
+            done
+            if [[ \$FOUND_CARDS -eq 0 ]]; then
+                echo -e "   \${YELLOW}○\${NC} No devices found currently bound to driver"
+            fi
+        else
+            echo -e "   \${RED}○\${NC} Module is not loaded, cannot retrieve card info"
         fi
         echo ""
         echo -e "\${BLUE}::\${NC} \${BOLD}Signal Status\${NC}"

@@ -23,10 +23,16 @@
 struct sc0710_board sc0710_boards[] = {
 	[SC0710_BOARD_UNKNOWN] = {
 		.name		= "UNKNOWN/GENERIC",
+		.bar1_index	= 1,
 		/* Ensure safe default for unknown boards */
 	},
 	[SC0710_BOARD_ELGATEO_4KP60_MK2] = {
 		.name		= "Elgato 4k60 Pro mk.2",
+		.bar1_index	= 1,
+	},
+	[SC0710_BOARD_ELGATEO_4KP60_MK2_R2] = {
+		.name		= "Elgato 4k60 Pro mk.2 (1cfa:0006)",
+		.bar1_index	= 5, /* Config space is on BAR[5], not BAR[1] */
 	},
 };
 const unsigned int sc0710_bcount = ARRAY_SIZE(sc0710_boards);
@@ -40,6 +46,10 @@ struct sc0710_subid sc0710_subids[] = {
 		.subvendor = 0x1cfa,
 		.subdevice = 0x0012,
 		.card      = SC0710_BOARD_ELGATEO_4KP60_MK2,
+	}, {
+		.subvendor = 0x1cfa,
+		.subdevice = 0x0006,
+		.card      = SC0710_BOARD_ELGATEO_4KP60_MK2_R2,
 	}
 };
 const unsigned int sc0710_idcount = ARRAY_SIZE(sc0710_subids);
@@ -76,6 +86,7 @@ void sc0710_gpio_setup(struct sc0710_dev *dev)
 {
 	switch (dev->board) {
 	case SC0710_BOARD_ELGATEO_4KP60_MK2:
+	case SC0710_BOARD_ELGATEO_4KP60_MK2_R2:
 		break;
 	}
 }
@@ -99,6 +110,16 @@ void sc0710_card_setup(struct sc0710_dev *dev)
 		sc_write(dev, 1, BAR1_208C, 0);
 		sc_write(dev, 1, BAR1_20A0, 0);
 		sc_write(dev, 1, BAR1_20A4, 0);
+		break;
+	case SC0710_BOARD_ELGATEO_4KP60_MK2_R2:
+		/* BAR[5] on this variant is only 4KB. The FPGA register
+		 * offsets used by the standard MK2 (>= 0x1000) exceed this
+		 * size and are not valid. Only write BAR0 config registers
+		 * which are within the 1MB BAR[0] space.
+		 */
+		sc_write(dev, 0, BAR0_00C4, 0x000f0000);
+		printk(KERN_INFO "%s: 1cfa:0006 variant — skipping BAR1 FPGA init (4KB config space)\n",
+		       dev->name);
 		break;
 	}
 }
