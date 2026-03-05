@@ -265,7 +265,7 @@ fi
 # 2. Execute Installation based on Strategy
 case "$PKG_MANAGER" in
     pacman)
-        # Arch / Pacman based (including Manjaro, EndeavourOS)
+        # Arch / Pacman based (including Manjaro, EndeavourOS, CachyOS)
         msg2 "Installing missing dependencies (pacman)..."
         
         # Determine correct headers package
@@ -296,6 +296,13 @@ case "$PKG_MANAGER" in
                 echo -e "  ${YELLOW}Manjaro users:${NC} Try: ${BOLD}sudo pacman -S linux${KERNEL_MAJOR}${KERNEL_MINOR}-headers${NC}"
             fi
             exit 1
+        fi
+
+        # Auto-detect Clang-built kernels (CachyOS, etc.) and install LLVM toolchain
+        if grep -qs '^CONFIG_CC_IS_CLANG=y' "/lib/modules/$KERNEL_VER/build/.config" 2>/dev/null; then
+            msg2 "Clang-built kernel detected, installing LLVM toolchain..."
+            pacman -S --needed --noconfirm clang lld >/dev/null 2>&1 || true
+            log "Installed clang/lld for Clang-built kernel"
         fi
         ;;
     apt)
@@ -622,11 +629,11 @@ fi
 # --- Persistence Function ---
 save_config() {
     # Read current values (default to 0/1 if not readable, though we check module load first)
-    local dbg=\$(cat /sys/module/sc0710/parameters/debug 2>/dev/null || echo 0)
+    local dbg=\$(cat /sys/module/sc0710/parameters/sc0710_debug_mode 2>/dev/null || echo 0)
     local img=\$(cat /sys/module/sc0710/parameters/use_status_images 2>/dev/null || echo 1)
     
     # Write to modprobe config
-    echo "options sc0710 debug=\$dbg use_status_images=\$img" > /etc/modprobe.d/sc0710-params.conf
+    echo "options sc0710 sc0710_debug_mode=\$dbg use_status_images=\$img" > /etc/modprobe.d/sc0710-params.conf
     echo -e "\${BLUE}[PERSIST]\${NC} Settings saved to /etc/modprobe.d/sc0710-params.conf"
 }
 
@@ -711,7 +718,43 @@ case "\$1" in
         echo -e "\${BLUE}::\${NC} \${BOLD}Kernel Module\${NC}"
         if lsmod | grep -q \$DRV_NAME; then
             echo -e "   \${GREEN}●\${NC} Module is loaded"
-            lsmod | grep \$DRV_NAME | awk '{print "   Size: " \$2 " bytes, Used by: " \$3 " processes"}' | head -1
+            MOD_INFO=\$(lsmod | grep \$DRV_NAME | head -1)
+            MOD_SIZE=\$(echo "\$MOD_INFO" | awk '{print \$2}')
+            MOD_USED=\$(echo "\$MOD_INFO" | awk '{print \$3}')
+            echo "   Size: \$MOD_SIZE bytes, Reference count: \$MOD_USED"
+            if [[ "\$MOD_USED" -gt 0 ]]; then
+                # Find processes using video devices or ALSA sound devices
+                PIDS=""
+                for vdev in /dev/video*; do
+                    if [[ -e "\$vdev" ]]; then
+                        DEVPIDS=\$(fuser "\$vdev" 2>/dev/null | tr -s ' ')
+                        if [[ -n "\$DEVPIDS" ]]; then
+                            PIDS="\$PIDS \$DEVPIDS"
+                        fi
+                    fi
+                done
+                # Check all ALSA sound devices (control, PCM, timer, etc.)
+                for sdev in /dev/snd/*; do
+                    if [[ -e "\$sdev" ]]; then
+                        DEVPIDS=\$(fuser "\$sdev" 2>/dev/null | tr -s ' ')
+                        if [[ -n "\$DEVPIDS" ]]; then
+                            PIDS="\$PIDS \$DEVPIDS"
+                        fi
+                    fi
+                done
+                # Deduplicate and resolve PID to process name
+                if [[ -n "\$PIDS" ]]; then
+                    echo -e "   \${YELLOW}Processes holding device open:\${NC}"
+                    echo "\$PIDS" | tr ' ' '\n' | sort -un | while read -r pid; do
+                        if [[ -n "\$pid" && -f "/proc/\$pid/comm" ]]; then
+                            PNAME=\$(cat /proc/\$pid/comm 2>/dev/null)
+                            echo -e "     PID \${BOLD}\$pid\${NC} - \$PNAME"
+                        fi
+                    done
+                else
+                    echo -e "   \${YELLOW}No open device handles found (kernel-internal reference?)\${NC}"
+                fi
+            fi
         else
             echo -e "   \${RED}○\${NC} Module is not loaded"
         fi
@@ -756,8 +799,8 @@ case "\$1" in
         fi
         echo ""
         echo -e "\${BLUE}::\${NC} \${BOLD}Debug Mode\${NC}"
-        if [[ -f /sys/module/sc0710/parameters/debug ]]; then
-            DBG_STATE=\$(cat /sys/module/sc0710/parameters/debug)
+        if [[ -f /sys/module/sc0710/parameters/sc0710_debug_mode ]]; then
+            DBG_STATE=\$(cat /sys/module/sc0710/parameters/sc0710_debug_mode)
             if [[ "\$DBG_STATE" == "1" ]]; then
                 echo -e "   \${YELLOW}●\${NC} Debug mode enabled (verbose logging)"
             else
@@ -782,16 +825,16 @@ case "\$1" in
 
         ;;
     -d|--debug)
-        if [[ ! -f /sys/module/sc0710/parameters/debug ]]; then
+        if [[ ! -f /sys/module/sc0710/parameters/sc0710_debug_mode ]]; then
             echo -e "\${RED}[ERROR]\${NC} Module not loaded. Load it first with: sc0710-cli --load"
             exit 1
         fi
-        CURRENT=\$(cat /sys/module/sc0710/parameters/debug)
+        CURRENT=\$(cat /sys/module/sc0710/parameters/sc0710_debug_mode)
         if [[ "\$CURRENT" == "1" ]]; then
-            echo 0 > /sys/module/sc0710/parameters/debug
+            echo 0 > /sys/module/sc0710/parameters/sc0710_debug_mode
             echo -e "\${GREEN}[OK]\${NC} Debug mode disabled (quiet)"
         else
-            echo 1 > /sys/module/sc0710/parameters/debug
+            echo 1 > /sys/module/sc0710/parameters/sc0710_debug_mode
             echo -e "\${YELLOW}[OK]\${NC} Debug mode enabled (check dmesg for output)"
         fi
         save_config

@@ -36,6 +36,10 @@ struct sc0710_subid sc0710_subids[] = {
 		.subvendor = 0x1cfa,
 		.subdevice = 0x000e,
 		.card      = SC0710_BOARD_ELGATEO_4KP60_MK2,
+	}, {
+		.subvendor = 0x1cfa,
+		.subdevice = 0x0012,
+		.card      = SC0710_BOARD_ELGATEO_4KP60_MK2,
 	}
 };
 const unsigned int sc0710_idcount = ARRAY_SIZE(sc0710_subids);

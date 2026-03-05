@@ -52,8 +52,8 @@ module_param(dma_status, int, 0644);
 MODULE_PARM_DESC(dma_status, "Manually start or stop dma activities (def:0 Stopped)");
 
 unsigned int sc0710_debug_mode = 0;
-module_param_named(debug, sc0710_debug_mode, int, 0644);
-MODULE_PARM_DESC(debug, "enable debug messages (0=off, 1=on)");
+module_param(sc0710_debug_mode, int, 0644);
+MODULE_PARM_DESC(sc0710_debug_mode, "Enable debug logging (0=off, 1=on)");
 EXPORT_SYMBOL(sc0710_debug_mode);
 
 unsigned int msi_enable = 0;
