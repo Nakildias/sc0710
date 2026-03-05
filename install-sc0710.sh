@@ -628,11 +628,16 @@ fi
 
 # --- Persistence Function ---
 save_config() {
-    # Read current values (default to 0/1 if not readable, though we check module load first)
-    local dbg=\$(cat /sys/module/sc0710/parameters/sc0710_debug_mode 2>/dev/null || echo 0)
+    # Read current values - check both possible parameter names
+    local dbg=0
+    if [[ -f /sys/module/sc0710/parameters/sc0710_debug_mode ]]; then
+        dbg=\$(cat /sys/module/sc0710/parameters/sc0710_debug_mode 2>/dev/null || echo 0)
+    elif [[ -f /sys/module/sc0710/parameters/debug ]]; then
+        dbg=\$(cat /sys/module/sc0710/parameters/debug 2>/dev/null || echo 0)
+    fi
     local img=\$(cat /sys/module/sc0710/parameters/use_status_images 2>/dev/null || echo 1)
     
-    # Write to modprobe config
+    # Write to modprobe config using the C variable name (what module_param exposes)
     echo "options sc0710 sc0710_debug_mode=\$dbg use_status_images=\$img" > /etc/modprobe.d/sc0710-params.conf
     echo -e "\${BLUE}[PERSIST]\${NC} Settings saved to /etc/modprobe.d/sc0710-params.conf"
 }
@@ -776,8 +781,10 @@ case "\$1" in
                     
                     if [[ -z "\$BOARD_NAME" ]]; then
                         # Fallbacks
-                        if [[ "\$SUBVEN:\$SUBDEV" == "1cfa:000e" || "\$SUBVEN:\$SUBDEV" == "1cfa:0012" ]]; then
+                        if [[ "\$SUBVEN:\$SUBDEV" == "1cfa:000e" ]]; then
                             BOARD_NAME="Elgato 4k60 Pro mk.2"
+                        elif [[ "\$SUBVEN:\$SUBDEV" == "1cfa:0012" ]]; then
+                            BOARD_NAME="Elgato 4K Pro"
                         elif [[ "\$SUBVEN:\$SUBDEV" == "1cfa:0006" ]]; then
                             BOARD_NAME="Elgato 4k60 Pro mk.2 (1cfa:0006)"
                         else
@@ -837,8 +844,14 @@ case "\$1" in
         fi
         echo ""
         echo -e "\${BLUE}::\${NC} \${BOLD}Debug Mode\${NC}"
+        DBG_PATH=""
         if [[ -f /sys/module/sc0710/parameters/sc0710_debug_mode ]]; then
-            DBG_STATE=\$(cat /sys/module/sc0710/parameters/sc0710_debug_mode)
+            DBG_PATH=/sys/module/sc0710/parameters/sc0710_debug_mode
+        elif [[ -f /sys/module/sc0710/parameters/debug ]]; then
+            DBG_PATH=/sys/module/sc0710/parameters/debug
+        fi
+        if [[ -n "\$DBG_PATH" ]]; then
+            DBG_STATE=\$(cat "\$DBG_PATH")
             if [[ "\$DBG_STATE" == "1" ]]; then
                 echo -e "   \${YELLOW}●\${NC} Debug mode enabled (verbose logging)"
             else
@@ -863,16 +876,22 @@ case "\$1" in
 
         ;;
     -d|--debug)
-        if [[ ! -f /sys/module/sc0710/parameters/sc0710_debug_mode ]]; then
+        DBG_PATH=""
+        if [[ -f /sys/module/sc0710/parameters/sc0710_debug_mode ]]; then
+            DBG_PATH=/sys/module/sc0710/parameters/sc0710_debug_mode
+        elif [[ -f /sys/module/sc0710/parameters/debug ]]; then
+            DBG_PATH=/sys/module/sc0710/parameters/debug
+        fi
+        if [[ -z "\$DBG_PATH" ]]; then
             echo -e "\${RED}[ERROR]\${NC} Module not loaded. Load it first with: sc0710-cli --load"
             exit 1
         fi
-        CURRENT=\$(cat /sys/module/sc0710/parameters/sc0710_debug_mode)
+        CURRENT=\$(cat "\$DBG_PATH")
         if [[ "\$CURRENT" == "1" ]]; then
-            echo 0 > /sys/module/sc0710/parameters/sc0710_debug_mode
+            echo 0 > "\$DBG_PATH"
             echo -e "\${GREEN}[OK]\${NC} Debug mode disabled (quiet)"
         else
-            echo 1 > /sys/module/sc0710/parameters/sc0710_debug_mode
+            echo 1 > "\$DBG_PATH"
             echo -e "\${YELLOW}[OK]\${NC} Debug mode enabled (check dmesg for output)"
         fi
         save_config

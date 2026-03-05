@@ -30,6 +30,7 @@ int sc0710_dma_channels_resize(struct sc0710_dev *dev)
 	switch (dev->board) {
 	case SC0710_BOARD_ELGATEO_4KP60_MK2:
 	case SC0710_BOARD_ELGATEO_4KP60_MK2_R2:
+	case SC0710_BOARD_ELGATEO_4KP:
 		sc0710_dma_channel_resize(dev, 0, CHDIR_INPUT, 0x1000, CHTYPE_VIDEO);
 		/* Audio uses fixed buffer size, do not resize as it may be active via ALSA */
 		/* sc0710_dma_channel_resize(dev, 1, CHDIR_INPUT, 0x1100, CHTYPE_AUDIO); */
@@ -44,6 +45,7 @@ int sc0710_dma_channels_alloc(struct sc0710_dev *dev)
 	switch (dev->board) {
 	case SC0710_BOARD_ELGATEO_4KP60_MK2:
 	case SC0710_BOARD_ELGATEO_4KP60_MK2_R2:
+	case SC0710_BOARD_ELGATEO_4KP:
 		sc0710_dma_channel_alloc(dev, 0, CHDIR_INPUT, 0x1000, CHTYPE_VIDEO);
 		sc0710_dma_channel_alloc(dev, 1, CHDIR_INPUT, 0x1100, CHTYPE_AUDIO);
 		break;
@@ -80,6 +82,13 @@ int sc0710_dma_channels_start(struct sc0710_dev *dev)
 
 	printk("%s()\n", __func__);
 
+	/* Send MCU init commands for 4K Pro to activate FPGA pipeline */
+	if (dev->board == SC0710_BOARD_ELGATEO_4KP) {
+		mutex_lock(&dev->signalMutex);
+		sc0710_lt6911_enable_output(dev);
+		mutex_unlock(&dev->signalMutex);
+	}
+
 	/* Prepare all DMA channels to start */
 	for (i = 0; i < SC0710_MAX_CHANNELS; i++) {
 		ret = sc0710_dma_channel_start_prep(&dev->channel[i]);
@@ -96,18 +105,53 @@ int sc0710_dma_channels_start(struct sc0710_dev *dev)
 	} else {
 		sc_write(dev, 0, BAR0_00C8, 0x438); /* 1080 default */
 	}
+
+	/* Set scaler output height for 4K Pro (always 1080p output).
+	 * Without this, the FPGA scaler produces no output and the
+	 * XDMA C2H engine gets no AXI-Stream data.
+	 */
+	if (dev->board == SC0710_BOARD_ELGATEO_4KP)
+		sc_write(dev, 0, BAR0_00D8, 0x438);
+
 	sc_write(dev, 0, BAR0_00D0, 0x4100);
-	sc_write(dev, 0, 0xcc, 0);
-	sc_write(dev, 0, 0xdc, 0);
+	sc_write(dev, 0, 0xCC, 0x00000000);
+	/* DC: MK2 uses 0 (no scaler). 4K Pro: FPGA auto-populates to 0x1050. */
+	if (dev->board != SC0710_BOARD_ELGATEO_4KP)
+		sc_write(dev, 0, BAR0_00DC, 0x00000000);
 	sc_write(dev, 0, BAR0_00D0, 0x4300);
 	sc_write(dev, 0, BAR0_00D0, 0x4100);
 
-	/* Start all DMA channels. */
+	/* Enable the pipeline BEFORE starting DMA.
+	 * On 4K Pro, A8 takes ~100ms to become non-zero after D0|=1.
+	 * The XDMA C2H engine stalls if started without stream data.
+	 */
+	sc_set(dev, 0, BAR0_00D0, 0x0001);
+
+	/* Enable scaler-to-DMA data path (4K Pro only). */
+	if (dev->board == SC0710_BOARD_ELGATEO_4KP)
+		sc_write(dev, 0, 0xEC, 0x00000001);
+
+	if (dev->board == SC0710_BOARD_ELGATEO_4KP) {
+		int poll;
+		u32 a8;
+		for (poll = 0; poll < 20; poll++) {
+			msleep(100);
+			a8 = sc_read(dev, 0, 0xa8);
+			if (a8 != 0) {
+				printk(KERN_INFO "%s: A8 active after %dms: %08x\n",
+					dev->name, (poll + 1) * 100, a8);
+				break;
+			}
+		}
+		if (a8 == 0)
+			printk(KERN_WARNING "%s: A8 still 0 after 2s — DMA may stall\n",
+				dev->name);
+	}
+
+	/* Start all DMA channels after pipeline is active. */
 	for (i = 0; i < SC0710_MAX_CHANNELS; i++) {
 		ret = sc0710_dma_channel_start(&dev->channel[i]);
 	}
-
-	sc_set(dev, 0, BAR0_00D0, 0x0001);
 
 	return 0;
 }

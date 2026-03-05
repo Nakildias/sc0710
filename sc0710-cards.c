@@ -34,6 +34,10 @@ struct sc0710_board sc0710_boards[] = {
 		.name		= "Elgato 4k60 Pro mk.2 (1cfa:0006)",
 		.bar1_index	= 5, /* Config space is on BAR[5], not BAR[1] */
 	},
+	[SC0710_BOARD_ELGATEO_4KP] = {
+		.name		= "Elgato 4K Pro",
+		.bar1_index	= 1,
+	},
 };
 const unsigned int sc0710_bcount = ARRAY_SIZE(sc0710_boards);
 
@@ -45,7 +49,7 @@ struct sc0710_subid sc0710_subids[] = {
 	}, {
 		.subvendor = 0x1cfa,
 		.subdevice = 0x0012,
-		.card      = SC0710_BOARD_ELGATEO_4KP60_MK2,
+		.card      = SC0710_BOARD_ELGATEO_4KP,
 	}, {
 		.subvendor = 0x1cfa,
 		.subdevice = 0x0006,
@@ -87,6 +91,7 @@ void sc0710_gpio_setup(struct sc0710_dev *dev)
 	switch (dev->board) {
 	case SC0710_BOARD_ELGATEO_4KP60_MK2:
 	case SC0710_BOARD_ELGATEO_4KP60_MK2_R2:
+	case SC0710_BOARD_ELGATEO_4KP:
 		break;
 	}
 }
@@ -96,6 +101,49 @@ void sc0710_card_setup(struct sc0710_dev *dev)
 	switch (dev->board) {
 	case SC0710_BOARD_ELGATEO_4KP60_MK2:
 		sc_write(dev, 0, BAR0_00C4, 0x000f0000);
+		sc_write(dev, 1, BAR1_0094, 0x00fffe3e);
+		sc_write(dev, 1, BAR1_0008, 0x00fffe3e);
+		sc_write(dev, 1, BAR1_0194, 0x00fffe3e);
+		sc_write(dev, 1, BAR1_0108, 0x00fffe3e);
+		sc_write(dev, 1, BAR1_1094, 0x00fffe7e);
+		sc_write(dev, 1, BAR1_1008, 0x00fffe7e);
+		sc_write(dev, 1, BAR1_1194, 0x00fffe7e);
+		sc_write(dev, 1, BAR1_1108, 0x00fffe7e);
+		sc_write(dev, 1, BAR1_2080, 0);
+		sc_write(dev, 1, BAR1_2084, 0);
+		sc_write(dev, 1, BAR1_2088, 0);
+		sc_write(dev, 1, BAR1_208C, 0);
+		sc_write(dev, 1, BAR1_20A0, 0);
+		sc_write(dev, 1, BAR1_20A4, 0);
+		break;
+	case SC0710_BOARD_ELGATEO_4KP:
+		sc_write(dev, 0, BAR0_00C4, 0x000f0000);
+
+		/* Soft reset and configure all 8 AXI IIC instances (0x3000-0x3E00).
+		 * Windows driver initializes all 8 identically. Each instance is
+		 * at a 0x200 offset: SOFTR at base+0x040, timing at base+0x128..0x144.
+		 * Without the soft reset, the 4K Pro's I2C controller starts wedged.
+		 */
+		{
+			int iic;
+			for (iic = 0; iic < 8; iic++) {
+				u32 base = 0x3000 + (iic * 0x200);
+				sc_write(dev, 0, base + 0x040, 0x0000000a); /* SOFTR */
+			}
+			udelay(10);
+			for (iic = 0; iic < 8; iic++) {
+				u32 base = 0x3000 + (iic * 0x200);
+				sc_write(dev, 0, base + 0x128, 0x0000002d); /* TSUSTA */
+				sc_write(dev, 0, base + 0x12c, 0x0000002d); /* TSUSTO */
+				sc_write(dev, 0, base + 0x130, 0x0000002d); /* THDSTA */
+				sc_write(dev, 0, base + 0x134, 0x00000014); /* TSUDAT */
+				sc_write(dev, 0, base + 0x138, 0x00000050); /* TBUF */
+				sc_write(dev, 0, base + 0x13c, 0x00000076); /* THIGH */
+				sc_write(dev, 0, base + 0x140, 0x00000076); /* TLOW */
+				sc_write(dev, 0, base + 0x144, 0x00000001); /* THDDAT */
+			}
+		}
+
 		sc_write(dev, 1, BAR1_0094, 0x00fffe3e);
 		sc_write(dev, 1, BAR1_0008, 0x00fffe3e);
 		sc_write(dev, 1, BAR1_0194, 0x00fffe3e);

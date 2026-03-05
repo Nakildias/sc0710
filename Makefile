@@ -39,13 +39,15 @@ load:	all
 	sudo modprobe videobuf2-common
 	sudo modprobe videodev
 	#sudo modprobe videobuf-dma-sg
-	sudo modprobe videobuf-vmalloc
+	sudo modprobe videobuf2-vmalloc
 	sudo insmod ./sc0710.ko \
 		thread_dma_poll_interval_ms=2 \
 		dma_status=0
 
 unload:
-	sudo rmmod sc0710
+	# Only real way to remove the module due to the module not dereferencing itself
+	# Decent chance this causes kernel issues if unlucky
+	sudo rmmod -f sc0710
 	sync
 
 tarball:

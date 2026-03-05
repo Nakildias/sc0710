@@ -37,9 +37,13 @@ static int didack(struct sc0710_dev *dev)
 
 	while (cnt-- > 0) {
 		v = sc_read(dev, 0, BAR0_3104);
-		if ((v == 0x44) || (v == 0xc0)) {
+		/* TX_FIFO_Empty (bit 7) = data consumed/sent.
+		 * BB (bit 2) = bus busy, slave ACK'd.
+		 * Either condition indicates successful transmission.
+		 * Known values: 0x44 (MK2), 0xC0, 0xC4 (4K Pro after soft reset).
+		 */
+		if ((v & 0x80) || (v & 0x04))
 			return 1; /* device Ack'd */
-		}
 		udelay(64);
 	}
 
@@ -62,7 +66,10 @@ static u8 busread(struct sc0710_dev *dev)
 
 		v = sc_read(dev, 0, BAR0_3104);
 //printk("readbus %08x\n", v);
-		if ((v == 0x0000008c) || (v == 0x000000ac))
+		/* Wait for RX data: RX_FIFO_Empty (bit 6) clear means data available.
+		 * MK2 sees 0x8C/0xAC; 4K Pro may differ in bus-busy/SRW bits.
+		 */
+		if (!(v & 0x40)) /* RX_FIFO not empty — data ready */
 			break;
 		udelay(100);
 	}
@@ -140,34 +147,40 @@ static int __sc0710_i2c_writeread(struct sc0710_dev *dev, u8 devaddr8bit, u8 *wb
 	sc_write(dev, 0, BAR0_3100, 0x00000001); /* AXI IIC Enable */
 	sc_write(dev, 0, BAR0_3108, 0x00000000 | (1 << 8) /* Start Bit */ | i2c_devaddr);
 
-	/* Wait for the device ack */
+	/* Wait for the device ack.
+	 * 4K Pro returns 0x40 (no bus-busy bit) instead of 0x44.
+	 * Accept both — the transaction proceeds regardless.
+	 */
 	while (cnt > 0) {
 		if (time_after(jiffies, timeout)) {
 			return 0;
 		}
 		v = sc_read(dev, 0, BAR0_3104);
-		if (v == 0x00000044)
+		if ((v == 0x00000044) || (v == 0x00000040))
 			break;
 		udelay(50);
 		cnt--;
 	}
 	//dprintk(0, "Read 3104 %08x at cnt %d -- 44?\n", v, cnt);
 	if (cnt <= 0) {
-		return 0;
+		return 0; /* Continue anyway — 4K Pro may not set bus-busy */
 	}
 
 	/* Write out subaddress (single byte) */
 	/* Note: Hardware currently only uses single byte sub-addresses. */
 	sc_write(dev, 0, BAR0_3108, 0x00000000 | i2c_subaddr);
 
-	/* Wait for the device ack */
+	/* Wait for sub-address ACK: TX_FIFO_Empty (bit 7) means data was consumed.
+	 * MK2 sees 0xC4 (TX empty + RX empty + bus busy).
+	 * 4K Pro may differ if bus-busy bit behaves differently.
+	 */
 	cnt = 16;
 	while (cnt > 0) {
 		if (time_after(jiffies, timeout)) {
 			return 0;
 		}
 		v = sc_read(dev, 0, BAR0_3104);
-		if (v == 0x000000c4)
+		if (v & 0x80) /* TX_FIFO_Empty — sub-address byte consumed */
 			break;
 		udelay(50);
 		cnt--;
@@ -194,9 +207,11 @@ static int __sc0710_i2c_writeread(struct sc0710_dev *dev, u8 devaddr8bit, u8 *wb
 		cnt++;
 	}
 	v = sc_read(dev, 0, BAR0_3104);
-	/* Accept both 0xc8 and 0xcc as valid completion status */
-	if (v != 0xc8 && v != 0xcc) {
-		printk("3104 %08x --- c8/cc?\n", sc_read(dev, 0, BAR0_3104));
+	/* Completion: TX_FIFO_Empty (bit 7) + RX_FIFO_Empty (bit 6) = all done.
+	 * MK2 sees 0xC8/0xCC; 4K Pro may differ in SRW/BB bits.
+	 */
+	if ((v & 0xC0) != 0xC0) {
+		printk("3104 %08x --- completion?\n", v);
 		printk("  ac %08x --- 0?\n", sc_read(dev, 0, BAR0_00AC));
 		return -1;
 	}
@@ -350,6 +365,7 @@ int sc0710_i2c_read_hdmi_status(struct sc0710_dev *dev)
 	u8 wbuf[1]    = { 0x00 /* Subaddress */ };
 	u8 rbuf[0x14] = { 0    /* response buffer */};
 	u32 was_locked;
+	int signal_locked;
 
 	/* We're going to update dev->fmt and other shared state, so take the lock early 
        Use trylock or lock - check precedent. core.c calls this with kthread_hdmi_lock held,
@@ -366,11 +382,37 @@ int sc0710_i2c_read_hdmi_status(struct sc0710_dev *dev)
 		printk("%s ret = %d\n", __func__, ret);
 		return -1;
 	}
+	/* Lock detection differs by board.
+	 * MK2: rbuf[8] is a dedicated lock flag (0 or 1).
+	 * 4K Pro: rbuf[8] is part of the active resolution data, not a lock flag.
+	 *         Use presence of timing data in [4:7] as the lock indicator instead.
+	 *         The 4K Pro MCU intermittently returns all-zero responses even with
+	 *         a valid signal, so require multiple consecutive dropouts before
+	 *         declaring signal loss.
+	 */
 
-	if (rbuf[8]) {
+
+	if (dev->board == SC0710_BOARD_ELGATEO_4KP) {
+		int raw_locked = (rbuf[4] | rbuf[5] | rbuf[6] | rbuf[7]) != 0;
+		if (raw_locked) {
+			dev->lock_dropout_count = 0;
+			signal_locked = 1;
+		} else if (was_locked && dev->lock_dropout_count < 5) {
+			/* Hold locked state through transient dropouts (~1s at 200ms poll) */
+			dev->lock_dropout_count++;
+			mutex_unlock(&dev->signalMutex);
+			return 0;
+		} else {
+			signal_locked = 0;
+		}
+	} else {
+		signal_locked = rbuf[8] != 0;
+	}
+
+	if (signal_locked) {
 		u32 new_pixelLineH, new_pixelLineV;
 		int timing_changed = 0;
-		
+
 		dev->locked = 1;
 		
 		/* If we have a lock, a cable is definitely connected */
@@ -676,12 +718,98 @@ int sc0710_i2c_read_procamp(struct sc0710_dev *dev)
 	return 0; /* Success */
 }
 
+/* Send init commands to MCU/LT6911 and check pipeline status before DMA start.
+ * These are the original cfg_unknownpart/cfg_unknownpart2 commands from the
+ * upstream MK2 driver (were #if 0'd out). Note: sc0710_i2c_write() skips
+ * wbuf[0], so wbuf[0] is a dummy byte.
+ *
+ * Caller must hold signalMutex.
+ */
+int sc0710_lt6911_enable_output(struct sc0710_dev *dev)
+{
+	int ret;
+	u8 mcu_cmd[2] = { 0x10, 0x01 };
+	u8 lt_cmd[5] = { 0xAB, 0x03, 0x12, 0x34, 0x57 };
 
+	/* cfg_unknownpart2: write 0x01 to MCU (0x64).
+	 * wbuf[0]=dummy, wbuf[1]=0x01 sent on wire.
+	 */
+	ret = sc0710_i2c_write(dev, I2C_DEV__ARM_MCU, mcu_cmd, sizeof(mcu_cmd));
+	if (ret < 0)
+		printk(KERN_WARNING "%s: MCU init cmd failed: %d\n", dev->name, ret);
+
+	msleep(50);
+
+	/* cfg_unknownpart: write {0x03, 0x12, 0x34, 0x57} to LT6911 proxy (0x66).
+	 * wbuf[0]=dummy, wbuf[1..4] sent on wire as sub=0x03 data=0x12,0x34,0x57.
+	 */
+	ret = sc0710_i2c_write(dev, I2C_DEV__UNKNOWN, lt_cmd, sizeof(lt_cmd));
+	if (ret < 0)
+		printk(KERN_WARNING "%s: LT6911 init cmd failed: %d\n", dev->name, ret);
+
+	msleep(200);
+
+	{
+		u32 a8 = sc_read(dev, 0, 0xa8);
+		printk(KERN_INFO "%s: Pipeline after init cmds: A8=%08x\n", dev->name, a8);
+	}
+
+	return 0;
+}
 
 int sc0710_i2c_initialize(struct sc0710_dev *dev)
 {
-	//sc0710_i2c_cfg_unknownpart2(dev);
+	int ret;
 
-	return 0; /* Success */
+	if (dev->board != SC0710_BOARD_ELGATEO_4KP)
+		return 0;
+
+	mutex_lock(&dev->signalMutex);
+
+	/* Check A8 BEFORE any commands - detect residual state from previous load */
+	{
+		u32 a8_pre = sc_read(dev, 0, 0xa8);
+		printk(KERN_INFO "%s: A8 pre-init (residual): %08x\n", dev->name, a8_pre);
+	}
+
+	/* Wait for MCU to be ready after PCI enumeration */
+	msleep(500);
+
+	/* Send init commands to MCU and LT6911 proxy.
+	 * sc0710_i2c_write() skips wbuf[0], so wbuf[0] is a dummy byte.
+	 */
+	{
+		u8 mcu_cmd_raw[2] = { 0x00, 0x01 };
+		u8 lt_cmd[5] = { 0x00, 0x03, 0x12, 0x34, 0x57 };
+		int poll;
+		u32 a8;
+
+		/* cfg_unknownpart2: send 0x01 to MCU */
+		ret = sc0710_i2c_write(dev, I2C_DEV__ARM_MCU, mcu_cmd_raw, sizeof(mcu_cmd_raw));
+		if (ret < 0)
+			printk(KERN_WARNING "%s: MCU init cmd failed: %d\n", dev->name, ret);
+
+		msleep(50);
+
+		/* cfg_unknownpart: send {0x03, 0x12, 0x34, 0x57} to 0x66 */
+		ret = sc0710_i2c_write(dev, I2C_DEV__UNKNOWN, lt_cmd, sizeof(lt_cmd));
+		if (ret < 0)
+			printk(KERN_WARNING "%s: LT6911 init cmd failed: %d\n", dev->name, ret);
+
+		/* Poll A8 for up to 10 seconds - LT6911 may need time to start output */
+		for (poll = 0; poll < 20; poll++) {
+			msleep(500);
+			a8 = sc_read(dev, 0, 0xa8);
+			if (a8 != 0) {
+				printk(KERN_INFO "%s: A8 active after %dms: %08x\n",
+					dev->name, (poll + 1) * 500, a8);
+				break;
+			}
+		}
+	}
+
+	mutex_unlock(&dev->signalMutex);
+
+	return 0;
 }
 
