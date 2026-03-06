@@ -665,16 +665,36 @@ void sc0710_dma_channel_free(struct sc0710_dev *dev, u32 nr)
  */
 int sc0710_dma_channel_start_prep(struct sc0710_dma_channel *ch)
 {
+	int i, total_descriptors = 0;
+
 	if (ch->state == STATE_RUNNING)
 		return 0;
 
+	/* Stop engine first */
 	sc_write(ch->dev, 1, ch->reg_dma_control_w1c, 0x00000001);
 
+	/* Full XDMA engine reset (Xilinx reference sequence).
+	 * Without this, the engine may be wedged from a previous load.
+	 */
+	sc_write(ch->dev, 1, ch->reg_dma_control_w1s, 0x01000000); /* Assert reset (bit 24) */
+	mdelay(1);
+	sc_write(ch->dev, 1, ch->reg_dma_control_w1c, 0x01000001); /* Clear reset + run */
+
+	/* Re-apply IE bits after reset cleared the control register */
+	sc_write(ch->dev, 1, ch->reg_dma_control_w1s, 0x00fffe7e);
+	/* Re-apply interrupt enable register */
+	sc_write(ch->dev, 1, ch->register_dma_base + 0x94, 0x00fffe7e);
+
 	ch->dma_completed_descriptor_count_last = 0;
-	sc_write(ch->dev, 1, ch->reg_dma_completed_descriptor_count, 1);
+	sc_write(ch->dev, 1, ch->reg_dma_completed_descriptor_count, 0);
 	sc_write(ch->dev, 1, ch->reg_sg_start_h, ch->pt_dma >> 32);
 	sc_write(ch->dev, 1, ch->reg_sg_start_l, ch->pt_dma);
 	sc_write(ch->dev, 1, ch->reg_sg_adj, 0);
+
+	/* Count total descriptors for SG credits (written after run bit in start) */
+	for (i = 0; i < ch->numDescriptorChains; i++)
+		total_descriptors += ch->chains[i].numAllocations;
+	ch->sg_total_descriptors = total_descriptors;
 
 	return 0;
 }
@@ -699,6 +719,13 @@ int sc0710_dma_channel_start(struct sc0710_dma_channel *ch)
 		return 0;
 
 	sc_write(ch->dev, 1, ch->reg_dma_control_w1s, 0x00000001);
+
+	/* Write SG credits after run bit is set.
+	 * The XDMA SG fetcher requires the engine to be running
+	 * before credits are accepted.
+	 */
+	sc_write(ch->dev, 1, ch->reg_sg_credits, ch->sg_total_descriptors);
+
 	ch->state = STATE_RUNNING;
 	return 0;
 }

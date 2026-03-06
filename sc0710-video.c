@@ -498,8 +498,21 @@ const struct sc0710_format *sc0710_format_find_by_timing(u32 timingH, u32 timing
 {
 	unsigned int i;
 
+	/* First try matching against total timing (htotal/vtotal).
+	 * Most sources report total timing in pixelLineH/V.
+	 */
 	for (i = 0; i < ARRAY_SIZE(formats); i++) {
 		if ((formats[i].timingH == timingH) && (formats[i].timingV == timingV)) {
+			return &formats[i];
+		}
+	}
+
+	/* Fall back to matching against active resolution (width/height).
+	 * Some sources (e.g. Nintendo Switch 2) report active pixel
+	 * dimensions in pixelLineH/V instead of total timing.
+	 */
+	for (i = 0; i < ARRAY_SIZE(formats); i++) {
+		if ((formats[i].width == timingH) && (formats[i].height == timingV)) {
 			return &formats[i];
 		}
 	}
@@ -512,14 +525,33 @@ const struct sc0710_format *sc0710_format_find_by_timing_and_rate(u32 timingH, u
 	unsigned int i;
 	const struct sc0710_format *best_fmt = NULL;
 	u32 best_diff = 0xFFFFFFFF;
+	int pass;
 
 	if (sc0710_debug_mode)
-		printk(KERN_INFO "sc0710: Match TargetFPS=%u\n", target_fps);
+		printk(KERN_INFO "sc0710: Match %ux%u TargetFPS=%u\n", timingH, timingV, target_fps);
 
-	for (i = 0; i < ARRAY_SIZE(formats); i++) {
-		if ((formats[i].timingH == timingH) && (formats[i].timingV == timingV)) {
-			u32 fps = formats[i].fpsX100 / 100;
-			u32 diff;
+	/* Pass 0: match against total timing (timingH/timingV).
+	 * Pass 1: fall back to active resolution (width/height).
+	 * Most sources report total timing (e.g. 2200x1125 for 1080p).
+	 * Some sources report active resolution (e.g. 1920x1080).
+	 */
+	for (pass = 0; pass < 2; pass++) {
+		best_fmt = NULL;
+		best_diff = 0xFFFFFFFF;
+
+		for (i = 0; i < ARRAY_SIZE(formats); i++) {
+			int match;
+			u32 fps, diff;
+
+			if (pass == 0)
+				match = (formats[i].timingH == timingH) && (formats[i].timingV == timingV);
+			else
+				match = (formats[i].width == timingH) && (formats[i].height == timingV);
+
+			if (!match)
+				continue;
+
+			fps = formats[i].fpsX100 / 100;
 
 			/* If no hint, return first match (legacy behavior) */
 			if (target_fps == 0) {
@@ -534,25 +566,24 @@ const struct sc0710_format *sc0710_format_find_by_timing_and_rate(u32 timingH, u
 				diff = target_fps - fps;
 
 			if (sc0710_debug_mode)
-				printk(KERN_INFO "sc0710: Cand %s FPS=%u Diff=%u\n", formats[i].name, fps, diff);
+				printk(KERN_INFO "sc0710: Cand %s FPS=%u Diff=%u (pass=%d)\n", formats[i].name, fps, diff, pass);
 
-			/* Special handling: If hint implies 60Hz (0x3C), allow 120Hz matches 
-			 * as they are often reported ambiguously or 120 is multiple of 60.
-			 * Favor exact match first, but keep track.
-			 */
-			
 			if (diff < best_diff) {
 				best_diff = diff;
 				best_fmt = &formats[i];
 			}
-			
+
 			/* Exact match optimization */
 			if (diff == 0)
 				return &formats[i];
 		}
+
+		/* If we found a match in this pass, return it */
+		if (best_fmt)
+			return best_fmt;
 	}
 
-	return best_fmt;
+	return NULL;
 }
 
 
@@ -1066,17 +1097,12 @@ static int sc0710_video_release(struct file *file)
 
 	/* Release the per-client VB2 queue */
 	if (fh->client) {
-		/* Stop streaming if this client was streaming */
-		if (fh->client->streaming) {
-			vb2_queue_release(&fh->client->vb2_queue);
-		}
-
 		/* Remove from client list */
 		spin_lock_irqsave(&ch->client_list_lock, flags);
 		list_del(&fh->client->list);
 		spin_unlock_irqrestore(&ch->client_list_lock, flags);
 
-		/* Release the queue */
+		/* Release the queue (handles stopping streaming if needed) */
 		vb2_queue_release(&fh->client->vb2_queue);
 
 		kfree(fh->client);

@@ -98,9 +98,11 @@ extern unsigned int sc0710_debug_mode;
 #define SC0710_BOARD_NOAUTO              UNSET
 #define SC0710_BOARD_UNKNOWN             0
 #define SC0710_BOARD_ELGATEO_4KP60_MK2   1
+#define SC0710_BOARD_ELGATEO_4KP         2
 
 struct sc0710_board {
 	char *name;
+	int   bar1_index; /* PCI BAR index for config registers (1 or 5) */
 };
 
 struct sc0710_subid {
@@ -253,6 +255,7 @@ struct sc0710_dma_channel
 	u32                          reg_sg_credits;
 
 	/* DMA related items we need to track. */
+	u32                          sg_total_descriptors;
 	u32                          dma_completed_descriptor_count_last;
 
 	/* Statistics */
@@ -351,6 +354,7 @@ struct sc0710_dev {
 	unsigned char              pci_rev, pci_lat;
 	u32                        __iomem *lmmio[2];
 	u8                         __iomem *bmmio[2];
+	u32                        bar1_size; /* Size of config BAR in bytes (for bounds checking) */
 
 	/* A kernel thread to keep the HDMI video frontend alive. */
  	struct task_struct         *kthread_hdmi;
@@ -383,6 +387,7 @@ struct sc0710_dev {
 	enum sc0710_eotf_e         eotf;       /* Detected/forced EOTF for HDR */
 	u32                        cable_connected; /* 5V sense: cable physically present */
 	u32                        unlocked_no_timing_count; /* Consecutive polls with no lock and no timing */
+	u32                        lock_dropout_count;       /* 4K Pro: consecutive polls with no lock while previously locked */
 
 
 
@@ -437,6 +442,7 @@ int sc0710_i2c_read_status2(struct sc0710_dev *dev);
 int sc0710_i2c_read_status3(struct sc0710_dev *dev);
 int sc0710_i2c_read_procamp(struct sc0710_dev *dev);
 int sc0710_i2c_write_mcu(struct sc0710_dev *dev, u8 subaddr, u8 *data, int len);
+int sc0710_lt6911_enable_output(struct sc0710_dev *dev);
 
 /* -formats.c */
 void sc0710_format_initialize(void);

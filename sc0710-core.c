@@ -52,8 +52,8 @@ module_param(dma_status, int, 0644);
 MODULE_PARM_DESC(dma_status, "Manually start or stop dma activities (def:0 Stopped)");
 
 unsigned int sc0710_debug_mode = 0;
-module_param_named(debug, sc0710_debug_mode, int, 0644);
-MODULE_PARM_DESC(debug, "enable debug messages (0=off, 1=on)");
+module_param(sc0710_debug_mode, int, 0644);
+MODULE_PARM_DESC(sc0710_debug_mode, "Enable debug logging (0=off, 1=on)");
 EXPORT_SYMBOL(sc0710_debug_mode);
 
 unsigned int msi_enable = 0;
@@ -75,17 +75,23 @@ LIST_HEAD(sc0710_devlist);
 
 static void sc_andor(struct sc0710_dev *dev, int bar, u32 reg, u32 mask, u32 value)
 {
+	if (bar == 1 && dev->bar1_size && reg >= dev->bar1_size)
+		return;
 	u32 newval = (readl(dev->lmmio[bar]+((reg)>>2)) & ~(mask)) | ((value) & (mask));
 	writel(newval, dev->lmmio[bar]+((reg)>>2));
 }
 
 u32 sc_read(struct sc0710_dev *dev, int bar, u32 reg)
 {
+	if (bar == 1 && dev->bar1_size && reg >= dev->bar1_size)
+		return 0xFFFFFFFF;
 	return readl(dev->lmmio[bar] + (reg >> 2));
 }
 
 void sc_write(struct sc0710_dev *dev, int bar, u32 reg, u32 value)
 {
+	if (bar == 1 && dev->bar1_size && reg >= dev->bar1_size)
+		return;
 	writel(value, dev->lmmio[bar] + (reg >>2));
 }
 
@@ -107,6 +113,8 @@ static void sc0710_shutdown(struct sc0710_dev *dev)
 
 static int get_resources(struct sc0710_dev *dev)
 {
+	int bar1_idx = sc0710_boards[dev->board].bar1_index;
+
 	if (request_mem_region(pci_resource_start(dev->pci, 0), pci_resource_len(dev->pci, 0), dev->name) == 0)
 	{
 		printk(KERN_ERR "%s: can't get var[0] memory @ 0x%llx\n",
@@ -114,10 +122,10 @@ static int get_resources(struct sc0710_dev *dev)
 		return -EBUSY;
 	}
 
-	if (request_mem_region(pci_resource_start(dev->pci, 1), pci_resource_len(dev->pci, 1), dev->name) == 0)
+	if (request_mem_region(pci_resource_start(dev->pci, bar1_idx), pci_resource_len(dev->pci, bar1_idx), dev->name) == 0)
 	{
-		printk(KERN_ERR "%s: can't get bar[1] memory @ 0x%llx\n",
-			dev->name, (unsigned long long)pci_resource_start(dev->pci, 1));
+		printk(KERN_ERR "%s: can't get bar[%d] memory @ 0x%llx\n",
+			dev->name, bar1_idx, (unsigned long long)pci_resource_start(dev->pci, bar1_idx));
 		return -EBUSY;
 	}
 
@@ -164,9 +172,12 @@ static int sc0710_dev_setup(struct sc0710_dev *dev)
 	}
 
 	/* PCIe stuff */
+	int bar1_idx = sc0710_boards[dev->board].bar1_index;
+	dev->bar1_size = pci_resource_len(dev->pci, bar1_idx);
+
 	dev->lmmio[0] = ioremap(pci_resource_start(dev->pci, 0), pci_resource_len(dev->pci, 0));
 	dev->bmmio[0] = (u8 __iomem *)dev->lmmio[0];
-	dev->lmmio[1] = ioremap(pci_resource_start(dev->pci, 1), pci_resource_len(dev->pci, 1));
+	dev->lmmio[1] = ioremap(pci_resource_start(dev->pci, bar1_idx), dev->bar1_size);
 	dev->bmmio[1] = (u8 __iomem *)dev->lmmio[1];
 
 	printk(KERN_INFO "%s: subsystem: %04x:%04x, board: %s [card=%d,%s]\n",
@@ -180,8 +191,10 @@ static int sc0710_dev_setup(struct sc0710_dev *dev)
 
 static void sc0710_dev_unregister(struct sc0710_dev *dev)
 {
+	int bar1_idx = sc0710_boards[dev->board].bar1_index;
+
 	release_mem_region(pci_resource_start(dev->pci, 0), pci_resource_len(dev->pci, 0));
-	release_mem_region(pci_resource_start(dev->pci, 1), pci_resource_len(dev->pci, 1));
+	release_mem_region(pci_resource_start(dev->pci, bar1_idx), pci_resource_len(dev->pci, bar1_idx));
 
 	if (!atomic_dec_and_test(&dev->refcount))
 		return;
@@ -612,6 +625,11 @@ static struct pci_device_id sc0710_pci_tbl[] = {
 	{
 		.vendor       = 0x12ab,
 		.device       = 0x0710,
+		.subvendor    = PCI_ANY_ID,
+		.subdevice    = PCI_ANY_ID,
+	} , {
+		.vendor       = 0x12ab,
+		.device       = 0x0380,
 		.subvendor    = PCI_ANY_ID,
 		.subdevice    = PCI_ANY_ID,
 	} , {
