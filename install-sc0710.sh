@@ -671,12 +671,12 @@ show_help() {
     echo -e "\${BOLD}OPTIONS:\${NC}"
     echo -e "    \${BOLD}-l, --load\${NC}       Load the driver module"
     echo -e "    \${BOLD}-u, --unload\${NC}     Unload the driver module"
-    echo -e "    \${BOLD}-r, --restart\${NC}    Restart the driver module"
+    echo -e "    \${BOLD}--restart\${NC}        Restart the driver module"
     echo -e "    \${BOLD}-s, --status\${NC}     Show DKMS and module status"
     echo -e "    \${BOLD}-d, --debug\${NC}      Toggle debug mode on/off"
     echo -e "    \${BOLD}-it, --image-toggle\${NC} Toggle status images on/off"
     echo -e "    \${BOLD}-U, --update\${NC}     Check for updates and reinstall"
-    echo -e "    \${BOLD}-R, --remove\${NC}     Completely uninstall driver and CLI"
+    echo -e "    \${BOLD}-r, -R, --remove\${NC} Completely uninstall driver and CLI"
     echo -e "    \${BOLD}-v, --version\${NC}    Show version information"
     echo -e "    \${BOLD}-h, --help\${NC}       Show this help message"
     echo ""
@@ -710,7 +710,7 @@ case "\$1" in
             echo -e "\${GREEN}[OK]\${NC} Driver unloaded successfully."
         fi
         ;;
-    -r|--restart)
+    --restart)
         \$0 --unload
         sleep 1
         \$0 --load
@@ -922,9 +922,12 @@ case "\$1" in
         echo -e "\${BLUE}::\${NC} Re-running installer from GitHub..."
         exec bash -c "\$(curl -fsSL https://raw.githubusercontent.com/Nakildias/sc0710/main/install-sc0710.sh)"
         ;;
-    -R|--remove)
+    -r|-R|--remove)
         echo -e "\${BLUE}::\${NC} Uninstalling driver and utility..."
-        dkms remove -m \$DRV_NAME --all >/dev/null 2>&1 || true
+        for ver in \$(dkms status | grep "\$DRV_NAME" | sed 's/.*\/\([^,]*\),.*/\1/'); do
+            dkms remove -m "\$DRV_NAME" -v "\$ver" --all >/dev/null 2>&1 || true
+        done
+        rm -rf "/usr/src/\${DRV_NAME}-"*
         rm -f "/etc/modules-load.d/\${DRV_NAME}.conf"
         rm -f "/etc/modprobe.d/\${DRV_NAME}.conf"
         rm -f "/usr/local/bin/sc0710-cli"
@@ -957,12 +960,12 @@ echo -e "    Usage:"
 echo -e "      ${BOLD}sc0710-cli -s${NC}  or  ${BOLD}--status${NC}   Check driver health"
 echo -e "      ${BOLD}sc0710-cli -l${NC}  or  ${BOLD}--load${NC}     Load driver"
 echo -e "      ${BOLD}sc0710-cli -u${NC}  or  ${BOLD}--unload${NC}   Unload driver"
-echo -e "      ${BOLD}sc0710-cli -r${NC}  or  ${BOLD}--restart${NC}  Reload driver"
+echo -e "      ${BOLD}sc0710-cli --restart${NC}        Reload driver"
 echo -e "      ${BOLD}sc0710-cli -d${NC}  or  ${BOLD}--debug${NC}    Toggle debug output"
 echo -e "      ${BOLD}sc0710-cli -it${NC} or  ${BOLD}--image-toggle${NC}  Toggle status images"
 echo -e ""
 echo -e "      ${BOLD}sc0710-cli -U${NC}  or  ${BOLD}--update${NC}   Pull latest & rebuild"
-echo -e "      ${BOLD}sc0710-cli -R${NC}  or  ${BOLD}--remove${NC}   Complete uninstall"
+echo -e "      ${BOLD}sc0710-cli -r/R${NC} or ${BOLD}--remove${NC} Complete uninstall"
 echo -e "      ${BOLD}sc0710-cli -h${NC}  or  ${BOLD}--help${NC}     Show all options"
 echo ""
 echo -e " ${BLUE}->${NC} Installation log available at: ${BOLD}$LOG_FILE${NC}"
