@@ -1064,10 +1064,8 @@ static int sc0710_video_open(struct file *file)
 	list_add_tail(&fh->client->list, &ch->client_list);
 	spin_unlock_irqrestore(&ch->client_list_lock, flags);
 
-	/* Track video users */
-	mutex_lock(&ch->lock);
+	/* Track video users (v4l2_lock already held by framework) */
 	ch->videousers++;
-	mutex_unlock(&ch->lock);
 
 	v4l2_fh_init(&fh->fh, vdev);
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6,18,0)
@@ -1109,10 +1107,9 @@ static int sc0710_video_release(struct file *file)
 		fh->client = NULL;
 	}
 
-	mutex_lock(&ch->lock);
+	/* v4l2_lock already held by framework */
 	ch->videousers--;
 	dprintk(2, "%s() videousers=%d\n", __func__, ch->videousers);
-	mutex_unlock(&ch->lock);
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6,18,0)
 	v4l2_fh_del(&fh->fh, file);
@@ -1381,7 +1378,7 @@ int sc0710_video_register(struct sc0710_dma_channel *ch)
 	q->mem_ops = &vb2_vmalloc_memops;
 	q->timestamp_flags = V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC;
 	q->min_queued_buffers = 2;
-	q->lock = &ch->lock;
+	q->lock = &ch->v4l2_lock;
 	q->dev = &dev->pci->dev;
 
 	err = vb2_queue_init(q);
@@ -1401,7 +1398,7 @@ int sc0710_video_register(struct sc0710_dma_channel *ch)
 #endif
 
 	memcpy(&ch->vdev, &sc0710_video_template, sizeof(sc0710_video_template));
-	ch->vdev.lock = &ch->lock;
+	ch->vdev.lock = &ch->v4l2_lock;
 	ch->vdev.release = video_device_release_empty;
 	ch->vdev.vfl_dir = VFL_DIR_RX;
 	ch->vdev.queue = q;

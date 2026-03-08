@@ -464,6 +464,7 @@ int sc0710_dma_channel_alloc(struct sc0710_dev *dev, u32 nr, enum sc0710_channel
 
 	memset(ch, 0, sizeof(*ch));
 	mutex_init(&ch->lock);
+	mutex_init(&ch->v4l2_lock);
 
 	/* Multi-client streaming support initialization */
 	atomic_set(&ch->streaming_refcount, 0);
