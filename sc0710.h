@@ -442,7 +442,7 @@ int sc0710_i2c_read_status2(struct sc0710_dev *dev);
 int sc0710_i2c_read_status3(struct sc0710_dev *dev);
 int sc0710_i2c_read_procamp(struct sc0710_dev *dev);
 int sc0710_i2c_write_mcu(struct sc0710_dev *dev, u8 subaddr, u8 *data, int len);
-int sc0710_lt6911_enable_output(struct sc0710_dev *dev);
+int sc0710_4kp_wait_pipeline(struct sc0710_dev *dev);
 
 /* -formats.c */
 void sc0710_format_initialize(void);

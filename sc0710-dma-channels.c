@@ -80,10 +80,10 @@ int sc0710_dma_channels_start(struct sc0710_dev *dev)
 
 	printk("%s()\n", __func__);
 
-	/* Send MCU init commands for 4K Pro to activate FPGA pipeline */
+	/* Wait for 4KP FPGA pipeline to become active before DMA start */
 	if (dev->board == SC0710_BOARD_ELGATEO_4KP) {
 		mutex_lock(&dev->signalMutex);
-		sc0710_lt6911_enable_output(dev);
+		sc0710_4kp_wait_pipeline(dev);
 		mutex_unlock(&dev->signalMutex);
 	}
 
