@@ -766,11 +766,11 @@ static void sc0710_write_factory_edid(struct sc0710_dev *dev)
 	}
 }
 
-/* Check pipeline status and poll A8 before DMA start.
+/* Wait for 4KP FPGA pipeline to become active before DMA start.
  * Pipeline registers are configured early in card_setup().
  * Caller must hold signalMutex.
  */
-int sc0710_lt6911_enable_output(struct sc0710_dev *dev)
+int sc0710_4kp_wait_pipeline(struct sc0710_dev *dev)
 {
 	u32 a8;
 	int i;
@@ -789,7 +789,7 @@ int sc0710_lt6911_enable_output(struct sc0710_dev *dev)
 	printk(KERN_INFO "%s: MCU TX status [13-15]: %02x %02x %02x (0x80=disabled)\n",
 		dev->name, rbuf[3], rbuf[4], rbuf[5]);
 
-	/* Poll A8 — LT6911 TX may need time after pipeline enable. */
+	/* Poll A8 — 4KP FPGA pipeline may need time to become active. */
 	for (i = 0; i < 10; i++) {
 		msleep(500);
 		a8 = sc_read(dev, 0, 0xa8);
@@ -800,7 +800,7 @@ int sc0710_lt6911_enable_output(struct sc0710_dev *dev)
 		}
 	}
 
-	printk(KERN_INFO "%s: A8 still 0 after 5s — LT6911 TX not outputting\n", dev->name);
+	printk(KERN_INFO "%s: A8 still 0 after 5s — 4KP pipeline not active\n", dev->name);
 	return 0;
 }
 
