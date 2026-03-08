@@ -232,6 +232,7 @@ struct sc0710_dma_channel
 	dma_addr_t  pt_dma;  /* Physical address - accessible to the PCIe endpoint */
 
 	struct mutex                 lock;
+	struct mutex                 v4l2_lock; /* Separate lock for V4L2/VB2 serialization */
 	u32                          numDescriptorChains;
 	u32                          buf_size;
 	struct sc0710_dma_descriptor_chain chains[SC0710_MAX_CHANNEL_DESCRIPTOR_CHAINS];

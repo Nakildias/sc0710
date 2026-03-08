@@ -786,7 +786,7 @@ int sc0710_4kp_wait_pipeline(struct sc0710_dev *dev)
 	/* MCU TX status for diagnostics */
 	wbuf[0] = 0x10;
 	__sc0710_i2c_writeread(dev, I2C_DEV__ARM_MCU, wbuf, 1, rbuf, 16);
-	printk(KERN_INFO "%s: MCU TX status [13-15]: %02x %02x %02x (0x80=disabled)\n",
+	printk(KERN_INFO "%s: MCU status [13-15]: %02x %02x %02x\n",
 		dev->name, rbuf[3], rbuf[4], rbuf[5]);
 
 	/* Poll A8 — 4KP FPGA pipeline may need time to become active. */
