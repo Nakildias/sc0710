@@ -428,6 +428,37 @@ if ! verify_essential_files "$SRC_DEST"; then
 fi
 log "Source verification passed"
 
+# 3.5 Firmware Extraction (4K Pro only)
+# The Elgato 4K Pro (subsystem 1cfa:0012) requires ECP5 companion FPGA firmware
+# at /lib/firmware/sc0710/SC0710.FWI.HEX. The driver uploads this on every boot.
+# Only run if a 4K Pro card is detected in the system.
+if lspci -d ::0400 -nn 2>/dev/null | grep -qi "1cfa:0012"; then
+    FIRMWARE_PATH="/lib/firmware/sc0710/SC0710.FWI.HEX"
+    if [[ -f "$FIRMWARE_PATH" ]]; then
+        msg2 "4K Pro firmware already present at $FIRMWARE_PATH"
+    else
+        msg "4K Pro detected — extracting ECP5 firmware..."
+        EXTRACT_SCRIPT="$SRC_DEST/extract-firmware.sh"
+        if [[ -f "$EXTRACT_SCRIPT" ]]; then
+            chmod +x "$EXTRACT_SCRIPT"
+            if bash "$EXTRACT_SCRIPT"; then
+                msg2 "Firmware extraction completed."
+                log "4K Pro firmware extracted to $FIRMWARE_PATH"
+            else
+                warning "Firmware extraction failed. The driver will load but ECP5 programming will not work."
+                warning "You can retry manually: sudo bash $EXTRACT_SCRIPT"
+                log "WARNING: Firmware extraction failed"
+            fi
+        else
+            warning "extract-firmware.sh not found in source tree. Firmware must be installed manually."
+            warning "Place SC0710.FWI.HEX in /lib/firmware/sc0710/"
+            log "WARNING: extract-firmware.sh missing from source"
+        fi
+    fi
+else
+    log "No 4K Pro card detected, skipping firmware extraction"
+fi
+
 # 4. Auto-Update / DKMS Selection
 USE_DKMS=false
 echo ""
