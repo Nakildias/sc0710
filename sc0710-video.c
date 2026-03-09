@@ -213,6 +213,54 @@ static void fill_frame_from_image(unsigned char *dest_frame,
 	}
 }
 
+/* Generate a complete YUYV frame from 1bpp sprites */
+static void generate_status_frame(unsigned char *dest, const struct overlay_sprite *msg_sprite)
+{
+	unsigned int r, c;
+	unsigned int dest_w = STATUS_IMAGE_WIDTH;
+	unsigned int dest_h = STATUS_IMAGE_HEIGHT;
+	const struct overlay_sprite *sprites[2];
+	int i;
+
+	sprites[0] = &shared_logo_sprite;
+	sprites[1] = msg_sprite;
+
+	/* 1. Fill background with dark gray (Y=0x20, U=0x80, V=0x80) */
+	for (r = 0; r < dest_h; r++) {
+		for (c = 0; c < dest_w; c += 2) {
+			unsigned int offset = (r * dest_w * 2) + (c * 2);
+			dest[offset]   = 0x20; /* Y0 */
+			dest[offset+1] = 0x80; /* U  */
+			dest[offset+2] = 0x20; /* Y1 */
+			dest[offset+3] = 0x80; /* V  */
+		}
+	}
+
+	/* 2. Draw sprites (1bpp packed, where 1 = white) */
+	for (i = 0; i < 2; i++) {
+		const struct overlay_sprite *sprite = sprites[i];
+		if (sprite && sprite->data) {
+			unsigned int stride = sprite->w / 8;
+			for (r = 0; r < sprite->h; r++) {
+				unsigned int dy = sprite->y + r;
+				if (dy >= dest_h) break;
+
+				for (c = 0; c < sprite->w; c++) {
+					unsigned int dx = sprite->x + c;
+					if (dx >= dest_w) continue;
+
+					if (sprite->data[r * stride + (c / 8)] & (1 << (c % 8))) {
+						/* Set pixel to white (Y=0xEB, U=0x80, V=0x80) */
+						unsigned int offset = (dy * dest_w * 2) + (dx * 2);
+						dest[offset] = 0xEB; /* Y */
+						dest[offset+1] = 0x80; /* U for even dx, V for odd dx */
+					}
+				}
+			}
+		}
+	}
+}
+
 /* Generate status frames from hybrid-optimized gradient + overlay data.
  * Called once lazily on first use.
  */
@@ -238,10 +286,10 @@ static void generate_status_frames_if_needed(void)
 		return;
 	}
 	
-	/* Generate frames from gradient + overlays */
-	generate_status_frame(nosignal_frame_buffer, gradient_y_lut, &nosignal_sprite);
+	/* Generate frames from overlays */
+	generate_status_frame(nosignal_frame_buffer, &no_signal_sprite);
 
-	generate_status_frame(nodevice_frame_buffer, gradient_y_lut, &nodevice_sprite);
+	generate_status_frame(nodevice_frame_buffer, &no_device_sprite);
 	
 	status_frames_generated = 1;
 	printk(KERN_INFO "sc0710: Generated status frames from hybrid-optimized data\n");
@@ -1432,4 +1480,3 @@ int sc0710_video_register(struct sc0710_dma_channel *ch)
 
 	return 0; /* Success */
 }
-
