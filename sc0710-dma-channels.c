@@ -80,13 +80,6 @@ int sc0710_dma_channels_start(struct sc0710_dev *dev)
 
 	printk("%s()\n", __func__);
 
-	/* Wait for 4KP FPGA pipeline to become active before DMA start */
-	if (dev->board == SC0710_BOARD_ELGATEO_4KP) {
-		mutex_lock(&dev->signalMutex);
-		sc0710_4kp_wait_pipeline(dev);
-		mutex_unlock(&dev->signalMutex);
-	}
-
 	/* Prepare all DMA channels to start */
 	for (i = 0; i < SC0710_MAX_CHANNELS; i++) {
 		ret = sc0710_dma_channel_start_prep(&dev->channel[i]);
@@ -129,22 +122,8 @@ int sc0710_dma_channels_start(struct sc0710_dev *dev)
 	if (dev->board == SC0710_BOARD_ELGATEO_4KP)
 		sc_write(dev, 0, 0xEC, 0x00000001);
 
-	if (dev->board == SC0710_BOARD_ELGATEO_4KP) {
-		int poll;
-		u32 a8;
-		for (poll = 0; poll < 20; poll++) {
-			msleep(100);
-			a8 = sc_read(dev, 0, 0xa8);
-			if (a8 != 0) {
-				printk(KERN_INFO "%s: A8 active after %dms: %08x\n",
-					dev->name, (poll + 1) * 100, a8);
-				break;
-			}
-		}
-		if (a8 == 0)
-			printk(KERN_WARNING "%s: A8 still 0 after 2s — DMA may stall\n",
-				dev->name);
-	}
+	if (dev->board == SC0710_BOARD_ELGATEO_4KP)
+		sc0710_4kp_wait_pipeline(dev);
 
 	/* Start all DMA channels after pipeline is active. */
 	for (i = 0; i < SC0710_MAX_CHANNELS; i++) {

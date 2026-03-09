@@ -789,18 +789,20 @@ int sc0710_4kp_wait_pipeline(struct sc0710_dev *dev)
 	printk(KERN_INFO "%s: MCU status [13-15]: %02x %02x %02x\n",
 		dev->name, rbuf[3], rbuf[4], rbuf[5]);
 
-	/* Poll A8 — 4KP FPGA pipeline may need time to become active. */
-	for (i = 0; i < 10; i++) {
-		msleep(500);
+	/* Poll A8 — 4KP FPGA pipeline may need time to become active
+	 * after D0/EC register writes. Typically activates within 100ms.
+	 */
+	for (i = 0; i < 20; i++) {
+		msleep(100);
 		a8 = sc_read(dev, 0, 0xa8);
 		if (a8 != 0) {
 			printk(KERN_INFO "%s: A8 active after %dms: %08x\n",
-				dev->name, (i + 1) * 500, a8);
+				dev->name, (i + 1) * 100, a8);
 			return 0;
 		}
 	}
 
-	printk(KERN_INFO "%s: A8 still 0 after 5s — 4KP pipeline not active\n", dev->name);
+	printk(KERN_WARNING "%s: A8 still 0 after 2s — DMA may stall\n", dev->name);
 	return 0;
 }
 
