@@ -243,13 +243,14 @@ static u32 ecp5_read_idcode(struct sc0710_dev *dev)
 
 static int ecp5_check_busy(struct sc0710_dev *dev, int timeout_ms)
 {
-	u8 tx[4] = { ECP5_LSC_CHECK_BUSY, 0, 0, 0 };
+	/* 4 command bytes + 1 dummy byte to clock out response */
+	u8 tx[5] = { ECP5_LSC_CHECK_BUSY, 0, 0, 0, 0 };
 	u8 rx[1];
 	int i;
 
 	for (i = 0; i < timeout_ms; i++) {
-		ecp5_spi_xfer(dev, tx, 4, rx, 1);
-		if (!rx[0])
+		ecp5_spi_xfer(dev, tx, 5, rx, 1);
+		if (!(rx[0] & 0x80))
 			return 0;
 		msleep(1);
 	}
@@ -275,20 +276,17 @@ static int ecp5_program_bitstream(struct sc0710_dev *dev, const u8 *data, u32 le
 
 	ecp5_spi_reset(dev);
 
-	/* If ECP5 is unresponsive (e.g. after failed programming),
-	 * send REFRESH to reset back to factory firmware.
+	/* Always REFRESH before programming to ensure clean state.
+	 * After a failed programming attempt, the ECP5 can be stuck
+	 * in ISC mode with dirty status bits. REFRESH resets it.
 	 */
-	if (ecp5_read_idcode(dev) == 0xFFFFFFFF) {
-		printk(KERN_WARNING "%s: ECP5 unresponsive, sending REFRESH\n",
-			dev->name);
-		cmd[0] = ECP5_LSC_REFRESH;
-		cmd[1] = 0x00;
-		cmd[2] = 0x00;
-		cmd[3] = 0x00;
-		ecp5_spi_xfer(dev, cmd, 4, NULL, 0);
-		msleep(200);
-		ecp5_spi_reset(dev);
-	}
+	cmd[0] = ECP5_LSC_REFRESH;
+	cmd[1] = 0x00;
+	cmd[2] = 0x00;
+	cmd[3] = 0x00;
+	ecp5_spi_xfer(dev, cmd, 4, NULL, 0);
+	msleep(200);
+	ecp5_spi_reset(dev);
 
 	/* ISC_ENABLE */
 	cmd[0] = ECP5_ISC_ENABLE;
@@ -297,9 +295,11 @@ static int ecp5_program_bitstream(struct sc0710_dev *dev, const u8 *data, u32 le
 	cmd[3] = 0x00;
 	ecp5_spi_xfer(dev, cmd, 4, NULL, 0);
 	msleep(1);
-	ret = ecp5_check_busy(dev, 100);
+	ret = ecp5_check_busy(dev, 1000);
 	if (ret) {
-		printk(KERN_ERR "%s: ECP5 ISC_ENABLE failed\n", dev->name);
+		ecp5_read_status(dev, &status);
+		printk(KERN_ERR "%s: ECP5 ISC_ENABLE failed (status: %08x)\n",
+			dev->name, status);
 		return ret;
 	}
 
@@ -325,6 +325,13 @@ static int ecp5_program_bitstream(struct sc0710_dev *dev, const u8 *data, u32 le
 
 	/* BITSTREAM_BURST — command + data in one CS cycle */
 	ecp5_spi_burst_write(dev, data, len);
+
+	/* Check status register before ISC_DISABLE (flow diagram step 7) */
+	ecp5_read_status(dev, &status);
+	if (status & 0x3802000) {  /* Fail Flag (bit 13) or BSE Error Code (bits 25:23) */
+		printk(KERN_ERR "%s: ECP5 bitstream error (status: %08x)\n",
+			dev->name, status);
+	}
 
 	/* ISC_DISABLE + NOP + STATUS (matching Windows sequence) */
 	cmd[0] = ECP5_ISC_DISABLE;
