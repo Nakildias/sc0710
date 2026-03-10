@@ -488,7 +488,7 @@ EOF
         warning "DKMS already has $DRV_NAME installed."
         if confirm "Remove existing and reinstall?" "Y"; then
             msg2 "Removing all existing DKMS versions..."
-            for ver in $(dkms status | grep "$DRV_NAME" | sed 's/.*\/\([^,]*\),.*/\1/'); do
+            for ver in $(dkms status 2>/dev/null | grep "^$DRV_NAME" | awk -F'[/,:]' '{print $2}' | tr -d ' '); do
                 if ! dkms remove -m "$DRV_NAME" -v "$ver" --all >/dev/null 2>&1; then
                     # If dkms remove fails (missing source directory), clean up manually.
                     # This is what DKMS means by "Manual intervention is required."
@@ -1012,7 +1012,7 @@ case "\$1" in
         ;;
     -r|-R|--remove)
         echo -e "\${BLUE}::\${NC} Uninstalling driver and utility..."
-        for ver in \$(dkms status | grep "\$DRV_NAME" | sed 's/.*\/\([^,]*\),.*/\1/'); do
+        for ver in \$(dkms status 2>/dev/null | grep "^\$DRV_NAME" | awk -F'[/,:]' '{print \$2}' | tr -d ' '); do
             if ! dkms remove -m "\$DRV_NAME" -v "\$ver" --all >/dev/null 2>&1; then
                 rm -rf "/var/lib/dkms/\${DRV_NAME}/\${ver}" 2>/dev/null || true
             fi
