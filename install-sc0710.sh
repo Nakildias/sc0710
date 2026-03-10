@@ -488,13 +488,11 @@ EOF
         warning "DKMS already has $DRV_NAME installed."
         if confirm "Remove existing and reinstall?" "Y"; then
             msg2 "Removing all existing DKMS versions..."
-            for ver in $(dkms status 2>/dev/null | grep "^$DRV_NAME" | awk -F'[/,:]' '{print $2}' | tr -d ' '); do
-                if ! dkms remove -m "$DRV_NAME" -v "$ver" --all >/dev/null 2>&1; then
-                    # If dkms remove fails (missing source directory), clean up manually.
-                    # This is what DKMS means by "Manual intervention is required."
-                    msg2 "Cleaning stale DKMS entry: $DRV_NAME/$ver"
-                    rm -rf "/var/lib/dkms/${DRV_NAME}/${ver}" 2>/dev/null || true
-                    rm -rf "/usr/src/${DRV_NAME}-${ver}" 2>/dev/null || true
+            for ver_item in $(dkms status 2>/dev/null | awk -F'[:,]' '/^sc0710/ {print $1}' | tr -d ' '); do
+                if ! dkms remove "$ver_item" --all >/dev/null 2>&1; then
+                    cleanup_path=$(echo "$ver_item" | tr ',' '/')
+                    msg2 "Cleaning stale DKMS entry: $cleanup_path"
+                    rm -rf "/var/lib/dkms/$cleanup_path" 2>/dev/null || true
                 fi
             done
             # Remove any leftover top-level DKMS directory if empty
@@ -991,10 +989,15 @@ case "\$1" in
         # Rebuild via DKMS
         echo -e "\${BLUE}::\${NC} Rebuilding module via DKMS..."
         KVER=\$(uname -r)
-        # Remove old DKMS build (handle missing source directory gracefully)
-        if ! dkms remove -m \$DRV_NAME -v "\$CURRENT_VERSION" -k "\$KVER" --force 2>/dev/null; then
-            rm -rf "/var/lib/dkms/\${DRV_NAME}/\${CURRENT_VERSION}" 2>/dev/null || true
-        fi
+        
+        # Remove old DKMS build (handles anything starting with sc0710)
+        for ver_item in \$(dkms status 2>/dev/null | awk -F'[:,]' '/^sc0710/ {print \$1}' | tr -d ' '); do
+            if ! dkms remove "\$ver_item" --all >/dev/null 2>&1; then
+                cleanup_path=\$(echo "\$ver_item" | tr ',' '/')
+                rm -rf "/var/lib/dkms/\$cleanup_path" 2>/dev/null || true
+            fi
+        done
+        rmdir "/var/lib/dkms/\${DRV_NAME}" 2>/dev/null || true
         if dkms install -m \$DRV_NAME -v "\$NEW_VER" -k "\$KVER" 2>&1; then
             echo -e "\${GREEN}[OK]\${NC} Module rebuilt successfully."
         else
@@ -1012,9 +1015,10 @@ case "\$1" in
         ;;
     -r|-R|--remove)
         echo -e "\${BLUE}::\${NC} Uninstalling driver and utility..."
-        for ver in \$(dkms status 2>/dev/null | grep "^\$DRV_NAME" | awk -F'[/,:]' '{print \$2}' | tr -d ' '); do
-            if ! dkms remove -m "\$DRV_NAME" -v "\$ver" --all >/dev/null 2>&1; then
-                rm -rf "/var/lib/dkms/\${DRV_NAME}/\${ver}" 2>/dev/null || true
+        for ver_item in \$(dkms status 2>/dev/null | awk -F'[:,]' '/^sc0710/ {print \$1}' | tr -d ' '); do
+            if ! dkms remove "\$ver_item" --all >/dev/null 2>&1; then
+                cleanup_path=\$(echo "\$ver_item" | tr ',' '/')
+                rm -rf "/var/lib/dkms/\$cleanup_path" 2>/dev/null || true
             fi
         done
         rmdir "/var/lib/dkms/\${DRV_NAME}" 2>/dev/null || true
