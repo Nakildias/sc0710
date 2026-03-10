@@ -19,6 +19,7 @@ High-performance, multi-client Linux driver for the Elgato 4K60 Pro MK.2 and Elg
 | **Arch Linux** | 6.18.7+ | Stable | Standard configuration. |
 | **Fedora** | 6.17.12+ | Stable | Standard configuration. |
 | **Debian** | 6.12.57+ | Stable | **Warning:** Repository version of OBS may crash. Use Flatpak OBS. |
+| **Fedora Atomic** | 6.17.7+ | **Experimental** | Supported on Bazzite, Bluefin, Aurora, Silverblue. |
 
 ## Installation
 
@@ -27,6 +28,13 @@ Supported on Arch Linux, Debian/Ubuntu, and Fedora. This script handles dependen
 
 ```bash
 sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/Nakildias/sc0710/main/install-sc0710.sh)"
+```
+
+### Fedora Atomic (Bazzite, Silverblue, etc.)
+On immutable distributions, standard DKMS is not supported. Use the atomic-specific installer which sets up a boot-time build service to handle kernel updates.
+
+```bash
+sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/Nakildias/sc0710/main/atomic-install-sc0710.sh)"
 ```
 
 ### Arch Linux (AUR)
@@ -69,7 +77,8 @@ The `sc0710-cli` tool (installed via the automatic script) provides real-time co
 
 ## Features & capabilities
 *   **Multi-Client Support:** Direct access for multiple simultaneous applications (e.g., OBS + Discord).
-*   **DKMS Integration:** Automatically rebuilds on kernel updates.
+*   **DKMS Integration:** Automatically rebuilds on kernel updates (Standard distros).
+*   **Atomic Support:** Custom systemd service for boot-time rebuilds on immutable/atomic distros (Bazzite, etc.).
 *   **Status Images:** Storage-efficient implementation of "No Signal" / "No Device" screens.
 *   **Connection Sensing:** Distinguishes between unplugged cables and signal loss (not 100% reliable).
 *   **Video Formats:** Supports 4K60, 1440p144, 1080p240 (requires Windows to change the EDID).
