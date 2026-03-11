@@ -431,29 +431,31 @@ if [[ ! -d "$SRC_DIR" ]]; then
 fi
 
 # --- 5.5. Firmware Extraction (4K Pro only) ---
-if lspci -d ::0400 -nn 2>/dev/null | grep -qi "1cfa:0012"; then
+if lspci -n -v -d 12ab:0710 2>/dev/null | grep -qi "1cfa:0012"; then
     FIRMWARE_STORE="/var/lib/sc0710/firmware"
     FIRMWARE_FILE="SC0710.FWI.HEX"
-    if [[ (-f "$FIRMWARE_STORE/$FIRMWARE_FILE" || -f "/lib/firmware/sc0710/$FIRMWARE_FILE") ]] && systemctl is-enabled sc0710-firmware.service >/dev/null 2>&1; then
-        msg2 "4K Pro firmware and service already present"
-    else
+    if [[ ! -f "$FIRMWARE_STORE/$FIRMWARE_FILE" && ! -f "/lib/firmware/sc0710/$FIRMWARE_FILE" ]]; then
         msg "4K Pro detected — extracting ECP5 firmware (atomic)..."
-        EXTRACT_SCRIPT="$SRC_DIR/atomic-extract-firmware.sh"
-        if [[ -f "$EXTRACT_SCRIPT" ]]; then
-            chmod +x "$EXTRACT_SCRIPT"
-            if bash "$EXTRACT_SCRIPT"; then
+        EXT_SCRIPT="$SRC_DIR/atomic-extract-firmware.sh"
+        if [[ ! -f "$EXT_SCRIPT" ]]; then
+            # Mirror of 5.6 logic: handle missing script from source
+            EXT_SCRIPT="./atomic-extract-firmware.sh"
+        fi
+
+        if [[ -f "$EXT_SCRIPT" ]]; then
+            chmod +x "$EXT_SCRIPT"
+            if bash "$EXT_SCRIPT"; then
                 msg2 "Firmware extraction completed."
                 log "4K Pro firmware extracted via atomic script"
             else
-                warning "Firmware extraction failed. The driver will load but ECP5 programming will not work."
-                warning "You can retry manually: sudo bash $EXTRACT_SCRIPT"
+                warning "Firmware extraction failed."
                 log "WARNING: Firmware extraction failed"
             fi
         else
-            warning "atomic-extract-firmware.sh not found in source tree. Firmware must be installed manually."
-            warning "Place SC0710.FWI.HEX in /var/lib/sc0710/firmware/ and symlink to /etc/firmware/sc0710/"
-            log "WARNING: atomic-extract-firmware.sh missing from source"
+            warning "atomic-extract-firmware.sh not found. Firmware must be installed manually."
         fi
+    else
+        msg2 "4K Pro firmware already present"
     fi
 else
     log "No 4K Pro card detected, skipping firmware extraction"
@@ -462,24 +464,27 @@ fi
 # --- 5.6. Firmware Service (4K Pro only) ---
 # Install a systemd service that ensures the ECP5 firmware file is present
 # on every boot and triggers a driver reload if the FPGA wasn't programmed.
-if lspci -d ::0400 -nn 2>/dev/null | grep -qi "1cfa:0012"; then
-    msg "4K Pro detected — installing firmware service..."
-
-    FW_SERVICE_SCRIPT="/var/lib/sc0710/sc0710-firmware.sh"
-    FW_SERVICE_SCRIPT_SRC="$SRC_DIR/sc0710-firmware.sh"
-    if [[ -f "$FW_SERVICE_SCRIPT_SRC" ]]; then
-        cp "$FW_SERVICE_SCRIPT_SRC" "$FW_SERVICE_SCRIPT"
-    elif [[ -f "./sc0710-firmware.sh" ]]; then
-        cp "./sc0710-firmware.sh" "$FW_SERVICE_SCRIPT"
+if lspci -n -v -d 12ab:0710 2>/dev/null | grep -qi "1cfa:0012"; then
+    if systemctl is-enabled sc0710-firmware.service >/dev/null 2>&1; then
+        msg2 "4K Pro firmware service already installed and enabled"
     else
-        warning "sc0710-firmware.sh not found in source tree."
-        FW_SERVICE_SCRIPT=""
-    fi
+        msg "4K Pro detected — installing firmware service..."
 
-    if [[ -n "$FW_SERVICE_SCRIPT" ]]; then
-        chmod +x "$FW_SERVICE_SCRIPT"
+        FW_SERVICE_SCRIPT="/var/lib/sc0710/sc0710-firmware.sh"
+        FW_SERVICE_SCRIPT_SRC="$SRC_DIR/sc0710-firmware.sh"
+        if [[ -f "$FW_SERVICE_SCRIPT_SRC" ]]; then
+            cp "$FW_SERVICE_SCRIPT_SRC" "$FW_SERVICE_SCRIPT"
+        elif [[ -f "./sc0710-firmware.sh" ]]; then
+            cp "./sc0710-firmware.sh" "$FW_SERVICE_SCRIPT"
+        else
+            warning "sc0710-firmware.sh not found in source tree."
+            FW_SERVICE_SCRIPT=""
+        fi
 
-        cat > "/etc/systemd/system/sc0710-firmware.service" <<FWEOF
+        if [[ -n "$FW_SERVICE_SCRIPT" ]]; then
+            chmod +x "$FW_SERVICE_SCRIPT"
+
+            cat > "/etc/systemd/system/sc0710-firmware.service" <<FWEOF
 [Unit]
 Description=SC0710 4K Pro ECP5 Firmware Loader
 After=local-fs.target network-online.target
@@ -499,10 +504,11 @@ StandardError=journal
 WantedBy=multi-user.target
 FWEOF
 
-        systemctl daemon-reload
-        systemctl enable sc0710-firmware.service
-        msg2 "Firmware service enabled: sc0710-firmware.service"
-        log "Created and enabled sc0710-firmware.service"
+            systemctl daemon-reload
+            systemctl enable sc0710-firmware.service
+            msg2 "Firmware service enabled: sc0710-firmware.service"
+            log "Created and enabled sc0710-firmware.service"
+        fi
     fi
 else
     log "No 4K Pro card detected, skipping firmware service installation"
@@ -1132,7 +1138,7 @@ case "\$1" in
             fi
         done
         if [[ "\$IS_4KP" == "false" ]]; then
-            if lspci -d ::0400 -nn 2>/dev/null | grep -qi "1cfa:0012"; then
+            if lspci -n -v -d 12ab:0710 2>/dev/null | grep -qi "1cfa:0012"; then
                 IS_4KP=true
             fi
         fi
