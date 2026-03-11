@@ -496,9 +496,6 @@ static int sc0710_thread_hdmi_function(void *data)
 					sc0710_scaler_mode_name(dev->scaler_mode),
 					sc0710_scaler_mode_name(new_mode));
 				dev->scaler_mode = new_mode;
-				
-				/* Notify clients so they renegotiate size */
-				sc0710_notify_source_change(dev);
 			}
 		}
 

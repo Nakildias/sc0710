@@ -447,7 +447,6 @@ void sc_clr(struct sc0710_dev *dev, int bar, u32 reg, u32 bit);
 
 /* -i2c.c */
 int sc0710_i2c_initialize(struct sc0710_dev *dev);
-extern void sc0710_notify_source_change(struct sc0710_dev *dev);
 int sc0710_i2c_hdmi_status_dump(struct sc0710_dev *dev);
 int sc0710_i2c_read_hdmi_status(struct sc0710_dev *dev);
 int sc0710_i2c_read_status2(struct sc0710_dev *dev);
