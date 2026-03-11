@@ -18,6 +18,7 @@
  *  Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
  */
 
+#include <linux/vmalloc.h>
 #include "sc0710.h"
 
 MODULE_DESCRIPTION("Driver for SC0710 based TV cards");
