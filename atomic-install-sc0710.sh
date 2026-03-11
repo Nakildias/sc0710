@@ -1183,17 +1183,27 @@ case "\$1" in
     -U|--update)
         echo -e "\${BLUE}::\${NC} Checking for updates..."
 
-        if [[ ! -d "\$SRC_DIR/.git" ]]; then
-            echo -e "\${RED}[ERROR]\${NC} Source directory is not a git repository. Re-run the full installer."
+        if [[ ! -d "\$SRC_DIR" ]]; then
+            echo -e "\${RED}[ERROR]\${NC} Source directory is missing. Re-run the full installer."
             exit 1
         fi
 
-        # Pull latest source
-        echo -e "\${BLUE}::\${NC} Pulling latest source..."
-        if ! git -C "\$SRC_DIR" pull --ff-only 2>&1; then
-            echo -e "\${RED}[ERROR]\${NC} Git pull failed. Try: sc0710-cli --rebuild or re-run the installer."
+        # Download latest source
+        echo -e "\${BLUE}::\${NC} Downloading latest source..."
+        TEMP_TAR=\$(mktemp /tmp/sc0710-update.XXXXXX.tar.gz)
+        if ! curl -fsSL "https://github.com/Nakildias/sc0710/archive/refs/heads/main.tar.gz" -o "\$TEMP_TAR"; then
+            echo -e "\${RED}[ERROR]\${NC} Failed to download update. Check your internet connection."
+            rm -f "\$TEMP_TAR"
             exit 1
         fi
+
+        # Extract over existing source directory
+        if ! tar -xzf "\$TEMP_TAR" --strip-components=1 -C "\$SRC_DIR"; then
+            echo -e "\${RED}[ERROR]\${NC} Failed to extract update archive."
+            rm -f "\$TEMP_TAR"
+            exit 1
+        fi
+        rm -f "\$TEMP_TAR"
 
         # Read updated version
         NEW_VER="\${CURRENT_VERSION}"
