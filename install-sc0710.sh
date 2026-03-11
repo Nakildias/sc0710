@@ -485,8 +485,6 @@ if lspci -nn 2>/dev/null | grep -qi "1cfa:0012"; then
         fi
 
 
-        fi
-
         if [[ -n "$FW_SERVICE_SCRIPT" ]]; then
             chmod +x "$FW_SERVICE_SCRIPT"
 
