@@ -188,15 +188,18 @@ static void sc0710_dma_dequeue_video(struct sc0710_dma_channel *ch,
 		return;
 	}
 
-	/* Validate DMA transfer size against expected frame size.
-	 * This catches races where resolution changed but buffers haven't been resized yet.
-	 * chain->total_transfer_size is set during allocation and reflects DMA buffer capacity.
+	/* Drop frames during resolution transitions.
+	 * When the detected format changes, cached_framesize reflects the NEW
+	 * resolution, but the DMA chains are still sized for the OLD resolution.
+	 * Delivering these mismatched frames produces split/misaligned images
+	 * and green flickers.  The DMA will be resized shortly by
+	 * sc0710_reset_dma_frame_sync(); until then, discard stale frames.
 	 */
-	if (chain->total_transfer_size > 0 && cached_framesize > (u32)chain->total_transfer_size) {
-		printk_ratelimited(KERN_WARNING "%s: Frame size %u exceeds DMA buffer %d - resolution change in progress?\n",
-			dev->name, cached_framesize, chain->total_transfer_size);
-		/* Continue anyway but cap to the actual DMA buffer size */
-		cached_framesize = chain->total_transfer_size;
+	if (chain->total_transfer_size > 0 &&
+	    cached_framesize != (u32)chain->total_transfer_size) {
+		dprintk(1, "%s() frame size mismatch (%u vs DMA %d) - resolution transition, dropping\n",
+			__func__, cached_framesize, chain->total_transfer_size);
+		return;
 	}
 
 	/* Check if software scaler is active (MK.2 only) */
@@ -216,7 +219,7 @@ static void sc0710_dma_dequeue_video(struct sc0710_dma_channel *ch,
 			    dev->scaler_staging_size < cached_framesize) {
 				if (dev->scaler_staging_buf)
 					vfree(dev->scaler_staging_buf);
-				dev->scaler_staging_buf = vmalloc(cached_framesize);
+				dev->scaler_staging_buf = vzalloc(cached_framesize);
 				dev->scaler_staging_size = cached_framesize;
 				if (!dev->scaler_staging_buf) {
 					dev->scaler_staging_size = 0;
