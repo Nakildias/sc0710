@@ -432,28 +432,30 @@ log "Source verification passed"
 # The Elgato 4K Pro (subsystem 1cfa:0012) requires ECP5 companion FPGA firmware
 # at /lib/firmware/sc0710/SC0710.FWI.HEX. The driver uploads this on every boot.
 # Only run if a 4K Pro card is detected in the system.
-if lspci -d ::0400 -nn 2>/dev/null | grep -qi "1cfa:0012"; then
+if lspci -nn 2>/dev/null | grep -qi "1cfa:0012"; then
     FIRMWARE_PATH="/lib/firmware/sc0710/SC0710.FWI.HEX"
-    if [[ -f "$FIRMWARE_PATH" ]] && systemctl is-enabled sc0710-firmware.service >/dev/null 2>&1; then
-        msg2 "4K Pro firmware and service already present"
-    else
+    if [[ ! -f "$FIRMWARE_PATH" ]]; then
         msg "4K Pro detected — extracting ECP5 firmware..."
-        EXTRACT_SCRIPT="$SRC_DEST/extract-firmware.sh"
-        if [[ -f "$EXTRACT_SCRIPT" ]]; then
-            chmod +x "$EXTRACT_SCRIPT"
-            if bash "$EXTRACT_SCRIPT"; then
+        EXT_SCRIPT="$SRC_DEST/extract-firmware.sh"
+        if [[ ! -f "$EXT_SCRIPT" ]]; then
+            # Mirror of 3.6 logic: handle missing script from source
+            EXT_SCRIPT="./extract-firmware.sh"
+        fi
+
+        if [[ -f "$EXT_SCRIPT" ]]; then
+            chmod +x "$EXT_SCRIPT"
+            if bash "$EXT_SCRIPT"; then
                 msg2 "Firmware extraction completed."
                 log "4K Pro firmware extracted to $FIRMWARE_PATH"
             else
-                warning "Firmware extraction failed. The driver will load but ECP5 programming will not work."
-                warning "You can retry manually: sudo bash $EXTRACT_SCRIPT"
+                warning "Firmware extraction failed."
                 log "WARNING: Firmware extraction failed"
             fi
         else
-            warning "extract-firmware.sh not found in source tree. Firmware must be installed manually."
-            warning "Place SC0710.FWI.HEX in /lib/firmware/sc0710/"
-            log "WARNING: extract-firmware.sh missing from source"
+            warning "extract-firmware.sh not found. Firmware must be installed manually."
         fi
+    else
+        msg2 "4K Pro firmware already present at $FIRMWARE_PATH"
     fi
 else
     log "No 4K Pro card detected, skipping firmware extraction"
@@ -463,27 +465,32 @@ fi
 # Install a systemd service that ensures the ECP5 firmware file is present
 # on every boot and triggers a driver reload if the FPGA wasn't programmed.
 # This handles cold boots where the ECP5 SRAM is wiped.
-if lspci -d ::0400 -nn 2>/dev/null | grep -qi "1cfa:0012"; then
-    msg "4K Pro detected — installing firmware service..."
-
-    # Install the firmware service script
-    FW_SERVICE_SCRIPT="/usr/local/libexec/sc0710-firmware.sh"
-    FW_SERVICE_SCRIPT_SRC="$SRC_DEST/sc0710-firmware.sh"
-    mkdir -p "$(dirname "$FW_SERVICE_SCRIPT")"
-    if [[ -f "$FW_SERVICE_SCRIPT_SRC" ]]; then
-        cp "$FW_SERVICE_SCRIPT_SRC" "$FW_SERVICE_SCRIPT"
-    elif [[ -f "./sc0710-firmware.sh" ]]; then
-        cp "./sc0710-firmware.sh" "$FW_SERVICE_SCRIPT"
+if lspci -nn 2>/dev/null | grep -qi "1cfa:0012"; then
+    if systemctl is-enabled sc0710-firmware.service >/dev/null 2>&1; then
+        msg2 "4K Pro firmware service already installed and enabled"
     else
-        warning "sc0710-firmware.sh not found. Creating from embedded copy."
-        # The script is part of the source tree; if missing, skip
-        FW_SERVICE_SCRIPT=""
-    fi
+        msg "4K Pro detected — installing firmware service..."
 
-    if [[ -n "$FW_SERVICE_SCRIPT" ]]; then
-        chmod +x "$FW_SERVICE_SCRIPT"
+        # Install the firmware service script
+        FW_SERVICE_SCRIPT="/usr/local/libexec/sc0710-firmware.sh"
+        FW_SERVICE_SCRIPT_SRC="$SRC_DEST/sc0710-firmware.sh"
+        mkdir -p "$(dirname "$FW_SERVICE_SCRIPT")"
+        if [[ -f "$FW_SERVICE_SCRIPT_SRC" ]]; then
+            cp "$FW_SERVICE_SCRIPT_SRC" "$FW_SERVICE_SCRIPT"
+        elif [[ -f "./sc0710-firmware.sh" ]]; then
+            cp "./sc0710-firmware.sh" "$FW_SERVICE_SCRIPT"
+        else
+            warning "sc0710-firmware.sh not found in source tree."
+            FW_SERVICE_SCRIPT=""
+        fi
 
-        cat > "/etc/systemd/system/sc0710-firmware.service" <<FWEOF
+
+        fi
+
+        if [[ -n "$FW_SERVICE_SCRIPT" ]]; then
+            chmod +x "$FW_SERVICE_SCRIPT"
+
+            cat > "/etc/systemd/system/sc0710-firmware.service" <<FWEOF
 [Unit]
 Description=SC0710 4K Pro ECP5 Firmware Loader
 After=local-fs.target network-online.target
@@ -503,10 +510,11 @@ StandardError=journal
 WantedBy=multi-user.target
 FWEOF
 
-        systemctl daemon-reload
-        systemctl enable sc0710-firmware.service
-        msg2 "Firmware service enabled: sc0710-firmware.service"
-        log "Created and enabled sc0710-firmware.service"
+            systemctl daemon-reload
+            systemctl enable sc0710-firmware.service
+            msg2 "Firmware service enabled: sc0710-firmware.service"
+            log "Created and enabled sc0710-firmware.service"
+        fi
     fi
 else
     log "No 4K Pro card detected, skipping firmware service installation"
