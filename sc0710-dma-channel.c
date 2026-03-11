@@ -188,18 +188,16 @@ static void sc0710_dma_dequeue_video(struct sc0710_dma_channel *ch,
 		return;
 	}
 
-	/* Drop frames during resolution transitions.
-	 * When the detected format changes, cached_framesize reflects the NEW
-	 * resolution, but the DMA chains are still sized for the OLD resolution.
-	 * Delivering these mismatched frames produces split/misaligned images
-	 * and green flickers.  The DMA will be resized shortly by
-	 * sc0710_reset_dma_frame_sync(); until then, discard stale frames.
+	/* Validate DMA transfer size against expected frame size.
+	 * This catches races where resolution changed but buffers haven't been resized yet.
+	 * chain->total_transfer_size is set during allocation and reflects DMA buffer capacity.
 	 */
 	if (chain->total_transfer_size > 0 &&
-	    cached_framesize != (u32)chain->total_transfer_size) {
-		dprintk(1, "%s() frame size mismatch (%u vs DMA %d) - resolution transition, dropping\n",
-			__func__, cached_framesize, chain->total_transfer_size);
-		return;
+	    cached_framesize > (u32)chain->total_transfer_size) {
+		/* Don't drop - continue anyway but cap to the actual DMA buffer size
+		 * to prevent kernel panics. OBS needs to receive frames to stay alive.
+		 */
+		cached_framesize = chain->total_transfer_size;
 	}
 
 	/* Check if software scaler is active (MK.2 only) */
@@ -273,9 +271,17 @@ static void sc0710_dma_dequeue_video(struct sc0710_dma_channel *ch,
 					src_w, src_h, dst, dst_w, dst_h);
 				vb2_set_plane_payload(&vb_buf->vb.vb2_buf, 0, scaled_framesize);
 			} else {
-				/* Buffer too small for scaled output — drop frame */
-				printk_ratelimited(KERN_ERR "%s: V4L2 buffer %lu too small for scaled frame %u\n",
-					dev->name, buffer_size, scaled_framesize);
+				/* Buffer too small for scaled output — the client hasn't resized yet.
+				 * Fill what we can with black/green (zeroes in YUYV) to avoid leaking
+				 * kernel memory, and flag it as an error so the app knows it's bad,
+				 * but DO deliver it so the app's pipeline doesn't freeze.
+				 */
+				memset(dst, 0, buffer_size);
+				vb2_set_plane_payload(&vb_buf->vb.vb2_buf, 0, buffer_size);
+				vb_buf->vb.vb2_buf.timestamp = ktime_get_ns();
+				vb_buf->vb.sequence = ch->frame_sequence;
+				list_del(&vb_buf->list);
+				vb2_buffer_done(&vb_buf->vb.vb2_buf, VB2_BUF_STATE_ERROR);
 				spin_unlock_irqrestore(&client->buffer_lock, buf_flags);
 				continue;
 			}
