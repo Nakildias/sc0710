@@ -24,6 +24,7 @@
 #include <linux/delay.h>
 #include <asm/io.h>
 
+#include <media/v4l2-event.h>
 #include "sc0710.h"
 
 #define I2C_DEV__ARM_MCU (0x32 << 1)
@@ -356,7 +357,20 @@ static void sc0710_reset_dma_frame_sync(struct sc0710_dev *dev)
 	printk(KERN_INFO "%s: DMA started after signal restoration\n", dev->name);
 }
 
+void sc0710_notify_source_change(struct sc0710_dev *dev)
+{
+	struct v4l2_event ev = {
+		.type = V4L2_EVENT_SOURCE_CHANGE,
+		.u.src_change.changes = V4L2_EVENT_SRC_CH_RESOLUTION,
+	};
+	int i;
 
+	for (i = 0; i < SC0710_MAX_CHANNELS; i++) {
+		if (dev->channel[i].enabled && dev->channel[i].mediatype == CHTYPE_VIDEO) {
+			v4l2_event_queue(&dev->channel[i].vdev, &ev);
+		}
+	}
+}
 
 int sc0710_i2c_read_hdmi_status(struct sc0710_dev *dev)
 {
@@ -548,6 +562,7 @@ int sc0710_i2c_read_hdmi_status(struct sc0710_dev *dev)
 			msleep(300);
 			
 			printk(KERN_INFO "%s: Resynchronizing DMA frames\n", dev->name);
+			sc0710_notify_source_change(dev);
 			sc0710_reset_dma_frame_sync(dev);
 			return 0; /* Success */
 		}
@@ -633,6 +648,12 @@ int sc0710_i2c_read_hdmi_status(struct sc0710_dev *dev)
 				dev->cable_connected ? "NO SIGNAL (cable present)" : "NO DEVICE (cable unplugged)",
 				dev->cable_connected);
 		}
+	}
+
+	/* Signal loss */
+	if (was_locked && !dev->locked) {
+		printk(KERN_INFO "%s: Signal lost, notifying clients\n", dev->name);
+		sc0710_notify_source_change(dev);
 	}
 
 	mutex_unlock(&dev->signalMutex);

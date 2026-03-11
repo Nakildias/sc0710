@@ -22,6 +22,7 @@
 #include <linux/moduleparam.h>
 #include <linux/init.h>
 #include <linux/vmalloc.h>
+#include <media/v4l2-event.h>
 
 #include "sc0710.h"
 
@@ -1332,6 +1333,9 @@ static const struct v4l2_ioctl_ops video_ioctl_ops =
 	.vidioc_dqbuf            = sc0710_vidioc_dqbuf,
 	.vidioc_streamon         = sc0710_vidioc_streamon,
 	.vidioc_streamoff        = sc0710_vidioc_streamoff,
+
+	.vidioc_subscribe_event  = v4l2_src_change_event_subscribe,
+	.vidioc_unsubscribe_event= v4l2_event_unsubscribe,
 };
 
 static struct video_device sc0710_video_template =
