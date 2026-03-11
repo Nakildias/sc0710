@@ -295,6 +295,26 @@ static void generate_status_frames_if_needed(void)
 	printk(KERN_INFO "sc0710: Generated status frames from hybrid-optimized data\n");
 }
 
+/* Compute the effective output dimensions, accounting for the software scaler.
+ * When the scaler is active on a MK.2 board, the output resolution differs
+ * from the source resolution.  When disabled, output = source.
+ */
+static void sc0710_get_effective_size(struct sc0710_dev *dev,
+	const struct sc0710_format *fmt, u32 *width, u32 *height, u32 *framesize)
+{
+	u32 w = fmt->width;
+	u32 h = fmt->height;
+
+	if (dev->board == SC0710_BOARD_ELGATEO_4KP60_MK2 &&
+	    dev->scaler_mode != SCALER_MODE_DISABLED) {
+		sc0710_scaler_get_output_size(dev, w, h, &w, &h);
+	}
+
+	*width = w;
+	*height = h;
+	*framesize = w * 2 * h;
+}
+
 static void fill_frame(struct sc0710_dma_channel *ch,
 	unsigned char *dest_frame, unsigned int width,
 	unsigned int height, unsigned int fillmode)
@@ -772,16 +792,19 @@ static int vidioc_g_fmt_vid_cap(struct file *file, void *priv, struct v4l2_forma
 	struct sc0710_dma_channel *ch = video_drvdata(file);
 	struct sc0710_dev *dev = ch->dev;
 	const struct sc0710_format *fmt;
+	u32 eff_w, eff_h, eff_fs;
 
 	/* Use real format if available, otherwise use lastfmt, then default */
 	fmt = dev->fmt ? dev->fmt : (dev->last_fmt ? dev->last_fmt : sc0710_get_default_format());
 
-	f->fmt.pix.width = fmt->width;
-	f->fmt.pix.height = fmt->height;
+	sc0710_get_effective_size(dev, fmt, &eff_w, &eff_h, &eff_fs);
+
+	f->fmt.pix.width = eff_w;
+	f->fmt.pix.height = eff_h;
 	f->fmt.pix.pixelformat = V4L2_PIX_FMT_YUYV;
 	f->fmt.pix.field = V4L2_FIELD_NONE;
-	f->fmt.pix.bytesperline = fmt->width * 2;
-	f->fmt.pix.sizeimage = fmt->framesize;
+	f->fmt.pix.bytesperline = eff_w * 2;
+	f->fmt.pix.sizeimage = eff_fs;
 	f->fmt.pix.colorspace = sc0710_get_v4l2_colorspace(dev);
 	f->fmt.pix.xfer_func = sc0710_get_v4l2_xfer_func(dev);
 	f->fmt.pix.ycbcr_enc = sc0710_get_v4l2_ycbcr_enc(dev);
@@ -795,16 +818,19 @@ static int vidioc_try_fmt_vid_cap(struct file *file, void *priv, struct v4l2_for
 	struct sc0710_dma_channel *ch = video_drvdata(file);
 	struct sc0710_dev *dev = ch->dev;
 	const struct sc0710_format *fmt;
+	u32 eff_w, eff_h, eff_fs;
 
 	/* Use real format if available, otherwise use lastfmt, then default */
 	fmt = dev->fmt ? dev->fmt : (dev->last_fmt ? dev->last_fmt : sc0710_get_default_format());
 
-	f->fmt.pix.width = fmt->width;
-	f->fmt.pix.height = fmt->height;
+	sc0710_get_effective_size(dev, fmt, &eff_w, &eff_h, &eff_fs);
+
+	f->fmt.pix.width = eff_w;
+	f->fmt.pix.height = eff_h;
 	f->fmt.pix.pixelformat = V4L2_PIX_FMT_YUYV;
 	f->fmt.pix.field = V4L2_FIELD_NONE;
-	f->fmt.pix.bytesperline = fmt->width * 2;
-	f->fmt.pix.sizeimage = fmt->framesize;
+	f->fmt.pix.bytesperline = eff_w * 2;
+	f->fmt.pix.sizeimage = eff_fs;
 	f->fmt.pix.colorspace = sc0710_get_v4l2_colorspace(dev);
 	f->fmt.pix.xfer_func = sc0710_get_v4l2_xfer_func(dev);
 	f->fmt.pix.ycbcr_enc = sc0710_get_v4l2_ycbcr_enc(dev);
@@ -822,6 +848,7 @@ static int vidioc_enum_framesizes(struct file *file, void *priv, struct v4l2_frm
 {
 	struct sc0710_dma_channel *ch = video_drvdata(file);
 	struct sc0710_dev *dev = ch->dev;
+	u32 eff_w, eff_h, eff_fs;
 
 	if (fsize->pixel_format != V4L2_PIX_FMT_YUYV)
 		return -EINVAL;
@@ -833,9 +860,11 @@ static int vidioc_enum_framesizes(struct file *file, void *priv, struct v4l2_frm
 	if (dev->fmt == NULL)
 		return -EINVAL;
 
+	sc0710_get_effective_size(dev, dev->fmt, &eff_w, &eff_h, &eff_fs);
+
 	fsize->type = V4L2_FRMSIZE_TYPE_DISCRETE;
-	fsize->discrete.width = dev->fmt->width;
-	fsize->discrete.height = dev->fmt->height;
+	fsize->discrete.width = eff_w;
+	fsize->discrete.height = eff_h;
 
 	return 0;
 }
@@ -844,6 +873,7 @@ static int vidioc_enum_frameintervals(struct file *file, void *priv, struct v4l2
 {
 	struct sc0710_dma_channel *ch = video_drvdata(file);
 	struct sc0710_dev *dev = ch->dev;
+	u32 eff_w, eff_h, eff_fs;
 
 	if (fival->pixel_format != V4L2_PIX_FMT_YUYV)
 		return -EINVAL;
@@ -854,7 +884,9 @@ static int vidioc_enum_frameintervals(struct file *file, void *priv, struct v4l2
 	if (dev->fmt == NULL)
 		return -EINVAL;
 
-	if (fival->width != dev->fmt->width || fival->height != dev->fmt->height)
+	sc0710_get_effective_size(dev, dev->fmt, &eff_w, &eff_h, &eff_fs);
+
+	if (fival->width != eff_w || fival->height != eff_h)
 		return -EINVAL;
 
 	fival->type = V4L2_FRMIVAL_TYPE_DISCRETE;
@@ -905,15 +937,18 @@ static int sc0710_queue_setup(struct vb2_queue *q,
 	struct sc0710_dma_channel *ch = client->fh->ch;
 	struct sc0710_dev *dev = ch->dev;
 	const struct sc0710_format *fmt;
+	u32 eff_w, eff_h, eff_fs;
 
 	/* Use real format if available, otherwise use lastfmt, then default */
 	fmt = dev->fmt ? dev->fmt : (dev->last_fmt ? dev->last_fmt : sc0710_get_default_format());
+
+	sc0710_get_effective_size(dev, fmt, &eff_w, &eff_h, &eff_fs);
 
 	if (*num_buffers < 2)
 		*num_buffers = 2;
 
 	*num_planes = 1;
-	sizes[0] = fmt->framesize;
+	sizes[0] = eff_fs;
 
 	dprintk(2, "%s() buffer count=%d, size=%d\n", __func__, *num_buffers, sizes[0]);
 
@@ -926,17 +961,20 @@ static int sc0710_buf_prepare(struct vb2_buffer *vb)
 	struct sc0710_dma_channel *ch = client->fh->ch;
 	struct sc0710_dev *dev = ch->dev;
 	const struct sc0710_format *fmt;
+	u32 eff_w, eff_h, eff_fs;
 
 	/* Use real format if available, otherwise use lastfmt, then default */
 	fmt = dev->fmt ? dev->fmt : (dev->last_fmt ? dev->last_fmt : sc0710_get_default_format());
 
-	if (vb2_plane_size(vb, 0) < fmt->framesize) {
+	sc0710_get_effective_size(dev, fmt, &eff_w, &eff_h, &eff_fs);
+
+	if (vb2_plane_size(vb, 0) < eff_fs) {
 		dprintk(0, "%s() buffer too small (%lu < %u)\n",
-			__func__, vb2_plane_size(vb, 0), fmt->framesize);
+			__func__, vb2_plane_size(vb, 0), eff_fs);
 		return -EINVAL;
 	}
 
-	vb2_set_plane_payload(vb, 0, fmt->framesize);
+	vb2_set_plane_payload(vb, 0, eff_fs);
 
 	return 0;
 }
@@ -1331,9 +1369,13 @@ static void sc0710_vid_timeout(struct timer_list *t)
 	const struct sc0710_format *fmt;
 	unsigned long flags, buf_flags;
 	int any_streaming = 0;
+	u32 eff_w, eff_h, eff_fs;
 
 	/* Use lastfmt for placeholder frames to render at last known resolution */
 	fmt = dev->last_fmt ? dev->last_fmt : sc0710_get_default_format();
+
+	/* Compute effective (possibly scaled) output dimensions */
+	sc0710_get_effective_size(dev, fmt, &eff_w, &eff_h, &eff_fs);
 
 	/* If we have real signal, DMA is handling frame delivery, just reschedule */
 	if (dev->fmt != NULL && dev->locked) {
@@ -1381,8 +1423,8 @@ static void sc0710_vid_timeout(struct timer_list *t)
 						dev->name, dev->cable_connected,
 						fillmode == FILL_MODE_NOSIGNAL ? "NOSIGNAL" : "NODEVICE");
 				}
-				fill_frame(ch, dst, fmt->width, fmt->height, fillmode);
-				vb2_set_plane_payload(&buf->vb.vb2_buf, 0, fmt->framesize);
+				fill_frame(ch, dst, eff_w, eff_h, fillmode);
+				vb2_set_plane_payload(&buf->vb.vb2_buf, 0, eff_fs);
 			}
 
 			buf->vb.vb2_buf.timestamp = ktime_get_ns();

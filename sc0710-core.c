@@ -60,6 +60,10 @@ unsigned int msi_enable = 0;
 module_param_named(msi_enable, msi_enable, int, 0644);
 MODULE_PARM_DESC(msi_enable, "use msi interrupts (def: 1)");
 
+unsigned int scaler_mode = 0;
+module_param(scaler_mode, int, 0644);
+MODULE_PARM_DESC(scaler_mode, "MK.2 software scaler: 0=disabled, 1=upscale 4K, 2=downscale 1080P");
+
 static unsigned int card[]  = {[0 ... (SC0710_MAXBOARDS - 1)] = UNSET };
 module_param_array(card,  int, NULL, 0444);
 MODULE_PARM_DESC(card, "card type");
@@ -186,6 +190,12 @@ static int sc0710_dev_setup(struct sc0710_dev *dev)
 	       dev->board, card[dev->nr] == dev->board ?
 	       "insmod option" : "autodetected");
 
+	/* Initialize software scaler mode for MK.2 boards */
+	if (dev->board == SC0710_BOARD_ELGATEO_4KP60_MK2 && scaler_mode <= 2)
+		dev->scaler_mode = (enum sc0710_scaler_mode)scaler_mode;
+	else
+		dev->scaler_mode = SCALER_MODE_DISABLED;
+
 	return 0;
 }
 
@@ -268,6 +278,21 @@ static int sc0710_proc_state_show(struct seq_file *m, void *v)
 		seq_printf(m, "     procamp: contrast    %d\n", dev->contrast);
 		seq_printf(m, "     procamp: saturation  %d\n", dev->saturation);
 		seq_printf(m, "     procamp: hue         %d\n", dev->hue);
+
+		/* Software scaler state (MK.2 only) */
+		if (dev->board == SC0710_BOARD_ELGATEO_4KP60_MK2) {
+			seq_printf(m, "      scaler: %s\n",
+				sc0710_scaler_mode_name(dev->scaler_mode));
+			if (dev->scaler_mode != SCALER_MODE_DISABLED && dev->fmt) {
+				u32 out_w, out_h;
+				sc0710_scaler_get_output_size(dev,
+					dev->fmt->width, dev->fmt->height,
+					&out_w, &out_h);
+				seq_printf(m, "  scaled out: %ux%u -> %ux%u\n",
+					dev->fmt->width, dev->fmt->height,
+					out_w, out_h);
+			}
+		}
 
 		for (i = 0; i < SC0710_MAX_CHANNELS; i++) {
 			ch = &dev->channel[i];
@@ -457,6 +482,22 @@ static int sc0710_thread_hdmi_function(void *data)
 		//sc0710_i2c_read_status2(dev);
 		//sc0710_i2c_read_status3(dev);
 
+		/* Sync software scaler mode from module parameter.
+		 * This allows runtime toggling via:
+		 *   echo N > /sys/module/sc0710/parameters/scaler_mode
+		 * where N = 0 (disabled), 1 (upscale to 4K), 2 (downscale to 1080P).
+		 */
+		if (dev->board == SC0710_BOARD_ELGATEO_4KP60_MK2 && scaler_mode <= 2) {
+			enum sc0710_scaler_mode new_mode = (enum sc0710_scaler_mode)scaler_mode;
+			if (dev->scaler_mode != new_mode) {
+				printk(KERN_INFO "%s: Software scaler mode changed: %s -> %s\n",
+					dev->name,
+					sc0710_scaler_mode_name(dev->scaler_mode),
+					sc0710_scaler_mode_name(new_mode));
+				dev->scaler_mode = new_mode;
+			}
+		}
+
 		mutex_unlock(&dev->kthread_hdmi_lock);
 	}
 
@@ -616,6 +657,12 @@ static void sc0710_finidev(struct pci_dev *pci_dev)
 	mutex_unlock(&devlist);
 
 	sc0710_dev_unregister(dev);
+
+	/* Free software scaler staging buffer if allocated */
+	if (dev->scaler_staging_buf) {
+		vfree(dev->scaler_staging_buf);
+		dev->scaler_staging_buf = NULL;
+	}
 
 	v4l2_device_unregister(&dev->v4l2_dev);
 	kfree(dev);

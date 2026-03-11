@@ -70,6 +70,7 @@ The `sc0710-cli` tool (installed via the automatic script) provides real-time co
 | `sc0710-cli --restart` | Reload the module. |
 | `sc0710-cli --debug` | Toggle verbose dmesg logging. |
 | `sc0710-cli --image-toggle` | Toggle between No Signal images and Colorbars. |
+| `sc0710-cli --software-scaler` | Toggle software scaler modes (MK.2 only). |
 | `sc0710-cli --update` | Pull latest code and rebuild. |
 | `sc0710-cli --remove` | Completely uninstall driver and CLI. |
 | `sc0710-cli --version` | Show installed driver version. |

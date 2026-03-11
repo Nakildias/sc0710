@@ -775,8 +775,12 @@ save_config() {
         dbg=\$(cat /sys/module/sc0710/parameters/debug 2>/dev/null || echo 0)
     fi
     local img=\$(cat /sys/module/sc0710/parameters/use_status_images 2>/dev/null || echo 1)
+    local smode=0
+    if [[ -f /sys/module/sc0710/parameters/scaler_mode ]]; then
+        smode=\$(cat /sys/module/sc0710/parameters/scaler_mode 2>/dev/null || echo 0)
+    fi
 
-    echo "options sc0710 sc0710_debug_mode=\$dbg use_status_images=\$img" > /etc/modprobe.d/sc0710-params.conf
+    echo "options sc0710 sc0710_debug_mode=\$dbg use_status_images=\$img scaler_mode=\$smode" > /etc/modprobe.d/sc0710-params.conf
     echo -e "\${BLUE}[PERSIST]\${NC} Settings saved to /etc/modprobe.d/sc0710-params.conf"
 }
 
@@ -813,6 +817,7 @@ show_help() {
     echo -e "    \${BOLD}-s, --status\${NC}     Show module and build status"
     echo -e "    \${BOLD}-d, --debug\${NC}      Toggle debug mode on/off"
     echo -e "    \${BOLD}-it, --image-toggle\${NC} Toggle status images on/off"
+    echo -e "    \${BOLD}-ss, --software-scaler\${NC} Toggle software scaler modes (MK.2 only)"
     echo -e "    \${BOLD}-U, --update\${NC}     Check for updates and reinstall"
     echo -e "    \${BOLD}-r, -R, --remove\${NC} Completely uninstall driver and CLI"
     echo -e "    \${BOLD}--rebuild\${NC}        Force rebuild the module for current kernel"
@@ -1184,6 +1189,24 @@ case "\$1" in
         fi
         save_config
         ;;
+    -ss|--software-scaler)
+        if [[ ! -f /sys/module/sc0710/parameters/scaler_mode ]]; then
+            echo -e "\${RED}[ERROR]\${NC} Module not loaded. Load it first with: sc0710-cli --load"
+            exit 1
+        fi
+        CURRENT=\$(cat /sys/module/sc0710/parameters/scaler_mode)
+        if [[ "\$CURRENT" == "0" || -z "\$CURRENT" ]]; then
+            echo 1 > /sys/module/sc0710/parameters/scaler_mode
+            echo -e "\${GREEN}[OK]\${NC} Software Scaler enabled: Upscale Mode (to 4K)"
+        elif [[ "\$CURRENT" == "1" ]]; then
+            echo 2 > /sys/module/sc0710/parameters/scaler_mode
+            echo -e "\${YELLOW}[OK]\${NC} Software Scaler changed: Downscale Mode (to 1080P)"
+        else
+            echo 0 > /sys/module/sc0710/parameters/scaler_mode
+            echo -e "\${BLUE}[OK]\${NC} Software Scaler disabled"
+        fi
+        save_config
+        ;;
     -U|--update)
         echo -e "\${BLUE}::\${NC} Checking for updates..."
 
@@ -1332,6 +1355,7 @@ echo -e "      ${BOLD}sc0710-cli -u${NC}  or  ${BOLD}--unload${NC}   Unload driv
 echo -e "      ${BOLD}sc0710-cli --restart${NC}        Reload driver"
 echo -e "      ${BOLD}sc0710-cli -d${NC}  or  ${BOLD}--debug${NC}    Toggle debug output"
 echo -e "      ${BOLD}sc0710-cli -it${NC} or  ${BOLD}--image-toggle${NC}  Toggle status images"
+echo -e "      ${BOLD}sc0710-cli -ss${NC} or  ${BOLD}--software-scaler${NC} Toggle software scaler (MK.2)"
 echo -e ""
 echo -e "      ${BOLD}sc0710-cli --rebuild${NC}        Force rebuild for current kernel"
 echo -e "      ${BOLD}sc0710-cli -U${NC}  or  ${BOLD}--update${NC}   Pull latest & rebuild"

@@ -100,6 +100,13 @@ extern unsigned int sc0710_debug_mode;
 #define SC0710_BOARD_ELGATEO_4KP60_MK2   1
 #define SC0710_BOARD_ELGATEO_4KP         2
 
+/* Software scaler modes (MK.2 only — 4K Pro has hardware scaler) */
+enum sc0710_scaler_mode {
+	SCALER_MODE_DISABLED = 0,
+	SCALER_MODE_UPSCALE  = 1,  /* Scale everything to 3840x2160 */
+	SCALER_MODE_DOWNSCALE = 2, /* Scale everything to 1920x1080 */
+};
+
 struct sc0710_board {
 	char *name;
 	int   bar1_index; /* PCI BAR index for config registers (1 or 5) */
@@ -390,7 +397,10 @@ struct sc0710_dev {
 	u32                        unlocked_no_timing_count; /* Consecutive polls with no lock and no timing */
 	u32                        lock_dropout_count;       /* 4K Pro: consecutive polls with no lock while previously locked */
 
-
+	/* Software scaler (MK.2 only) */
+	enum sc0710_scaler_mode    scaler_mode;
+	u8                        *scaler_staging_buf;  /* Contiguous frame for scaling input */
+	u32                        scaler_staging_size;  /* Current allocation size */
 
 	/* Procamp */
 	s32                        brightness;
@@ -504,3 +514,10 @@ int  sc0710_audio_register(struct sc0710_dev *dev);
 void sc0710_audio_unregister(struct sc0710_dev *dev);
 int  sc0710_audio_deliver_samples(struct sc0710_dev *dev, struct sc0710_dma_channel *ch,
         const u8 *buf, int bitdepth, int strideBytes, int channels, int samplesPerChannel);
+
+/* -scaler.c (software scaler for MK.2) */
+void sc0710_scaler_get_output_size(struct sc0710_dev *dev,
+	u32 src_width, u32 src_height, u32 *out_width, u32 *out_height);
+int  sc0710_scaler_scale_frame(const u8 *src, u32 src_width, u32 src_height,
+	u8 *dst, u32 dst_width, u32 dst_height);
+const char *sc0710_scaler_mode_name(enum sc0710_scaler_mode mode);

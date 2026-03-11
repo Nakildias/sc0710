@@ -177,6 +177,10 @@ static void sc0710_dma_dequeue_video(struct sc0710_dma_channel *ch,
 	struct sc0710_dev *dev = ch->dev;
 	struct sc0710_client *client;
 	unsigned long flags;
+	int scaler_active = 0;
+	u32 src_w = 0, src_h = 0;
+	u32 dst_w = 0, dst_h = 0;
+	u32 scaled_framesize = 0;
 
 	if (cached_framesize == 0) {
 		dprintk(1, "%s() no format detected, skipping\n", __func__);
@@ -194,6 +198,43 @@ static void sc0710_dma_dequeue_video(struct sc0710_dma_channel *ch,
 		cached_framesize = chain->total_transfer_size;
 	}
 
+	/* Check if software scaler is active (MK.2 only) */
+	if (dev->board == SC0710_BOARD_ELGATEO_4KP60_MK2 &&
+	    dev->scaler_mode != SCALER_MODE_DISABLED &&
+	    dev->fmt) {
+		src_w = dev->fmt->width;
+		src_h = dev->fmt->height;
+		sc0710_scaler_get_output_size(dev, src_w, src_h, &dst_w, &dst_h);
+
+		/* Only scale if output differs from input */
+		if (dst_w != src_w || dst_h != src_h) {
+			scaled_framesize = dst_w * 2 * dst_h;
+
+			/* Ensure staging buffer is large enough for the source frame */
+			if (!dev->scaler_staging_buf ||
+			    dev->scaler_staging_size < cached_framesize) {
+				if (dev->scaler_staging_buf)
+					vfree(dev->scaler_staging_buf);
+				dev->scaler_staging_buf = vmalloc(cached_framesize);
+				dev->scaler_staging_size = cached_framesize;
+				if (!dev->scaler_staging_buf) {
+					dev->scaler_staging_size = 0;
+					printk_ratelimited(KERN_ERR "%s: Failed to allocate scaler staging buffer (%u bytes)\n",
+						dev->name, cached_framesize);
+					/* Fall through to unscaled path */
+				}
+			}
+
+			if (dev->scaler_staging_buf) {
+				/* Gather scattered DMA data into contiguous staging buffer */
+				int gathered = sc0710_dma_chain_dq_to_ptr(ch, chain,
+					dev->scaler_staging_buf, cached_framesize);
+				if (gathered > 0)
+					scaler_active = 1;
+			}
+		}
+	}
+
 	/* Broadcast frame to all streaming clients */
 	spin_lock_irqsave(&ch->client_list_lock, flags);
 	list_for_each_entry(client, &ch->client_list, list) {
@@ -201,7 +242,6 @@ static void sc0710_dma_dequeue_video(struct sc0710_dma_channel *ch,
 		unsigned long buf_flags;
 		u8 *dst;
 		unsigned long buffer_size;
-		int len;
 
 		if (!client->streaming)
 			continue;
@@ -222,23 +262,38 @@ static void sc0710_dma_dequeue_video(struct sc0710_dma_channel *ch,
 			continue;
 		}
 
-		/* Validate buffer size against DMA transfer size to prevent overflow.
-		 * This is the final safety check before the actual copy.
-		 */
-		if (chain->total_transfer_size > 0 && (u32)chain->total_transfer_size > buffer_size) {
-			printk_ratelimited(KERN_ERR "%s: DMA size %d exceeds client buffer %lu - dropping frame\n",
-				dev->name, chain->total_transfer_size, buffer_size);
-			spin_unlock_irqrestore(&client->buffer_lock, buf_flags);
-			continue; /* Skip this buffer, don't attempt copy */
-		}
-
-		/* Copy DMA data to client's buffer - use cached_framesize */
-		if (cached_framesize > buffer_size) {
-			len = sc0710_dma_chain_dq_to_ptr(ch, chain, dst, buffer_size);
-			vb2_set_plane_payload(&vb_buf->vb.vb2_buf, 0, buffer_size);
+		if (scaler_active) {
+			/* Scale from staging buffer into client's V4L2 buffer */
+			if (scaled_framesize <= buffer_size) {
+				sc0710_scaler_scale_frame(dev->scaler_staging_buf,
+					src_w, src_h, dst, dst_w, dst_h);
+				vb2_set_plane_payload(&vb_buf->vb.vb2_buf, 0, scaled_framesize);
+			} else {
+				/* Buffer too small for scaled output — drop frame */
+				printk_ratelimited(KERN_ERR "%s: V4L2 buffer %lu too small for scaled frame %u\n",
+					dev->name, buffer_size, scaled_framesize);
+				spin_unlock_irqrestore(&client->buffer_lock, buf_flags);
+				continue;
+			}
 		} else {
-			len = sc0710_dma_chain_dq_to_ptr(ch, chain, dst, cached_framesize);
-			vb2_set_plane_payload(&vb_buf->vb.vb2_buf, 0, cached_framesize);
+			int len;
+
+			/* Validate buffer size against DMA transfer size to prevent overflow. */
+			if (chain->total_transfer_size > 0 && (u32)chain->total_transfer_size > buffer_size) {
+				printk_ratelimited(KERN_ERR "%s: DMA size %d exceeds client buffer %lu - dropping frame\n",
+					dev->name, chain->total_transfer_size, buffer_size);
+				spin_unlock_irqrestore(&client->buffer_lock, buf_flags);
+				continue;
+			}
+
+			/* Copy DMA data to client's buffer - use cached_framesize */
+			if (cached_framesize > buffer_size) {
+				len = sc0710_dma_chain_dq_to_ptr(ch, chain, dst, buffer_size);
+				vb2_set_plane_payload(&vb_buf->vb.vb2_buf, 0, buffer_size);
+			} else {
+				len = sc0710_dma_chain_dq_to_ptr(ch, chain, dst, cached_framesize);
+				vb2_set_plane_payload(&vb_buf->vb.vb2_buf, 0, cached_framesize);
+			}
 		}
 
 		vb_buf->vb.vb2_buf.timestamp = ktime_get_ns();
@@ -255,6 +310,7 @@ static void sc0710_dma_dequeue_video(struct sc0710_dma_channel *ch,
 	/* Re-set the buffer timeout */
 	mod_timer(&ch->timeout, jiffies + VBUF_TIMEOUT);
 }
+
 
 /* Copy the contains of the audio chain into linux audio subsystem.
  */
