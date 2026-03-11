@@ -290,8 +290,15 @@ static void sc0710_dma_dequeue_video(struct sc0710_dma_channel *ch,
 
 			/* Validate buffer size against DMA transfer size to prevent overflow. */
 			if (chain->total_transfer_size > 0 && (u32)chain->total_transfer_size > buffer_size) {
-				printk_ratelimited(KERN_ERR "%s: DMA size %d exceeds client buffer %lu - dropping frame\n",
-					dev->name, chain->total_transfer_size, buffer_size);
+				/* Buffer too small for the actual DMA frame.
+				 * Fill with zero/black, flag as Error, but DO deliver to keep OBS pipe alive!
+				 */
+				memset(dst, 0, buffer_size);
+				vb2_set_plane_payload(&vb_buf->vb.vb2_buf, 0, buffer_size);
+				vb_buf->vb.vb2_buf.timestamp = ktime_get_ns();
+				vb_buf->vb.sequence = ch->frame_sequence;
+				list_del(&vb_buf->list);
+				vb2_buffer_done(&vb_buf->vb.vb2_buf, VB2_BUF_STATE_ERROR);
 				spin_unlock_irqrestore(&client->buffer_lock, buf_flags);
 				continue;
 			}
