@@ -29,6 +29,11 @@
 #define I2C_DEV__ARM_MCU (0x32 << 1)
 #define I2C_DEV__UNKNOWN (0x33 << 1)
 
+#define SC0710_I2C_HDMI_RETRIES 3
+#define SC0710_I2C_HDMI_RETRY_DELAY_US 50000
+#define SC0710_LOCK_DROPOUT_MAX 5
+#define SC0710_NO_TIMING_THRESHOLD 6
+
 #if 1 /* Enable I2C write for tone mapping control */
 static int didack(struct sc0710_dev *dev)
 {
@@ -152,9 +157,8 @@ static int __sc0710_i2c_writeread(struct sc0710_dev *dev, u8 devaddr8bit, u8 *wb
 	 * Accept both — the transaction proceeds regardless.
 	 */
 	while (cnt > 0) {
-		if (time_after(jiffies, timeout)) {
-			return 0;
-		}
+		if (time_after(jiffies, timeout))
+			return -ETIMEDOUT;
 		v = sc_read(dev, 0, BAR0_3104);
 		if ((v == 0x00000044) || (v == 0x00000040))
 			break;
@@ -163,7 +167,11 @@ static int __sc0710_i2c_writeread(struct sc0710_dev *dev, u8 devaddr8bit, u8 *wb
 	}
 	//dprintk(0, "Read 3104 %08x at cnt %d -- 44?\n", v, cnt);
 	if (cnt <= 0) {
-		return 0; /* Continue anyway — 4K Pro may not set bus-busy */
+		/* 4K Pro may not always expose the expected bus-busy bit.
+		 * Continue to sub-address stage unless we actually hit timeout.
+		 */
+		if (time_after(jiffies, timeout))
+			return -ETIMEDOUT;
 	}
 
 	/* Write out subaddress (single byte) */
@@ -176,9 +184,8 @@ static int __sc0710_i2c_writeread(struct sc0710_dev *dev, u8 devaddr8bit, u8 *wb
 	 */
 	cnt = 16;
 	while (cnt > 0) {
-		if (time_after(jiffies, timeout)) {
-			return 0;
-		}
+		if (time_after(jiffies, timeout))
+			return -ETIMEDOUT;
 		v = sc_read(dev, 0, BAR0_3104);
 		if (v & 0x80) /* TX_FIFO_Empty — sub-address byte consumed */
 			break;
@@ -228,15 +235,17 @@ static int sc0710_i2c_writeread(struct sc0710_dev *dev, u8 devaddr8bit, u8 *wbuf
 	return ret;
 }
 
-/* Helper to fully restart DMA on signal restoration to fix frame alignment.
- * Also handles starting DMA if streaming started without signal.
+/* Atomic DMA restart on signal restoration or resolution/refresh change.
+ * Serializes with the DMA service thread via kthread_dma_lock so that
+ * dequeue cannot race with stop/resize/start.
  */
-static void sc0710_reset_dma_frame_sync(struct sc0710_dev *dev)
+void sc0710_reset_dma_frame_sync(struct sc0710_dev *dev)
 {
 	struct sc0710_dma_channel *ch;
 	struct sc0710_dma_descriptor_chain *chain;
 	struct sc0710_dma_descriptor_chain_allocation *dca;
 	int ch_idx, i, j;
+	int retry;
 	int dma_was_running = 0;
 	int has_streaming_clients = 0;
 
@@ -245,16 +254,15 @@ static void sc0710_reset_dma_frame_sync(struct sc0710_dev *dev)
 		return;
 	}
 
-	/* Check video channel status */
 	for (ch_idx = 0; ch_idx < SC0710_MAX_CHANNELS; ch_idx++) {
 		ch = &dev->channel[ch_idx];
-		
+
 		if (!ch->enabled || ch->mediatype != CHTYPE_VIDEO)
 			continue;
 
 		if (ch->state == STATE_RUNNING)
 			dma_was_running = 1;
-		
+
 		if (atomic_read(&ch->streaming_refcount) > 0)
 			has_streaming_clients = 1;
 	}
@@ -267,42 +275,37 @@ static void sc0710_reset_dma_frame_sync(struct sc0710_dev *dev)
 	printk(KERN_INFO "%s: Signal restoration - DMA was %s, have streaming clients\n",
 		dev->name, dma_was_running ? "running" : "stopped");
 
-	/* Phase 1: Stop DMA if it was running */
+	/* Hold the DMA service lock for the entire stop/resize/start
+	 * sequence.  The DMA thread checks reconfig_in_progress under
+	 * the same lock, so service cannot run while we reconfigure.
+	 */
+	mutex_lock(&dev->kthread_dma_lock);
+	dev->reconfig_in_progress = 1;
+
+	/* Phase 1: Stop video DMA channels */
 	if (dma_was_running) {
 		for (ch_idx = 0; ch_idx < SC0710_MAX_CHANNELS; ch_idx++) {
 			ch = &dev->channel[ch_idx];
-			
+
 			if (!ch->enabled || ch->state != STATE_RUNNING)
 				continue;
-			
+
 			if (ch->mediatype != CHTYPE_VIDEO)
 				continue;
 
 			mutex_lock(&ch->lock);
-			
+
 			printk(KERN_INFO "%s: Stopping DMA channel %d for resync\n",
 				dev->name, ch_idx);
-			
-			/* Stop the DMA hardware */
+
 			sc_write(dev, 1, ch->reg_dma_control_w1c, 0x00000001);
-			
-			/* Longer delay to ensure all in-flight DMA transactions complete.
-			 * This prevents race conditions where DMA completion processing
-			 * could occur with stale buffer state during resize.
-			 */
+
 			usleep_range(5000, 6000);
-			
-			/* Delete timeout timer to prevent it firing with stale buffer
-			 * state during resize operations.
-			 */
+
 			timer_delete_sync(&ch->timeout);
-			
-			/* Memory barrier to ensure DMA stop is visible to all CPUs
-			 * before we clear the writeback metadata.
-			 */
+
 			mb();
-			
-			/* Clear all writeback metadata */
+
 			for (i = 0; i < ch->numDescriptorChains; i++) {
 				chain = &ch->chains[i];
 				for (j = 0; j < chain->numAllocations; j++) {
@@ -313,47 +316,85 @@ static void sc0710_reset_dma_frame_sync(struct sc0710_dev *dev)
 						*(dca->wbm[1]) = 0;
 				}
 			}
-			
-			/* Write memory barrier to ensure metadata clear is visible
-			 * before we proceed with resize.
-			 */
+
 			wmb();
-			
-			/* Reset descriptor counter */
+
 			ch->dma_completed_descriptor_count_last = 0;
-			sc_write(dev, 1, ch->reg_dma_completed_descriptor_count, 1);
-			sc_write(dev, 1, ch->reg_sg_start_h, ch->pt_dma >> 32);
-			sc_write(dev, 1, ch->reg_sg_start_l, ch->pt_dma);
-			sc_write(dev, 1, ch->reg_sg_adj, 0);
-			
-			/* Update state so resize() can proceed */
 			ch->state = STATE_STOPPED;
-			
+
 			mutex_unlock(&ch->lock);
 		}
 	}
 
-	/* Phase 2: Resize DMA buffers if needed (for resolution changes) */
+	/* Phase 2: Resize DMA buffers for the new resolution */
 	sc0710_dma_channels_resize(dev);
 
-	/* Phase 3: Program hardware registers */
-	if (dev->fmt) {
-		sc_write(dev, 0, BAR0_00C8, dev->fmt->height);
-		printk(KERN_INFO "%s: Reprogrammed height register to %d\n",
-			dev->name, dev->fmt->height);
+	/* Phase 3: Drop first frames after restart — the FPGA may
+	 * begin capturing mid-frame, producing a torn image.
+	 */
+	for (ch_idx = 0; ch_idx < SC0710_MAX_CHANNELS; ch_idx++) {
+		ch = &dev->channel[ch_idx];
+		if (ch->enabled && ch->mediatype == CHTYPE_VIDEO) {
+			ch->skip_next_frames = 3;
+			ch->tear_validation_frames_left = dma_resync_validate_frames;
+			ch->tear_streak_count = 0;
+			ch->tear_last_line = -1;
+		}
 	}
-	sc_write(dev, 0, BAR0_00D0, 0x4100);
-	sc_write(dev, 0, 0xcc, 0);
-	sc_write(dev, 0, 0xdc, 0);
-	sc_write(dev, 0, BAR0_00D0, 0x4300);
-	sc_write(dev, 0, BAR0_00D0, 0x4100);
 
-	/* Small delay before restart */
-	msleep(10);
+	/* Phase 4: Full restart via the canonical path (prep, pipeline
+	 * registers, enable, channel start).  This uses the single
+	 * authoritative sc0710_program_pipeline_regs() so that the
+	 * register sequence is never partially applied.
+	 * Verify video DMA run bit and retry once if needed.
+	 */
+	for (retry = 0; retry < 2; retry++) {
+		int dma_running_ok = 1;
 
-	/* Phase 4: Start DMA */
-	sc0710_dma_channels_start(dev);
-	printk(KERN_INFO "%s: DMA started after signal restoration\n", dev->name);
+		sc0710_dma_channels_start(dev);
+
+		for (ch_idx = 0; ch_idx < SC0710_MAX_CHANNELS; ch_idx++) {
+			u32 dma_ctrl;
+
+			ch = &dev->channel[ch_idx];
+			if (!ch->enabled || ch->mediatype != CHTYPE_VIDEO)
+				continue;
+			if (atomic_read(&ch->streaming_refcount) <= 0)
+				continue;
+
+			dma_ctrl = sc_read(dev, 1, ch->reg_dma_control);
+			if (!(dma_ctrl & 0x00000001)) {
+				dma_running_ok = 0;
+				printk(KERN_WARNING "%s: DMA channel %d not running after restart (ctrl=%08x)\n",
+				       dev->name, ch_idx, dma_ctrl);
+				break;
+			}
+			ch->dma_last_completion_jiffies = jiffies;
+		}
+
+		if (dma_running_ok)
+			break;
+
+		if (retry == 0) {
+			printk(KERN_WARNING "%s: Retrying DMA restart after failed run-state verify\n",
+			       dev->name);
+			for (ch_idx = 0; ch_idx < SC0710_MAX_CHANNELS; ch_idx++) {
+				ch = &dev->channel[ch_idx];
+				if (!ch->enabled || ch->mediatype != CHTYPE_VIDEO)
+					continue;
+				mutex_lock(&ch->lock);
+				sc_write(dev, 1, ch->reg_dma_control_w1c, 0x00000001);
+				ch->state = STATE_STOPPED;
+				mutex_unlock(&ch->lock);
+			}
+			usleep_range(5000, 6000);
+		}
+	}
+
+	dev->reconfig_in_progress = 0;
+	mutex_unlock(&dev->kthread_dma_lock);
+
+	printk(KERN_INFO "%s: DMA restarted after signal restoration\n", dev->name);
 }
 
 
@@ -362,10 +403,15 @@ int sc0710_i2c_read_hdmi_status(struct sc0710_dev *dev)
 {
 	int ret;
 	int i;
+	int pass;
+	int attempt;
 	u8 wbuf[1]    = { 0x00 /* Subaddress */ };
 	u8 rbuf[0x14] = { 0    /* response buffer */};
 	u32 was_locked;
 	int signal_locked;
+	int raw_locked;
+	int refresh_only_change = 0;
+	u32 new_pixelLineH = 0, new_pixelLineV = 0;
 
 	/* We're going to update dev->fmt and other shared state, so take the lock early 
        Use trylock or lock - check precedent. core.c calls this with kthread_hdmi_lock held,
@@ -376,11 +422,24 @@ int sc0710_i2c_read_hdmi_status(struct sc0710_dev *dev)
 	/* Remember previous lock state to detect signal restoration */
 	was_locked = dev->locked;
 
-	ret = __sc0710_i2c_writeread(dev, I2C_DEV__ARM_MCU, &wbuf[0], sizeof(wbuf), &rbuf[0], sizeof(rbuf));
+	for (attempt = 0; attempt < SC0710_I2C_HDMI_RETRIES; attempt++) {
+		ret = __sc0710_i2c_writeread(dev, I2C_DEV__ARM_MCU,
+					     &wbuf[0], sizeof(wbuf),
+					     &rbuf[0], sizeof(rbuf));
+		if (ret == 0)
+			break;
+
+		if (attempt + 1 < SC0710_I2C_HDMI_RETRIES)
+			usleep_range(SC0710_I2C_HDMI_RETRY_DELAY_US,
+				     SC0710_I2C_HDMI_RETRY_DELAY_US + 5000);
+	}
+
 	if (ret < 0) {
+		/* Preserve last known-good signal/debounce state on I2C errors. */
 		mutex_unlock(&dev->signalMutex);
-		printk("%s ret = %d\n", __func__, ret);
-		return -1;
+		printk_ratelimited(KERN_WARNING "%s: HDMI status read failed after retries (%d)\n",
+				   dev->name, ret);
+		return ret;
 	}
 	/* Lock detection differs by board.
 	 * MK2: rbuf[8] is a dedicated lock flag (0 or 1).
@@ -392,166 +451,116 @@ int sc0710_i2c_read_hdmi_status(struct sc0710_dev *dev)
 	 */
 
 
-	if (dev->board == SC0710_BOARD_ELGATEO_4KP) {
-		int raw_locked = (rbuf[4] | rbuf[5] | rbuf[6] | rbuf[7]) != 0;
-		if (raw_locked) {
-			dev->lock_dropout_count = 0;
-			signal_locked = 1;
-		} else if (was_locked && dev->lock_dropout_count < 5) {
-			/* Hold locked state through transient dropouts (~1s at 200ms poll) */
-			dev->lock_dropout_count++;
-			mutex_unlock(&dev->signalMutex);
-			return 0;
-		} else {
-			signal_locked = 0;
-		}
+	if (dev->board == SC0710_BOARD_ELGATEO_4KP)
+		raw_locked = (rbuf[4] | rbuf[5] | rbuf[6] | rbuf[7]) != 0;
+	else
+		raw_locked = rbuf[8] != 0;
+
+	if (raw_locked) {
+		dev->lock_dropout_count = 0;
+		signal_locked = 1;
+	} else if (was_locked && dev->lock_dropout_count < SC0710_LOCK_DROPOUT_MAX) {
+		/* Hold locked state through transient dropouts (~1s at 200ms poll). */
+		dev->lock_dropout_count++;
+		mutex_unlock(&dev->signalMutex);
+		return 0;
 	} else {
-		signal_locked = rbuf[8] != 0;
+		signal_locked = 0;
 	}
 
 	if (signal_locked) {
-		u32 new_pixelLineH, new_pixelLineV;
-		int timing_changed = 0;
 
 		dev->locked = 1;
-		
-		/* If we have a lock, a cable is definitely connected */
 		dev->cable_connected = 1;
-		dev->unlocked_no_timing_count = 0; /* Reset counter on lock */
-		
+		dev->unlocked_no_timing_count = 0;
+
 		switch ((rbuf[0x0d] & 0x30) >> 4) {
-		case 0x1:
-			dev->colorimetry = BT_709;
-			break;
-		case 0x2:
-			dev->colorimetry = BT_601;
-			break;
-		case 0x3:
-			dev->colorimetry = BT_2020;
-			break;
-		default:
-			dev->colorimetry = BT_UNDEFINED;
+		case 0x1: dev->colorimetry = BT_709;  break;
+		case 0x2: dev->colorimetry = BT_601;  break;
+		case 0x3: dev->colorimetry = BT_2020; break;
+		default:  dev->colorimetry = BT_UNDEFINED;
 		}
 
 		switch (rbuf[0x0f]) {
-		case 0x0:
-			dev->colorspace = CS_YUV_YCRCB_422_420;
-			break;
-		case 0x1:
-			dev->colorspace = CS_YUV_YCRCB_444;
-			break;
-		case 0x2:
-			dev->colorspace = CS_RGB_444;
-			break;
-		default:
-			dev->colorspace = CS_UNDEFINED;
+		case 0x0: dev->colorspace = CS_YUV_YCRCB_422_420; break;
+		case 0x1: dev->colorspace = CS_YUV_YCRCB_444;     break;
+		case 0x2: dev->colorspace = CS_RGB_444;            break;
+		default:  dev->colorspace = CS_UNDEFINED;
 		}
 
-		/* Default EOTF to SDR - safer than assuming HDR.
-		 * TODO: Parse actual EOTF from HDR DR InfoFrame if available.
-		 * HDR DR InfoFrame EOTF field: 0=SDR, 2=SMPTE 2084/PQ, 3=HLG
-		 */
 		dev->eotf = EOTF_SDR;
 
-
-		/* Save old timings to detect changes */
 		new_pixelLineV = rbuf[0x05] << 8 | rbuf[0x04];
 		new_pixelLineH = rbuf[0x07] << 8 | rbuf[0x06];
-		
-		/* Detect timing change (quick replug or resolution change) */
-		if (was_locked && dev->pixelLineH > 0 && dev->pixelLineV > 0) {
-			if (new_pixelLineH != dev->pixelLineH || new_pixelLineV != dev->pixelLineV ||
-			    rbuf[0x0c] != dev->last_hint_interval || rbuf[0x0d] != dev->last_hint_flags) {
-				timing_changed = 1;
-				if (sc0710_debug_mode) {
-					printk(KERN_INFO "%s: HDMI timing/rate changed (%dx%d@%x/%x -> %dx%d@%x/%x)\n",
-						dev->name, dev->pixelLineH, dev->pixelLineV, dev->last_hint_interval, dev->last_hint_flags,
-						new_pixelLineH, new_pixelLineV, rbuf[0x0c], rbuf[0x0d]);
-				}
+
+		/* ---- Debounce path ----
+		 * If a timing candidate is pending, compare the current
+		 * reading against it.  Only proceed with a full reconfig
+		 * after 2 consecutive matching polls (~400 ms).
+		 */
+		if (dev->timing_stable_count > 0) {
+			if (new_pixelLineH == dev->pending_pixelLineH &&
+			    new_pixelLineV == dev->pending_pixelLineV &&
+			    rbuf[0x0c] == dev->pending_hint_interval &&
+			    rbuf[0x0d] == dev->pending_hint_flags) {
+				dev->timing_stable_count++;
+			} else {
+				dev->pending_pixelLineH = new_pixelLineH;
+				dev->pending_pixelLineV = new_pixelLineV;
+				dev->pending_hint_interval = rbuf[0x0c];
+				dev->pending_hint_flags = rbuf[0x0d];
+				dev->timing_stable_count = 1;
+				mutex_unlock(&dev->signalMutex);
+				return 0;
 			}
+
+			if (dev->timing_stable_count >= 2) {
+				/* Confirmed stable — jump to the commit path */
+				dev->timing_stable_count = 0;
+				goto confirmed_timing_change;
+			}
+
+			mutex_unlock(&dev->signalMutex);
+			return 0;
 		}
-		
+
+		/* ---- Normal detection path ----
+		 * First lock (!was_locked) or timing/rate change while
+		 * locked enters the debounce — candidate is stored and we
+		 * wait for confirmation on the next poll.
+		 */
+		if (!was_locked ||
+		    (was_locked && dev->pixelLineH > 0 && dev->pixelLineV > 0 &&
+		     (new_pixelLineH != dev->pixelLineH ||
+		      new_pixelLineV != dev->pixelLineV ||
+		      rbuf[0x0c] != dev->last_hint_interval ||
+		      rbuf[0x0d] != dev->last_hint_flags))) {
+
+			dev->pending_pixelLineH = new_pixelLineH;
+			dev->pending_pixelLineV = new_pixelLineV;
+			dev->pending_hint_interval = rbuf[0x0c];
+			dev->pending_hint_flags = rbuf[0x0d];
+			dev->timing_stable_count = 1;
+
+			if (sc0710_debug_mode)
+				printk(KERN_INFO "%s: HDMI %s, debouncing...\n",
+					dev->name,
+					was_locked ? "timing change" : "signal lock");
+
+			mutex_unlock(&dev->signalMutex);
+			return 0;
+		}
+
+		/* No change — keep hint tracking current */
 		dev->last_hint_interval = rbuf[0x0c];
 		dev->last_hint_flags = rbuf[0x0d];
-
-		dev->width = rbuf[0x0b] << 8 | rbuf[0x0a];
-		dev->height = rbuf[0x09] << 8 | rbuf[0x08];
-		dev->pixelLineV = new_pixelLineV;
-		dev->pixelLineH = new_pixelLineH;
-
-		dev->interlaced = rbuf[0x0d] & 0x01;
-		if (dev->interlaced)
-			dev->height *= 2;
-
-
-
-
-		if (timing_changed || !was_locked) {
-			u32 fps_target = 0;
-			u8 hint_interval = rbuf[0x0c];
-			u8 hint_flags = rbuf[0x0d];
-
-			/* DEBUG: Print raw I2C response on change */
-			if (sc0710_debug_mode) {
-				printk(KERN_INFO "%s: HDMI raw: ", dev->name);
-				for (i = 0; i < 0x14; i++)
-					printk(KERN_CONT "%02x ", rbuf[i]);
-				printk(KERN_CONT "\n");
-			}
-
-			/* Differentiate FPS based on I2C hints:
-			 * Byte 12 (0x0C) appears to be frame interval (approx 3600/FPS).
-			 * Byte 13 (0x0D) also varies for 120Hz.
-			 */
-			if (hint_interval == 0x78) { /* ~120 -> 30Hz or 120Hz */
-				if (hint_flags == 0x10)
-					fps_target = 120; /* 1080p120 */
-				else
-					fps_target = 30;  /* 1080p30 (flags=0x50) */
-			} else if (hint_interval == 0x3C) { /* ~60 -> 60Hz */
-				fps_target = 60;
-			}
-
-			/* Use rate hint to differentiate modes (e.g. 1080p30 vs 1080p120) */
-			dev->fmt = sc0710_format_find_by_timing_and_rate(dev->pixelLineH, dev->pixelLineV, fps_target);
-		}
-		
-		/* Debug: show timing when format not found */
-		if (!dev->fmt) {
-			printk(KERN_INFO "%s: Unknown timing %dx%d (add to formats table)\n",
-				dev->name, dev->pixelLineH, dev->pixelLineV);
-		}
-		
-		/* Log format detection on timing change or signal restore */
-		if (timing_changed || !was_locked) {
-			if (dev->fmt) {
-				printk(KERN_INFO "%s: Detected timing %dx%d -> format: %s\n",
-					dev->name, dev->pixelLineH, dev->pixelLineV, dev->fmt->name);
-			}
-		}
-		
-		/* Save last known format for placeholder rendering */
 		if (dev->fmt)
 			dev->last_fmt = dev->fmt;
-		
-		/* Detect signal restoration (unlocked -> locked transition) OR timing change */
-		if ((!was_locked && dev->locked) || timing_changed) {
-			printk(KERN_INFO "%s: HDMI signal %s, waiting for stabilization...\n",
-				dev->name, timing_changed ? "timing changed" : "restored");
-			mutex_unlock(&dev->signalMutex);
-			
-			/* Wait for HDMI signal to stabilize.
-			 * A 300ms delay gives the source time to fully establish the link.
-			 * Shorter delays can result in processing during signal transition,
-			 * leading to format/buffer mismatches and potential kernel panics.
-			 */
-			msleep(300);
-			
-			printk(KERN_INFO "%s: Resynchronizing DMA frames\n", dev->name);
-			sc0710_reset_dma_frame_sync(dev);
-			return 0; /* Success */
-		}
+
 	} else {
+		/* Clear any pending debounce — signal is gone */
+		dev->timing_stable_count = 0;
+
 		/* No signal detected - check if cable is connected.
 		 * When a cable is connected (but no valid video signal),
 		 * bytes 4-7 contain timing data from EDID negotiation.
@@ -599,11 +608,11 @@ int sc0710_i2c_read_hdmi_status(struct sc0710_dev *dev)
 			/* No timing data - increment counter */
 			dev->unlocked_no_timing_count++;
 			
-			/* Require 3 consecutive polls with no timing to confirm cable removal.
+			/* Require consecutive polls with no timing to confirm cable removal.
 			 * This prevents false "No Device" during unsupported timing lock cycling.
-			 * With ~200ms polling interval, this is about 600ms confirmation time.
+			 * With ~200ms polling interval and threshold=6, this is ~1.2s confirmation.
 			 */
-			if (dev->unlocked_no_timing_count >= 3) {
+			if (dev->unlocked_no_timing_count >= SC0710_NO_TIMING_THRESHOLD) {
 				dev->cable_connected = 0;
 
 				dev->fmt = NULL;
@@ -621,8 +630,9 @@ int sc0710_i2c_read_hdmi_status(struct sc0710_dev *dev)
 				/* Still in grace period - assume cable connected */
 				dev->cable_connected = 1;
 				if (sc0710_debug_mode) {
-					printk(KERN_INFO "%s: No timing data, count=%d/3, assuming cable still connected\n",
-						dev->name, dev->unlocked_no_timing_count);
+					printk(KERN_INFO "%s: No timing data, count=%d/%d, assuming cable still connected\n",
+					       dev->name, dev->unlocked_no_timing_count,
+					       SC0710_NO_TIMING_THRESHOLD);
 				}
 			}
 		}
@@ -637,6 +647,146 @@ int sc0710_i2c_read_hdmi_status(struct sc0710_dev *dev)
 
 	mutex_unlock(&dev->signalMutex);
 	return 0; /* Success */
+
+confirmed_timing_change:
+	/* ---- Debounce confirmed: commit timing and trigger reconfig ----
+	 * All operational fields are updated from the latest I2C response
+	 * (which matched the pending candidate for 2 consecutive polls).
+	 * dev->fmt is set BEFORE the DMA restart so that the resize step
+	 * allocates chains for the correct framesize.  The DMA service
+	 * thread is blocked by kthread_dma_lock inside reset, so it
+	 * cannot observe the new fmt with stale DMA chains.
+	 */
+	{
+		u32 fps_target = 0;
+		u8 hint_interval = rbuf[0x0c];
+		u8 hint_flags = rbuf[0x0d];
+		u32 prev_pixelLineH = dev->pixelLineH;
+		u32 prev_pixelLineV = dev->pixelLineV;
+		u32 prev_width = dev->width;
+		u32 prev_height = dev->height;
+		u32 prev_interlaced = dev->interlaced;
+
+		dev->last_hint_interval = hint_interval;
+		dev->last_hint_flags = hint_flags;
+		dev->pixelLineV = new_pixelLineV;
+		dev->pixelLineH = new_pixelLineH;
+		dev->width = rbuf[0x0b] << 8 | rbuf[0x0a];
+		dev->height = rbuf[0x09] << 8 | rbuf[0x08];
+		dev->interlaced = rbuf[0x0d] & 0x01;
+		if (dev->interlaced)
+			dev->height *= 2;
+
+		if (was_locked &&
+		    prev_pixelLineH == new_pixelLineH &&
+		    prev_pixelLineV == new_pixelLineV &&
+		    prev_width == dev->width &&
+		    prev_height == dev->height &&
+		    prev_interlaced == dev->interlaced)
+			refresh_only_change = 1;
+
+		if (sc0710_debug_mode) {
+			printk(KERN_INFO "%s: HDMI raw: ", dev->name);
+			for (i = 0; i < 0x14; i++)
+				printk(KERN_CONT "%02x ", rbuf[i]);
+			printk(KERN_CONT "\n");
+		}
+
+		if (hint_interval > 0 && hint_interval < 0xFF) {
+			fps_target = 3600 / hint_interval;
+			if (hint_interval == 0x78 && (hint_flags & 0x10))
+				fps_target = 120;
+		}
+
+		/* Timing selection strategy:
+		 * 0 = merge (static table first, dynamic fallback)
+		 * 1 = procedural only (skip static table)
+		 * 2 = static only (no dynamic fallback)
+		 */
+		if (procedural_timings != TIMING_MODE_PROCEDURAL_ONLY) {
+			dev->fmt = sc0710_format_find_by_timing_and_rate(
+					dev->pixelLineH, dev->pixelLineV, fps_target);
+		} else {
+			dev->fmt = NULL;
+		}
+
+		if (!dev->fmt &&
+		    procedural_timings != TIMING_MODE_STATIC_ONLY &&
+		    dev->width >= 320 && dev->height >= 200) {
+			struct sc0710_format *dyn = &dev->dynamic_fmt;
+			u32 fps_est = fps_target ? fps_target : 60;
+
+			dyn->timingH    = dev->pixelLineH;
+			dyn->timingV    = dev->pixelLineV;
+			dyn->width      = dev->width;
+			dyn->height     = dev->height;
+			dyn->interlaced = dev->interlaced;
+			dyn->fpsX100    = fps_est * 100;
+			dyn->fpsnum     = fps_est * 1000;
+			dyn->fpsden     = 1000;
+			dyn->depth      = 8;
+			dyn->framesize  = dev->width * 2 * dev->height;
+			snprintf(dev->dynamic_fmt_name,
+				 sizeof(dev->dynamic_fmt_name),
+				 "%ux%u%s%u(dynamic)",
+				 dev->width, dev->height,
+				 dev->interlaced ? "i" : "p",
+				 fps_est);
+			dyn->name = dev->dynamic_fmt_name;
+
+			memset(&dyn->dv_timings, 0, sizeof(dyn->dv_timings));
+			dyn->dv_timings.type = V4L2_DV_BT_656_1120;
+			dyn->dv_timings.bt.width  = dev->width;
+			dyn->dv_timings.bt.height = dev->height;
+			dyn->dv_timings.bt.interlaced =
+				dev->interlaced ? V4L2_DV_INTERLACED
+						: V4L2_DV_PROGRESSIVE;
+
+			dev->fmt = dyn;
+			printk(KERN_INFO "%s: Dynamic format: %s (timing %dx%d)\n",
+			       dev->name, dyn->name,
+			       dyn->timingH, dyn->timingV);
+		}
+
+		if (!dev->fmt) {
+			printk(KERN_INFO "%s: Unknown timing %dx%d (add to formats table)\n",
+				dev->name, dev->pixelLineH, dev->pixelLineV);
+		} else {
+			printk(KERN_INFO "%s: Detected timing %dx%d -> format: %s\n",
+				dev->name, dev->pixelLineH, dev->pixelLineV,
+				dev->fmt->name);
+			dev->last_fmt = dev->fmt;
+		}
+	}
+
+	mutex_unlock(&dev->signalMutex);
+
+	for (i = 0; i < SC0710_MAX_CHANNELS; i++) {
+		struct sc0710_dma_channel *vch = &dev->channel[i];
+		if (!vch->enabled || vch->mediatype != CHTYPE_VIDEO)
+			continue;
+		vch->tear_resync_retries_left = dma_resync_max_tear_retries;
+	}
+
+	printk(KERN_INFO "%s: Resynchronizing DMA frames\n", dev->name);
+	sc0710_reset_dma_frame_sync(dev);
+
+	/* Refresh-rate-only switches are more likely to leave DMA mis-phased.
+	 * Run extra resync passes with a short delay to get independent lock attempts.
+	 */
+	if (refresh_only_change && refresh_rate_resync_passes > 1) {
+		for (pass = 1; pass < refresh_rate_resync_passes; pass++) {
+			msleep(refresh_rate_resync_delay_ms);
+			printk(KERN_INFO "%s: Refresh-rate change follow-up resync pass %d/%u\n",
+			       dev->name, pass + 1, refresh_rate_resync_passes);
+			sc0710_reset_dma_frame_sync(dev);
+		}
+	}
+
+	if (!auto_scaler && dev->scaler_mode == SCALER_MODE_DISABLED)
+		sc0710_video_notify_source_change(dev);
+
+	return 0;
 }
 
 int sc0710_i2c_read_status2(struct sc0710_dev *dev)

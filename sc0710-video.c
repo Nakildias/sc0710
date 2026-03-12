@@ -296,7 +296,7 @@ static void generate_status_frames_if_needed(void)
 }
 
 /* Compute the effective output dimensions, accounting for the software scaler.
- * When the scaler is active on a MK.2 board, the output resolution differs
+ * When the scaler is active, the output resolution differs
  * from the source resolution.  When disabled, output = source.
  */
 static void sc0710_get_effective_size(struct sc0710_dev *dev,
@@ -305,7 +305,7 @@ static void sc0710_get_effective_size(struct sc0710_dev *dev,
 	u32 w = fmt->width;
 	u32 h = fmt->height;
 
-	if (dev->board == SC0710_BOARD_ELGATEO_4KP60_MK2 &&
+	if (sc0710_software_scaler_allowed(dev) &&
 	    dev->scaler_mode != SCALER_MODE_DISABLED) {
 		sc0710_scaler_get_output_size(dev, w, h, &w, &h);
 	}
@@ -925,9 +925,22 @@ static int vidioc_s_parm(struct file *file, void *priv, struct v4l2_streamparm *
 	return vidioc_g_parm(file, priv, parm);
 }
 
+static int vidioc_subscribe_event(struct v4l2_fh *fh,
+				  const struct v4l2_event_subscription *sub)
+{
+	switch (sub->type) {
+	case V4L2_EVENT_SOURCE_CHANGE:
+		return v4l2_src_change_event_subscribe(fh, sub);
+	default:
+		return v4l2_ctrl_subscribe_event(fh, sub);
+	}
+}
+
 /* ----------------------------------------------------------- */
 /* VB2 buffer operations                                       */
 /* ----------------------------------------------------------- */
+
+#define SC0710_MAX_FRAME_SIZE (3840u * 2u * 2160u)
 
 static int sc0710_queue_setup(struct vb2_queue *q,
 	unsigned int *num_buffers, unsigned int *num_planes,
@@ -938,19 +951,33 @@ static int sc0710_queue_setup(struct vb2_queue *q,
 	struct sc0710_dev *dev = ch->dev;
 	const struct sc0710_format *fmt;
 	u32 eff_w, eff_h, eff_fs;
+	int dynamic_res_active;
 
 	/* Use real format if available, otherwise use lastfmt, then default */
 	fmt = dev->fmt ? dev->fmt : (dev->last_fmt ? dev->last_fmt : sc0710_get_default_format());
 
 	sc0710_get_effective_size(dev, fmt, &eff_w, &eff_h, &eff_fs);
 
+	dynamic_res_active = (!auto_scaler &&
+			      dev->scaler_mode == SCALER_MODE_DISABLED);
+
 	if (*num_buffers < 2)
 		*num_buffers = 2;
 
 	*num_planes = 1;
-	sizes[0] = eff_fs;
 
-	dprintk(2, "%s() buffer count=%d, size=%d\n", __func__, *num_buffers, sizes[0]);
+	if (dynamic_res_active) {
+		/* Allocate at max resolution so any mid-stream resolution
+		 * change fits without killing the stream or truncating.
+		 */
+		sizes[0] = SC0710_MAX_FRAME_SIZE;
+		dprintk(2, "%s() dynamic res: buffer count=%d, size=%d (max 4K)\n",
+			__func__, *num_buffers, sizes[0]);
+	} else {
+		sizes[0] = eff_fs;
+		dprintk(2, "%s() buffer count=%d, size=%d\n",
+			__func__, *num_buffers, sizes[0]);
+	}
 
 	return 0;
 }
@@ -960,6 +987,8 @@ static int sc0710_buf_prepare(struct vb2_buffer *vb)
 	struct sc0710_client *client = vb2_get_drv_priv(vb->vb2_queue);
 	struct sc0710_dma_channel *ch = client->fh->ch;
 	struct sc0710_dev *dev = ch->dev;
+	struct vb2_v4l2_buffer *vbuf = to_vb2_v4l2_buffer(vb);
+	struct sc0710_buffer *buf = container_of(vbuf, struct sc0710_buffer, vb);
 	const struct sc0710_format *fmt;
 	u32 eff_w, eff_h, eff_fs;
 
@@ -968,6 +997,17 @@ static int sc0710_buf_prepare(struct vb2_buffer *vb)
 
 	sc0710_get_effective_size(dev, fmt, &eff_w, &eff_h, &eff_fs);
 
+	/* When auto_scaler is active the dequeue path scales every frame
+	 * to match the client's stream resolution.  Buffers only need to
+	 * hold that scaled output, not the raw source frame.
+	 */
+	if (auto_scaler && client->stream_framesize &&
+	    client->stream_framesize < eff_fs) {
+		eff_w = client->stream_width;
+		eff_h = client->stream_height;
+		eff_fs = client->stream_framesize;
+	}
+
 	if (vb2_plane_size(vb, 0) < eff_fs) {
 		dprintk(0, "%s() buffer too small (%lu < %u)\n",
 			__func__, vb2_plane_size(vb, 0), eff_fs);
@@ -975,6 +1015,8 @@ static int sc0710_buf_prepare(struct vb2_buffer *vb)
 	}
 
 	vb2_set_plane_payload(vb, 0, eff_fs);
+	buf->expected_framesize = eff_fs;
+	buf->fmt = fmt;
 
 	return 0;
 }
@@ -1005,6 +1047,24 @@ static int sc0710_start_streaming(struct vb2_queue *q, unsigned int count)
 	/* Ensure status images are generated (safe process context here) */
 	if (use_status_images)
 		generate_status_frames_if_needed();
+
+	/* Record the resolution this client expects for its entire stream
+	 * lifetime.  Dynamic resolution mode uses this to scale frames
+	 * back to the client's expected size when the source changes.
+	 */
+	{
+		const struct sc0710_format *sfmt;
+		u32 sw, sh, sfs;
+
+		sfmt = dev->fmt ? dev->fmt :
+			(dev->last_fmt ? dev->last_fmt : sc0710_get_default_format());
+		sc0710_get_effective_size(dev, sfmt, &sw, &sh, &sfs);
+		client->stream_width = sw;
+		client->stream_height = sh;
+		client->stream_framesize = sfs;
+		dprintk(1, "%s() client locked to %ux%u (%u bytes)\n",
+			__func__, sw, sh, sfs);
+	}
 
 	/* Mark this client as streaming */
 	client->streaming = true;
@@ -1224,9 +1284,19 @@ static ssize_t sc0710_fop_read(struct file *file, char __user *buf,
 static __poll_t sc0710_fop_poll(struct file *file, poll_table *wait)
 {
 	struct sc0710_fh *fh = file->private_data;
+	__poll_t rc;
+
 	if (!fh || !fh->client)
 		return EPOLLERR;
-	return vb2_poll(&fh->client->vb2_queue, file, wait);
+
+	rc = vb2_poll(&fh->client->vb2_queue, file, wait);
+
+	/* Also wake callers waiting for V4L2 events (SOURCE_CHANGE) */
+	poll_wait(file, &fh->fh.wait, wait);
+	if (v4l2_event_pending(&fh->fh))
+		rc |= EPOLLPRI;
+
+	return rc;
 }
 
 static int sc0710_fop_mmap(struct file *file, struct vm_area_struct *vma)
@@ -1332,6 +1402,9 @@ static const struct v4l2_ioctl_ops video_ioctl_ops =
 	.vidioc_dqbuf            = sc0710_vidioc_dqbuf,
 	.vidioc_streamon         = sc0710_vidioc_streamon,
 	.vidioc_streamoff        = sc0710_vidioc_streamoff,
+
+	.vidioc_subscribe_event   = vidioc_subscribe_event,
+	.vidioc_unsubscribe_event = v4l2_event_unsubscribe,
 };
 
 static struct video_device sc0710_video_template =
@@ -1413,18 +1486,30 @@ static void sc0710_vid_timeout(struct timer_list *t)
 			}
 
 			if (dst) {
-				/* Choose image based on cable status:
-				 * - cable_connected: Show "No Signal" (device connected but no video)
-				 * - !cable_connected: Show "No Device" (nothing plugged in)
+				unsigned long buf_sz = vb2_plane_size(&buf->vb.vb2_buf, 0);
+				u32 fill_w = eff_w, fill_h = eff_h, fill_fs = eff_fs;
+
+				/* Clamp to buffer capacity to prevent overflow when
+				 * the detected format is larger than what the client
+				 * allocated (e.g. 4K placeholder into 1080p buffer).
 				 */
-				int fillmode = dev->cable_connected ? FILL_MODE_NOSIGNAL : FILL_MODE_NODEVICE;
-				if (sc0710_debug_mode) {
-					printk_ratelimited(KERN_INFO "%s: fill_frame: cable_connected=%d => fillmode=%s\n",
-						dev->name, dev->cable_connected,
-						fillmode == FILL_MODE_NOSIGNAL ? "NOSIGNAL" : "NODEVICE");
+				if (fill_fs > buf_sz && fill_w && fill_h) {
+					sc0710_guess_dims_from_framesize((u32)buf_sz,
+								&fill_w, &fill_h);
+					fill_fs = fill_w * 2 * fill_h;
 				}
-				fill_frame(ch, dst, eff_w, eff_h, fillmode);
-				vb2_set_plane_payload(&buf->vb.vb2_buf, 0, eff_fs);
+				if (fill_fs > buf_sz) {
+					fill_w = 1920;
+					fill_h = 1080;
+					fill_fs = 1920 * 2 * 1080;
+				}
+
+				{
+					int fillmode = dev->cable_connected ?
+						FILL_MODE_NOSIGNAL : FILL_MODE_NODEVICE;
+					fill_frame(ch, dst, fill_w, fill_h, fillmode);
+					vb2_set_plane_payload(&buf->vb.vb2_buf, 0, fill_fs);
+				}
 			}
 
 			buf->vb.vb2_buf.timestamp = ktime_get_ns();
@@ -1441,6 +1526,29 @@ static void sc0710_vid_timeout(struct timer_list *t)
 	/* Re-set the buffer timeout if any clients are still streaming */
 	if (any_streaming)
 		mod_timer(&ch->timeout, jiffies + VBUF_TIMEOUT);
+}
+
+void sc0710_video_notify_source_change(struct sc0710_dev *dev)
+{
+	struct sc0710_dma_channel *ch;
+	struct v4l2_event ev = {};
+	int ch_idx;
+
+	ev.type = V4L2_EVENT_SOURCE_CHANGE;
+	ev.u.src_change.changes = V4L2_EVENT_SRC_CH_RESOLUTION;
+
+	for (ch_idx = 0; ch_idx < SC0710_MAX_CHANNELS; ch_idx++) {
+		ch = &dev->channel[ch_idx];
+		if (!ch->enabled || ch->mediatype != CHTYPE_VIDEO)
+			continue;
+		if (!video_is_registered(&ch->vdev))
+			continue;
+
+		v4l2_event_queue(&ch->vdev, &ev);
+	}
+
+	printk(KERN_INFO "%s: SOURCE_CHANGE event queued — stream kept alive\n",
+		dev->name);
 }
 
 void sc0710_video_unregister(struct sc0710_dma_channel *ch)

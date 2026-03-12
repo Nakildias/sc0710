@@ -65,6 +65,45 @@ unsigned int scaler_mode = 0;
 module_param(scaler_mode, int, 0644);
 MODULE_PARM_DESC(scaler_mode, "MK.2 software scaler: 0=disabled, 1=upscale 4K, 2=downscale 1080P");
 
+unsigned int auto_scaler = 1;
+module_param(auto_scaler, int, 0644);
+MODULE_PARM_DESC(auto_scaler, "Automatic safety scaler on mismatch: 0=off, 1=on");
+
+unsigned int force_software_scaling = 0;
+module_param(force_software_scaling, int, 0644);
+MODULE_PARM_DESC(force_software_scaling,
+	"Allow MK.2 software scaler path on all supported cards (testing)");
+
+unsigned int procedural_timings = TIMING_MODE_MERGE;
+module_param(procedural_timings, int, 0644);
+MODULE_PARM_DESC(procedural_timings,
+	"Timing selection mode: 0=merge(static+procedural), 1=procedural-only, 2=static-only");
+
+unsigned int dma_resync_validate_frames = 8;
+module_param(dma_resync_validate_frames, int, 0644);
+MODULE_PARM_DESC(dma_resync_validate_frames,
+	"Frames to validate after resync before disabling tear detection");
+
+unsigned int dma_resync_tear_streak_required = 2;
+module_param(dma_resync_tear_streak_required, int, 0644);
+MODULE_PARM_DESC(dma_resync_tear_streak_required,
+	"Consecutive tear detections required before scheduling a re-resync");
+
+unsigned int dma_resync_max_tear_retries = 5;
+module_param(dma_resync_max_tear_retries, int, 0644);
+MODULE_PARM_DESC(dma_resync_max_tear_retries,
+	"Maximum tear-triggered DMA resync retries per timing change");
+
+unsigned int refresh_rate_resync_passes = 2;
+module_param(refresh_rate_resync_passes, int, 0644);
+MODULE_PARM_DESC(refresh_rate_resync_passes,
+	"Total DMA resync passes on refresh-rate-only switches (>=1)");
+
+unsigned int refresh_rate_resync_delay_ms = 12;
+module_param(refresh_rate_resync_delay_ms, int, 0644);
+MODULE_PARM_DESC(refresh_rate_resync_delay_ms,
+	"Delay between refresh-rate resync passes in milliseconds");
+
 static unsigned int card[]  = {[0 ... (SC0710_MAXBOARDS - 1)] = UNSET };
 module_param_array(card,  int, NULL, 0444);
 MODULE_PARM_DESC(card, "card type");
@@ -77,6 +116,8 @@ MODULE_PARM_DESC(card, "card type");
 static unsigned int sc0710_devcount;
 static DEFINE_MUTEX(devlist);
 LIST_HEAD(sc0710_devlist);
+
+#define SC0710_DMA_WATCHDOG_TIMEOUT_MS 3000
 
 static void sc_andor(struct sc0710_dev *dev, int bar, u32 reg, u32 mask, u32 value)
 {
@@ -191,8 +232,8 @@ static int sc0710_dev_setup(struct sc0710_dev *dev)
 	       dev->board, card[dev->nr] == dev->board ?
 	       "insmod option" : "autodetected");
 
-	/* Initialize software scaler mode for MK.2 boards */
-	if (dev->board == SC0710_BOARD_ELGATEO_4KP60_MK2 && scaler_mode <= 2)
+	/* Initialize software scaler mode for eligible boards */
+	if (sc0710_software_scaler_allowed(dev) && scaler_mode <= 2)
 		dev->scaler_mode = (enum sc0710_scaler_mode)scaler_mode;
 	else
 		dev->scaler_mode = SCALER_MODE_DISABLED;
@@ -280,8 +321,8 @@ static int sc0710_proc_state_show(struct seq_file *m, void *v)
 		seq_printf(m, "     procamp: saturation  %d\n", dev->saturation);
 		seq_printf(m, "     procamp: hue         %d\n", dev->hue);
 
-		/* Software scaler state (MK.2 only) */
-		if (dev->board == SC0710_BOARD_ELGATEO_4KP60_MK2) {
+		/* Software scaler state */
+		if (sc0710_software_scaler_allowed(dev)) {
 			seq_printf(m, "      scaler: %s\n",
 				sc0710_scaler_mode_name(dev->scaler_mode));
 			if (dev->scaler_mode != SCALER_MODE_DISABLED && dev->fmt) {
@@ -294,6 +335,26 @@ static int sc0710_proc_state_show(struct seq_file *m, void *v)
 					out_w, out_h);
 			}
 			seq_printf(m, " auto scaler: %s\n", dev->auto_scaler_active ? "ON (Prevented Kernel Panic)" : "OFF");
+			seq_printf(m, " auto scaler cfg: %s\n", auto_scaler ? "ENABLED" : "DISABLED");
+			seq_printf(m, " force sw scaler: %s\n", force_software_scaling ? "ENABLED" : "DISABLED");
+			switch (procedural_timings) {
+			case TIMING_MODE_PROCEDURAL_ONLY:
+				seq_printf(m, " timing calc: PROCEDURAL_ONLY\n");
+				break;
+			case TIMING_MODE_STATIC_ONLY:
+				seq_printf(m, " timing calc: STATIC_ONLY\n");
+				break;
+			case TIMING_MODE_MERGE:
+			default:
+				seq_printf(m, " timing calc: MERGE\n");
+				break;
+			}
+			{
+				int dyn_active = (!auto_scaler &&
+						  dev->scaler_mode == SCALER_MODE_DISABLED);
+				seq_printf(m, " dynamic res: %s\n",
+					dyn_active ? "ACTIVE" : "INACTIVE");
+			}
 		}
 
 		for (i = 0; i < SC0710_MAX_CHANNELS; i++) {
@@ -405,11 +466,43 @@ static int sc0710_proc_create(void)
 }
 #endif
 
+static bool sc0710_dma_watchdog_check_locked(struct sc0710_dev *dev)
+{
+	unsigned long timeout_jiffies = msecs_to_jiffies(SC0710_DMA_WATCHDOG_TIMEOUT_MS);
+	int i;
+
+	for (i = 0; i < SC0710_MAX_CHANNELS; i++) {
+		struct sc0710_dma_channel *ch = &dev->channel[i];
+
+		if (!ch->enabled || ch->mediatype != CHTYPE_VIDEO)
+			continue;
+		if (ch->state != STATE_RUNNING)
+			continue;
+		if (atomic_read(&ch->streaming_refcount) <= 0)
+			continue;
+
+		if (!ch->dma_last_completion_jiffies) {
+			ch->dma_last_completion_jiffies = jiffies;
+			continue;
+		}
+
+		if (time_after(jiffies, ch->dma_last_completion_jiffies + timeout_jiffies)) {
+			printk(KERN_WARNING "%s: DMA watchdog detected stalled video channel %d, scheduling resync\n",
+			       dev->name, ch->nr);
+			ch->dma_last_completion_jiffies = jiffies;
+			return true;
+		}
+	}
+
+	return false;
+}
+
 static int sc0710_thread_dma_function(void *data)
 {
 	struct sc0710_dev *dev = data;
-	int ret;
-	u32 lastDMAStatus = 0;
+	int need_dma_resync;
+	int tear_requested_resync;
+	int i;
 
 	dprintk(1, "%s() Started\n", __func__);
 
@@ -428,20 +521,33 @@ static int sc0710_thread_dma_function(void *data)
 		if (thread_dma_active == 0)
 			continue;
 
-
-		lastDMAStatus = dma_status;
-
-		/* Other parts of the driver need to guarantee that
-		 * various 'keep alives' aren't happening. We'll
-		 * prevent race conditions by allowing the
-		 * rest of the driver to dictate when
-		 * this keepalives can occur.
-		 */
+		need_dma_resync = 0;
+		tear_requested_resync = 0;
 		mutex_lock(&dev->kthread_dma_lock);
-
+		if (!dev->reconfig_in_progress) {
+			sc0710_dma_channels_service(dev);
+			need_dma_resync = sc0710_dma_watchdog_check_locked(dev);
+			if (!need_dma_resync && dev->tear_resync_pending) {
+				dev->tear_resync_pending = 0;
+				need_dma_resync = 1;
+				tear_requested_resync = 1;
+				printk(KERN_WARNING "%s: Scheduling DMA re-resync after tear detection\n",
+				       dev->name);
+			}
+		}
 		mutex_unlock(&dev->kthread_dma_lock);
 
-		ret = sc0710_dma_channels_service(dev);
+		if (need_dma_resync) {
+			if (!tear_requested_resync) {
+				for (i = 0; i < SC0710_MAX_CHANNELS; i++) {
+					struct sc0710_dma_channel *ch = &dev->channel[i];
+					if (!ch->enabled || ch->mediatype != CHTYPE_VIDEO)
+						continue;
+					ch->tear_resync_retries_left = dma_resync_max_tear_retries;
+				}
+			}
+			sc0710_reset_dma_frame_sync(dev);
+		}
 	}
 
 	thread_dma_active = 0;
@@ -489,7 +595,7 @@ static int sc0710_thread_hdmi_function(void *data)
 		 *   echo N > /sys/module/sc0710/parameters/scaler_mode
 		 * where N = 0 (disabled), 1 (upscale to 4K), 2 (downscale to 1080P).
 		 */
-		if (dev->board == SC0710_BOARD_ELGATEO_4KP60_MK2 && scaler_mode <= 2) {
+		if (sc0710_software_scaler_allowed(dev) && scaler_mode <= 2) {
 			enum sc0710_scaler_mode new_mode = (enum sc0710_scaler_mode)scaler_mode;
 			if (dev->scaler_mode != new_mode) {
 				printk(KERN_INFO "%s: Software scaler mode changed: %s -> %s\n",

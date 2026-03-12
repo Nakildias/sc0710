@@ -71,6 +71,9 @@ The `sc0710-cli` tool (installed via the automatic script) provides real-time co
 | `sc0710-cli --debug` | Toggle verbose dmesg logging. |
 | `sc0710-cli --image-toggle` | Toggle between No Signal images and Colorbars. |
 | `sc0710-cli --software-scaler` | Toggle software scaler modes (MK.2 only). |
+| `sc0710-cli --toggle-auto-scalar` | Toggle automatic safety scaler on/off. |
+| `sc0710-cli --procedural-timings` | Toggle timing mode (`merge`, `procedural-only`, `static-only`). |
+| `sc0710-cli --force-software-scaling` | Force software scaler eligibility on all cards (testing). |
 | `sc0710-cli --update` | Pull latest code and rebuild. |
 | `sc0710-cli --remove` | Completely uninstall driver and CLI. |
 | `sc0710-cli --version` | Show installed driver version. |
@@ -83,7 +86,9 @@ The `sc0710-cli` tool (installed via the automatic script) provides real-time co
 *   **Status Images:** Storage-efficient implementation of "No Signal" / "No Device" screens.
 *   **Connection Sensing:** Distinguishes between unplugged cables and signal loss (not 100% reliable).
 *   **Video Formats:** Supports 4K60, 1440p144, 1080p240 (requires Windows to change the EDID).
-*   **Hotplug Stability:** Implemented. (Close software that uses card when changing resolution otherwise this can cause a Kernel Panic).
+*   **Mode-Switch Stability:** Atomic DMA resync, restart validation, and watchdog recovery significantly improve resolution/refresh switching while apps are open.
+*   **Safety Scaling Paths:** Auto-scaler and dynamic-resolution compatibility keep streams alive during geometry mismatches and reduce crash-prone transitions.
+*   **Timing Controls:** Runtime timing calculation modes (`merge`, `procedural-only`, `static-only`) via CLI.
 
 ## Known Limitations / Roadmap
 *   **HDR Tonemapping (On Hold):** Requires opaque I2C commands to onboard ARM MCU.

@@ -75,6 +75,14 @@
 
 /* Global debug mode - extern declaration for use in all source files */
 extern unsigned int sc0710_debug_mode;
+extern unsigned int auto_scaler;
+extern unsigned int procedural_timings;
+extern unsigned int force_software_scaling;
+extern unsigned int dma_resync_validate_frames;
+extern unsigned int dma_resync_tear_streak_required;
+extern unsigned int dma_resync_max_tear_retries;
+extern unsigned int refresh_rate_resync_passes;
+extern unsigned int refresh_rate_resync_delay_ms;
 
 #define SC0710_MAX_CHANNELS 2
 
@@ -105,6 +113,12 @@ enum sc0710_scaler_mode {
 	SCALER_MODE_DISABLED = 0,
 	SCALER_MODE_UPSCALE  = 1,  /* Scale everything to 3840x2160 */
 	SCALER_MODE_DOWNSCALE = 2, /* Scale everything to 1920x1080 */
+};
+
+enum sc0710_timing_mode {
+	TIMING_MODE_MERGE = 0,           /* Use static match + dynamic fallback */
+	TIMING_MODE_PROCEDURAL_ONLY = 1, /* Dynamic/procedural fallback only */
+	TIMING_MODE_STATIC_ONLY = 2,     /* Static timing table only */
 };
 
 struct sc0710_board {
@@ -140,6 +154,7 @@ struct sc0710_buffer
 
 	/* sc0710 specific */
 	const struct sc0710_format *fmt;
+	u32 expected_framesize;
 };
 
 struct sc0710_dmaqueue {
@@ -214,6 +229,14 @@ struct sc0710_client {
 	spinlock_t               buffer_lock;    /* Protects buffer_list */
 	bool                     streaming;      /* Is this client streaming? */
 
+	/* Resolution the client negotiated at STREAMON time.
+	 * Used by dynamic resolution mode to scale frames that arrive
+	 * at a different resolution back to what the client expects.
+	 */
+	u32                      stream_width;
+	u32                      stream_height;
+	u32                      stream_framesize;
+
 	/* Per-client VB2 queue for multi-app support */
 	struct vb2_queue         vb2_queue;
 	struct mutex             vb2_lock;       /* Lock for this client's queue */
@@ -265,6 +288,7 @@ struct sc0710_dma_channel
 	/* DMA related items we need to track. */
 	u32                          sg_total_descriptors;
 	u32                          dma_completed_descriptor_count_last;
+	unsigned long                dma_last_completion_jiffies;
 
 	/* Statistics */
 	struct sc0710_things_per_second bitsPerSecond;
@@ -283,6 +307,11 @@ struct sc0710_dma_channel
 	struct timer_list            timeout;
 	u32                          videousers;
 	u32                          frame_sequence;
+	u32                          skip_next_frames;
+	u32                          tear_validation_frames_left;
+	u32                          tear_streak_count;
+	int                          tear_last_line;
+	u32                          tear_resync_retries_left;
 
 	/* Channel 1 */
 	struct sc0710_audio_dev     *audio_dev;
@@ -344,6 +373,7 @@ struct sc0710_audio_dev
 	struct snd_pcm_substream  *substream;
 	struct  snd_card          *card;
 	snd_pcm_uframes_t          buffer_ptr;
+	snd_pcm_uframes_t          period_pos;
 };
 
 struct sc0710_dev {
@@ -390,6 +420,8 @@ struct sc0710_dev {
 	u32                        interlaced;
 	const struct sc0710_format *fmt;
 	const struct sc0710_format *last_fmt;  /* Last active format for placeholders */
+	struct sc0710_format        dynamic_fmt;      /* Fallback for unlisted timings */
+	char                        dynamic_fmt_name[64];
 	enum sc0710_colorimetry_e  colorimetry;
 	enum sc0710_colorspace_e   colorspace;
 	enum sc0710_eotf_e         eotf;       /* Detected/forced EOTF for HDR */
@@ -414,6 +446,15 @@ struct sc0710_dev {
 	/* I2C Hint tracking for change detection */
 	u8 last_hint_interval;
 	u8 last_hint_flags;
+
+	/* Atomic reconfig state — prevents DMA service during mode transitions */
+	int reconfig_in_progress;
+	int tear_resync_pending;
+
+	/* Debounce: require consecutive stable polls before triggering reconfig */
+	u32 timing_stable_count;
+	u32 pending_pixelLineH, pending_pixelLineV;
+	u8 pending_hint_interval, pending_hint_flags;
 };
 
 struct sc0710_fh
@@ -455,6 +496,7 @@ int sc0710_i2c_read_status3(struct sc0710_dev *dev);
 int sc0710_i2c_read_procamp(struct sc0710_dev *dev);
 int sc0710_i2c_write_mcu(struct sc0710_dev *dev, u8 subaddr, u8 *data, int len);
 int sc0710_4kp_wait_pipeline(struct sc0710_dev *dev);
+void sc0710_reset_dma_frame_sync(struct sc0710_dev *dev);
 
 /* -formats.c */
 void sc0710_format_initialize(void);
@@ -487,6 +529,7 @@ int  sc0710_dma_channels_start(struct sc0710_dev *dev);
 int  sc0710_dma_channels_service(struct sc0710_dev *dev);
 void sc0710_dma_channels_stop(struct sc0710_dev *dev);
 int  sc0710_dma_channels_resize(struct sc0710_dev *dev);
+void sc0710_program_pipeline_regs(struct sc0710_dev *dev);
 
 /* things-per-second.c */
 void sc0710_things_per_second_reset(struct sc0710_things_per_second *tps);
@@ -496,6 +539,8 @@ s64  sc0710_things_per_second_query(struct sc0710_things_per_second *tps);
 /* video.c */
 void sc0710_video_unregister(struct sc0710_dma_channel *ch);
 int  sc0710_video_register(struct sc0710_dma_channel *ch);
+void sc0710_video_notify_source_change(struct sc0710_dev *dev);
+bool sc0710_guess_dims_from_framesize(u32 frame_bytes, u32 *w, u32 *h);
 const char *sc0710_colorimetry_ascii(enum sc0710_colorimetry_e val);
 const char *sc0710_colorspace_ascii(enum sc0710_colorspace_e val);
 
@@ -517,6 +562,7 @@ int  sc0710_audio_deliver_samples(struct sc0710_dev *dev, struct sc0710_dma_chan
         const u8 *buf, int bitdepth, int strideBytes, int channels, int samplesPerChannel);
 
 /* -scaler.c (software scaler for MK.2) */
+bool sc0710_software_scaler_allowed(const struct sc0710_dev *dev);
 void sc0710_scaler_get_output_size(struct sc0710_dev *dev,
 	u32 src_width, u32 src_height, u32 *out_width, u32 *out_height);
 int  sc0710_scaler_scale_frame(const u8 *src, u32 src_width, u32 src_height,

@@ -36,86 +36,60 @@ int sc0710_audio_deliver_samples(struct sc0710_dev *dev, struct sc0710_dma_chann
 	struct sc0710_audio_dev *chip;
 	struct snd_pcm_substream *substream;
 	struct snd_pcm_runtime *runtime;
-	u8 *ptr = (u8 *)buf;
-	u8 *dst;
+	const u8 *ptr = buf;
+	snd_pcm_uframes_t period_size;
 	int i;
-	
-	if (channels != 2)
-		return -1;
-	if (bitdepth != 16)
-		return -1;
-	if (samplesPerChannel <= 0)
+
+	if (channels != 2 || bitdepth != 16 || samplesPerChannel <= 0)
 		return -1;
 
 	chip = ch->audio_dev;
-	if (!chip) {
-		printk("%s() audio chip is NULL \n", __func__);
+	if (!chip)
 		return -1;
-	}
 
 	substream = chip->substream;
-	if (!substream) {
-		/* Audio stream is closed, stop delivering samples */
+	if (!substream)
 		return 0;
-	}
 
 	runtime = substream->runtime;
-	if (!runtime) {
-		printk("%s() audio capture runtime is NULL\n", __func__);
+	if (!runtime || !runtime->dma_area || !runtime->buffer_size)
 		return -1;
-	}
-	if (!runtime->dma_area) {
-		printk("%s() audio capture runtime->dma_area is NULL\n", __func__);
+
+	period_size = runtime->period_size;
+	if (!period_size)
 		return -1;
-	}
-	if (!runtime->buffer_size) {
-		printk("%s() audio capture runtime->buffer_size is zero\n", __func__);
-		return -1;
-	}
 
-
-
-	/* Hardware is going to give is a series of s16 words in the following format:
-	 *    L1  R1  L2  R2  L3  R3  L4  R4
-	 *   s16 s16 s16 s16 s16 s16 s16 s16 
-	 * Only Pair L1/R1 will be value, the remaining should be ignored.
-	 * Push only L1/R1 into the sound system.
+	/* Hardware delivers interleaved s16 pairs at the given stride.
+	 * Only the first L/R pair (4 bytes) per stride is valid.
+	 * Use 32-bit writes instead of 4 individual byte copies.
 	 */
-
-	dst = (u8 *)runtime->dma_area + (chip->buffer_ptr * 4);
-
 	for (i = 0; i < samplesPerChannel; i++) {
+		u32 *dst;
 
-		/* Make sure we can fit a left and right sample in. */
-		if (chip->buffer_ptr >= runtime->buffer_size) {
-			dst = (u8 *)runtime->dma_area;
+		if (chip->buffer_ptr >= runtime->buffer_size)
 			chip->buffer_ptr = 0;
-		}
 
-		/* TODO: Do this in dwords, its faster. */
-		*(dst++) = *(ptr + 0);
-		*(dst++) = *(ptr + 1);
-		*(dst++) = *(ptr + 2);
-		*(dst++) = *(ptr + 3);
-
-		sc0710_things_per_second_update(&ch->audioSamplesPerSecond, 2);
+		dst = (u32 *)(runtime->dma_area + chip->buffer_ptr * 4);
+		*dst = *(const u32 *)ptr;
 
 		ptr += strideBytes;
 		chip->buffer_ptr++;
-		
-		/* Wrap immediately if we hit the end */
-		if (chip->buffer_ptr >= runtime->buffer_size) {
-			chip->buffer_ptr = 0;
-			dst = (u8 *)runtime->dma_area;
-		}
 	}
 
-	//snd_pcm_stream_lock(substream);
-	//snd_pcm_stream_unlock(substream);
+	sc0710_things_per_second_update(&ch->audioSamplesPerSecond,
+					samplesPerChannel * 2);
 
-	snd_pcm_period_elapsed(substream);
+	/* Only notify ALSA when an actual period boundary has been crossed.
+	 * Calling snd_pcm_period_elapsed() on every DMA completion (even
+	 * partial periods) causes over-reporting and audio glitches.
+	 */
+	chip->period_pos += samplesPerChannel;
+	while (chip->period_pos >= period_size) {
+		chip->period_pos -= period_size;
+		snd_pcm_period_elapsed(substream);
+	}
 
-	return 0; /* Success */
+	return 0;
 }
 
 static struct snd_pcm_hardware snd_sc0710_hw_capture =
@@ -229,6 +203,7 @@ static int snd_sc0710_prepare(struct snd_pcm_substream *substream)
 	dprintk(1, "%s() requested rate = %d\n", __func__, substream->runtime->rate);
 
 	chip->buffer_ptr = 0;
+	chip->period_pos = 0;
 
 	if (substream->runtime->rate != 48000) {
 		dprintk(1, "%s() audio rate mismatch (%u vs %u)\n", __func__, substream->runtime->rate, 48000);

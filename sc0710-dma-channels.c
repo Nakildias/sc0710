@@ -74,58 +74,48 @@ void sc0710_dma_channels_stop(struct sc0710_dev *dev)
 	}
 }
 
+/* Program the FPGA pipeline registers (height, scaler, enable).
+ * This is the single authoritative place for the register sequence.
+ * Called from both normal stream start and DMA resync paths.
+ */
+void sc0710_program_pipeline_regs(struct sc0710_dev *dev)
+{
+	if (dev->fmt)
+		sc_write(dev, 0, BAR0_00C8, dev->fmt->height);
+	else
+		sc_write(dev, 0, BAR0_00C8, 0x438); /* 1080 default */
+
+	if (dev->board == SC0710_BOARD_ELGATEO_4KP)
+		sc_write(dev, 0, BAR0_00D8, 0x438);
+
+	sc_write(dev, 0, BAR0_00D0, 0x4100);
+	sc_write(dev, 0, 0xCC, 0x00000000);
+	if (dev->board != SC0710_BOARD_ELGATEO_4KP)
+		sc_write(dev, 0, BAR0_00DC, 0x00000000);
+	sc_write(dev, 0, BAR0_00D0, 0x4300);
+	sc_write(dev, 0, BAR0_00D0, 0x4100);
+
+	sc_set(dev, 0, BAR0_00D0, 0x0001);
+
+	if (dev->board == SC0710_BOARD_ELGATEO_4KP)
+		sc_write(dev, 0, 0xEC, 0x00000001);
+}
+
 int sc0710_dma_channels_start(struct sc0710_dev *dev)
 {
 	int i, ret;
 
 	printk("%s()\n", __func__);
 
-	/* Prepare all DMA channels to start */
 	for (i = 0; i < SC0710_MAX_CHANNELS; i++) {
 		ret = sc0710_dma_channel_start_prep(&dev->channel[i]);
 	}
 
-	/* TODO: What do these registers do? Any documentation? */
-	/* Digging into the reference drivers for the SCxxxx cards available
-	 * from the CM's website, the hardware supports a video scaler.
-	 * I'm guessing that this is setting - maybe - a scaler? */
-
-	/* Set the height register to the incoming signal format height */
-	if (dev->fmt) {
-		sc_write(dev, 0, BAR0_00C8, dev->fmt->height);
-	} else {
-		sc_write(dev, 0, BAR0_00C8, 0x438); /* 1080 default */
-	}
-
-	/* Set scaler output height for 4K Pro (always 1080p output).
-	 * Without this, the FPGA scaler produces no output and the
-	 * XDMA C2H engine gets no AXI-Stream data.
-	 */
-	if (dev->board == SC0710_BOARD_ELGATEO_4KP)
-		sc_write(dev, 0, BAR0_00D8, 0x438);
-
-	sc_write(dev, 0, BAR0_00D0, 0x4100);
-	sc_write(dev, 0, 0xCC, 0x00000000);
-	/* DC: MK2 uses 0 (no scaler). 4K Pro: FPGA auto-populates to 0x1050. */
-	if (dev->board != SC0710_BOARD_ELGATEO_4KP)
-		sc_write(dev, 0, BAR0_00DC, 0x00000000);
-	sc_write(dev, 0, BAR0_00D0, 0x4300);
-	sc_write(dev, 0, BAR0_00D0, 0x4100);
-
-	/* Enable the pipeline BEFORE starting DMA.
-	 * On 4K Pro, A8 takes ~100ms to become non-zero after D0|=1.
-	 * The XDMA C2H engine stalls if started without stream data.
-	 */
-	sc_set(dev, 0, BAR0_00D0, 0x0001);
-
-	/* Enable scaler-to-DMA data path (4K Pro only). */
-	if (dev->board == SC0710_BOARD_ELGATEO_4KP)
-		sc_write(dev, 0, 0xEC, 0x00000001);
+	sc0710_program_pipeline_regs(dev);
 
 	if (dev->board == SC0710_BOARD_ELGATEO_4KP)
 		sc0710_4kp_wait_pipeline(dev);
 
-	/* Start all DMA channels after pipeline is active. */
 	for (i = 0; i < SC0710_MAX_CHANNELS; i++) {
 		ret = sc0710_dma_channel_start(&dev->channel[i]);
 	}
