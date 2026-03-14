@@ -930,7 +930,8 @@ PACKAGE_VERSION="$DRV_VERSION"
 BUILT_MODULE_NAME[0]="$DRV_NAME"
 DEST_MODULE_LOCATION[0]="/kernel/drivers/media/pci/"
 AUTOINSTALL="yes"
-MAKE[0]="make KVERSION=\$kernelver -j\$(nproc) && cp build/sc0710.ko ."
+BUILT_MODULE_LOCATION[0]="build/"
+MAKE[0]="make KVERSION=\$kernelver -j\$(nproc)"
 DKMSEOF
     if dkms status 2>/dev/null | grep -q "$DRV_NAME"; then
         confirm "Remove existing DKMS and reinstall?" "Y" && for ver_item in $(dkms status 2>/dev/null | awk -F'[:,]' '/^sc0710/ {print $1}' | tr -d ' '); do dkms remove "$ver_item" --all >/dev/null 2>&1 || true; done
