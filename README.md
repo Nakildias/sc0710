@@ -27,7 +27,7 @@ High-performance, multi-client Linux driver for the Elgato 4K60 Pro MK.2 and Elg
 Unified installer that auto-detects your distro (Atomic or standard) and runs the appropriate flow. Supported on Arch Linux, Debian/Ubuntu, Fedora, and Fedora Atomic (Bazzite, Silverblue, Bluefin, Aurora).
 
 ```bash
-sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/Nakildias/sc0710/main/install-sc0710.sh)"
+sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/Nakildias/sc0710/main/scripts/install-sc0710.sh)"
 ```
 
 On Fedora Atomic distros, the installer sets up a boot-time build service instead of DKMS. Both the above URL and `atomic-install-sc0710.sh` work (they use the same unified script).

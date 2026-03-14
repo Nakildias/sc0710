@@ -341,7 +341,7 @@ case "$1" in
                 AUTO_SCALER_CFG_LINE=$(echo "$PROC_INFO" | grep "^ auto scaler cfg:" | head -1)
                 if [[ -n "$SCALER_LINE" ]]; then
                     echo ""
-                    echo -e "${BLUE}::${NC} ${BOLD}Scaler Information (MK.2)${NC}"
+                    echo -e "${BLUE}::${NC} ${BOLD}Scaler Information${NC}"
                     SCALER_MODE=$(echo "$SCALER_LINE" | sed 's/.*scaler: \([^ ]*.*\)/\1/')
                     [[ "$SCALER_MODE" == "DISABLED" ]] && echo -e "   Software Scaler: ${YELLOW}DISABLED${NC}" || echo -e "   Software Scaler: ${GREEN}${SCALER_MODE}${NC}"
                     if [[ -n "$AUTO_SCALER_LINE" ]]; then
@@ -527,7 +527,12 @@ case "$1" in
                 echo "$(uname -r)" > "$SRC_DIR/.built-for-kernel"
                 chcon -t modules_object_t "$SRC_DIR/build/${DRV_NAME}.ko" 2>/dev/null || true
                 for dep in videodev videobuf2-common videobuf2-v4l2 videobuf2-vmalloc snd-pcm; do modprobe "$dep" 2>/dev/null || true; done
-                insmod "$SRC_DIR/build/${DRV_NAME}.ko" 2>/dev/null && echo -e "${GREEN}[OK]${NC} Driver updated (v${NEW_VER})." || echo -e "${YELLOW}[WARNING]${NC} Try: sc0710-cli --load"
+                if insmod "$SRC_DIR/build/${DRV_NAME}.ko" 2>/dev/null; then
+                    echo -e "${GREEN}[OK]${NC} Driver updated (v${NEW_VER})."
+                else
+                    echo -e "${YELLOW}[WARNING]${NC} Try: sc0710-cli --load"
+                    [[ ! -f "$SRC_DIR/build/${DRV_NAME}.ko" ]] && echo -e "   ${YELLOW}If module doesn't exist, please reinstall using:${NC}" && echo -e "   sudo bash -c \"\$(curl -fsSL https://raw.githubusercontent.com/Nakildias/sc0710/main/scripts/install-sc0710.sh)\""
+                fi
             else
                 echo -e "${RED}[ERROR]${NC} Build failed."
                 exit 1
