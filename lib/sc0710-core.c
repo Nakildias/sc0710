@@ -765,6 +765,10 @@ static void sc0710_finidev(struct pci_dev *pci_dev)
 		vfree(dev->scaler_staging_buf);
 		dev->scaler_staging_buf = NULL;
 	}
+	if (dev->weave_staging_buf) {
+		vfree(dev->weave_staging_buf);
+		dev->weave_staging_buf = NULL;
+	}
 
 	v4l2_device_unregister(&dev->v4l2_dev);
 	kfree(dev);
