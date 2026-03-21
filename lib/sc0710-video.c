@@ -434,7 +434,7 @@ static void fill_frame(struct sc0710_dma_channel *ch,
 }
 #endif /* #if LINUX_VERSION_CODE <= KERNEL_VERSION(4, 0, 0) */
 
-#define SUPPORT_INTERLACED 0
+#define SUPPORT_INTERLACED 1
 static struct sc0710_format formats[] =
 {
 	/* 640x480 - VGA */
@@ -443,13 +443,13 @@ static struct sc0710_format formats[] =
 
 	/* 720x480 - SD NTSC */
 #if SUPPORT_INTERLACED
-	{  858,  262,  720,  240, 1, 2997, 30000, 1001, 8, 0, "720x480i29.97",   V4L2_DV_BT_CEA_720X480I59_94 },
+	{  858,  262,  720,  480, 1, 2997, 30000, 1001, 8, 0, "720x480i29.97",   V4L2_DV_BT_CEA_720X480I59_94 },
 #endif
 	{  858,  525,  720,  480, 0, 5994, 60000, 1001, 8, 0, "720x480p59.94",   V4L2_DV_BT_CEA_720X480P59_94 },
 
 	/* 720x576 - SD PAL */
 #if SUPPORT_INTERLACED
-	{  864,  312,  720,  288, 1, 2500, 25000, 1000, 8, 0, "720x576i25",      V4L2_DV_BT_CEA_720X576I50 },
+	{  864,  312,  720,  576, 1, 2500, 25000, 1000, 8, 0, "720x576i25",      V4L2_DV_BT_CEA_720X576I50 },
 #endif
 	{  864,  625,  720,  576, 0, 5000, 50000, 1000, 8, 0, "720x576p50",      V4L2_DV_BT_CEA_720X576P50 },
 
@@ -475,8 +475,8 @@ static struct sc0710_format formats[] =
 
 	/* 1920x1080 - Full HD */
 #if SUPPORT_INTERLACED
-	{ 2640,  562, 1920,  540, 1, 2500, 25000, 1000, 8, 0, "1920x1080i25",    V4L2_DV_BT_CEA_1920X1080I50 },
-	{ 2200,  562, 1920,  540, 1, 2997, 30000, 1001, 8, 0, "1920x1080i29.97", V4L2_DV_BT_CEA_1920X1080I60 },
+	{ 2640,  562, 1920, 1080, 1, 2500, 25000, 1000, 8, 0, "1920x1080i25",    V4L2_DV_BT_CEA_1920X1080I50 },
+	{ 2200,  562, 1920, 1080, 1, 2997, 30000, 1001, 8, 0, "1920x1080i29.97", V4L2_DV_BT_CEA_1920X1080I60 },
 #endif
 	{ 2750, 1125, 1920, 1080, 0, 2400, 24000, 1000, 8, 0, "1920x1080p24",    V4L2_DV_BT_CEA_1920X1080P24 },
 	{ 2640, 1125, 1920, 1080, 0, 2500, 25000, 1000, 8, 0, "1920x1080p25",    V4L2_DV_BT_CEA_1920X1080P25 },
@@ -802,7 +802,8 @@ static int vidioc_g_fmt_vid_cap(struct file *file, void *priv, struct v4l2_forma
 	f->fmt.pix.width = eff_w;
 	f->fmt.pix.height = eff_h;
 	f->fmt.pix.pixelformat = V4L2_PIX_FMT_YUYV;
-	f->fmt.pix.field = V4L2_FIELD_NONE;
+	f->fmt.pix.field = fmt->interlaced ?
+		V4L2_FIELD_INTERLACED : V4L2_FIELD_NONE;
 	f->fmt.pix.bytesperline = eff_w * 2;
 	f->fmt.pix.sizeimage = eff_fs;
 	f->fmt.pix.colorspace = sc0710_get_v4l2_colorspace(dev);
@@ -828,7 +829,8 @@ static int vidioc_try_fmt_vid_cap(struct file *file, void *priv, struct v4l2_for
 	f->fmt.pix.width = eff_w;
 	f->fmt.pix.height = eff_h;
 	f->fmt.pix.pixelformat = V4L2_PIX_FMT_YUYV;
-	f->fmt.pix.field = V4L2_FIELD_NONE;
+	f->fmt.pix.field = fmt->interlaced ?
+		V4L2_FIELD_INTERLACED : V4L2_FIELD_NONE;
 	f->fmt.pix.bytesperline = eff_w * 2;
 	f->fmt.pix.sizeimage = eff_fs;
 	f->fmt.pix.colorspace = sc0710_get_v4l2_colorspace(dev);

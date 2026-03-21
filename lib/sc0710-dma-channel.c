@@ -75,6 +75,29 @@ bool sc0710_guess_dims_from_framesize(u32 frame_bytes, u32 *w, u32 *h)
 	return false;
 }
 
+/* Weave two vertically-stacked fields into a proper interlaced frame.
+ * The hardware delivers interlaced content as Field 1 (top) followed by
+ * Field 2 (bottom) in a single DMA buffer.  This function interleaves
+ * the lines so that even output lines come from Field 1 and odd output
+ * lines come from Field 2, producing a standard V4L2_FIELD_INTERLACED frame.
+ *
+ * @src and @dst must not overlap.  @height is the full frame height
+ * (must be even).
+ */
+static void sc0710_weave_fields(const u8 *src, u8 *dst, u32 width, u32 height)
+{
+	u32 stride = width * 2; /* YUYV: 2 bytes per pixel */
+	u32 field_height = height / 2;
+	const u8 *field1 = src;
+	const u8 *field2 = src + field_height * stride;
+	u32 y;
+
+	for (y = 0; y < field_height; y++) {
+		memcpy(dst + (y * 2)     * stride, field1 + y * stride, stride);
+		memcpy(dst + (y * 2 + 1) * stride, field2 + y * stride, stride);
+	}
+}
+
 /* Detect a likely persistent horizontal tear seam.
  * This runs only in a short post-resync validation window.
  */
@@ -265,7 +288,8 @@ static void sc0710_dma_dequeue_video(struct sc0710_dma_channel *ch,
 	struct sc0710_dma_descriptor_chain *chain,
 	u32 cached_framesize,
 	u32 cached_width,
-	u32 cached_height)
+	u32 cached_height,
+	u32 cached_interlaced)
 {
 	struct sc0710_dev *dev = ch->dev;
 	struct sc0710_client *client;
@@ -279,6 +303,7 @@ static void sc0710_dma_dequeue_video(struct sc0710_dma_channel *ch,
 	int any_auto_scaler = 0;
 	int auto_scaler_gathered = 0;
 	int sw_scaler_allowed = sc0710_software_scaler_allowed(dev);
+	const u8 *woven_frame = NULL;
 	u32 streak_required = dma_resync_tear_streak_required ?
 		dma_resync_tear_streak_required : 1;
 
@@ -322,9 +347,9 @@ static void sc0710_dma_dequeue_video(struct sc0710_dma_channel *ch,
 	/* Pre-allocate staging buffer outside of spinlock context.
 	 * vzalloc/vfree are sleeping calls that must not be called
 	 * while holding spinlocks.  We size the buffer once here for
-	 * both the explicit scaler and the auto-scaler paths below.
+	 * the explicit scaler, auto-scaler, and interlaced weaving paths.
 	 */
-	if (sw_scaler_allowed &&
+	if ((sw_scaler_allowed || cached_interlaced) &&
 	    (!dev->scaler_staging_buf ||
 	     dev->scaler_staging_size < source_framesize)) {
 		u8 *old = dev->scaler_staging_buf;
@@ -334,6 +359,22 @@ static void sc0710_dma_dequeue_video(struct sc0710_dma_channel *ch,
 		} else {
 			dev->scaler_staging_size = 0;
 			printk_ratelimited(KERN_ERR "%s: Failed to allocate scaler staging buffer (%u bytes)\n",
+				dev->name, source_framesize);
+		}
+		if (old)
+			vfree(old);
+	}
+
+	if (cached_interlaced &&
+	    (!dev->weave_staging_buf ||
+	     dev->weave_staging_size < source_framesize)) {
+		u8 *old = dev->weave_staging_buf;
+		dev->weave_staging_buf = vzalloc(source_framesize);
+		if (dev->weave_staging_buf) {
+			dev->weave_staging_size = source_framesize;
+		} else {
+			dev->weave_staging_size = 0;
+			printk_ratelimited(KERN_ERR "%s: Failed to allocate weave staging buffer (%u bytes)\n",
 				dev->name, source_framesize);
 		}
 		if (old)
@@ -409,6 +450,26 @@ static void sc0710_dma_dequeue_video(struct sc0710_dma_channel *ch,
 		}
 	}
 
+	/* For interlaced content the hardware delivers two fields stacked
+	 * vertically (Field 1 on top, Field 2 on bottom).  Weave them into
+	 * a proper interleaved frame before delivering to clients.
+	 */
+	if (cached_interlaced && source_h >= 2 &&
+	    dev->scaler_staging_buf && dev->scaler_staging_size >= source_framesize &&
+	    dev->weave_staging_buf && dev->weave_staging_size >= source_framesize) {
+		if (!auto_scaler_gathered && !scaler_active) {
+			int gathered = sc0710_dma_chain_dq_to_ptr(ch, chain,
+				dev->scaler_staging_buf, source_framesize);
+			if (gathered == (int)source_framesize)
+				auto_scaler_gathered = 1;
+		}
+		if (auto_scaler_gathered || scaler_active) {
+			sc0710_weave_fields(dev->scaler_staging_buf,
+				dev->weave_staging_buf, source_w, source_h);
+			woven_frame = dev->weave_staging_buf;
+		}
+	}
+
 	/* Broadcast frame to all streaming clients */
 	spin_lock_irqsave(&ch->client_list_lock, flags);
 	list_for_each_entry(client, &ch->client_list, list) {
@@ -437,8 +498,9 @@ static void sc0710_dma_dequeue_video(struct sc0710_dma_channel *ch,
 		}
 
 		if (scaler_active) {
+			const u8 *scale_src = woven_frame ? woven_frame : dev->scaler_staging_buf;
 			if (scaled_framesize <= buffer_size) {
-				sc0710_scaler_scale_frame(dev->scaler_staging_buf,
+				sc0710_scaler_scale_frame(scale_src,
 					src_w, src_h, dst, dst_w, dst_h);
 				vb2_set_plane_payload(&vb_buf->vb.vb2_buf, 0, scaled_framesize);
 			} else {
@@ -453,14 +515,10 @@ static void sc0710_dma_dequeue_video(struct sc0710_dma_channel *ch,
 			   (source_w != client->stream_width ||
 			    source_h != client->stream_height) &&
 			   sw_scaler_allowed) {
-			/* Auto-scaler: scale to the resolution the client
-			 * started streaming at.  Works in both directions —
-			 * downscale when source is larger, upscale when
-			 * source is smaller.
-			 */
 			u32 adapt_dst_w = client->stream_width;
 			u32 adapt_dst_h = client->stream_height;
 			u32 adapt_fs = adapt_dst_w * 2 * adapt_dst_h;
+			const u8 *scale_src;
 
 			if (!dev->scaler_staging_buf) {
 				spin_unlock_irqrestore(&client->buffer_lock, buf_flags);
@@ -471,7 +529,8 @@ static void sc0710_dma_dequeue_video(struct sc0710_dma_channel *ch,
 					dev->scaler_staging_buf, source_framesize);
 				auto_scaler_gathered = 1;
 			}
-			sc0710_scaler_scale_frame(dev->scaler_staging_buf,
+			scale_src = woven_frame ? woven_frame : dev->scaler_staging_buf;
+			sc0710_scaler_scale_frame(scale_src,
 				source_w, source_h,
 				dst, adapt_dst_w, adapt_dst_h);
 			vb2_set_plane_payload(&vb_buf->vb.vb2_buf, 0, adapt_fs);
@@ -483,14 +542,10 @@ static void sc0710_dma_dequeue_video(struct sc0710_dma_channel *ch,
 			   (source_w != client->stream_width ||
 			    source_h != client->stream_height) &&
 			   sw_scaler_allowed) {
-			/* Dynamic resolution: source changed but the client
-			 * is still expecting its original resolution.  Scale
-			 * to match so the image stays correct until the app
-			 * handles SOURCE_CHANGE and restarts natively.
-			 */
 			u32 dyn_dst_w = client->stream_width;
 			u32 dyn_dst_h = client->stream_height;
 			u32 dyn_fs = dyn_dst_w * 2 * dyn_dst_h;
+			const u8 *scale_src;
 
 			if (!dev->scaler_staging_buf) {
 				spin_unlock_irqrestore(&client->buffer_lock, buf_flags);
@@ -501,10 +556,19 @@ static void sc0710_dma_dequeue_video(struct sc0710_dma_channel *ch,
 					dev->scaler_staging_buf, source_framesize);
 				auto_scaler_gathered = 1;
 			}
-			sc0710_scaler_scale_frame(dev->scaler_staging_buf,
+			scale_src = woven_frame ? woven_frame : dev->scaler_staging_buf;
+			sc0710_scaler_scale_frame(scale_src,
 				source_w, source_h,
 				dst, dyn_dst_w, dyn_dst_h);
 			vb2_set_plane_payload(&vb_buf->vb.vb2_buf, 0, dyn_fs);
+		} else if (woven_frame) {
+			if (source_framesize <= buffer_size) {
+				memcpy(dst, woven_frame, source_framesize);
+				vb2_set_plane_payload(&vb_buf->vb.vb2_buf, 0, source_framesize);
+			} else {
+				memcpy(dst, woven_frame, buffer_size);
+				vb2_set_plane_payload(&vb_buf->vb.vb2_buf, 0, buffer_size);
+			}
 		} else {
 			int len;
 			if (source_framesize > buffer_size) {
@@ -518,6 +582,8 @@ static void sc0710_dma_dequeue_video(struct sc0710_dma_channel *ch,
 
 		vb_buf->vb.vb2_buf.timestamp = ktime_get_ns();
 		vb_buf->vb.sequence = ch->frame_sequence;
+		vb_buf->vb.field = cached_interlaced ?
+			V4L2_FIELD_INTERLACED : V4L2_FIELD_NONE;
 
 		list_del(&vb_buf->list);
 		vb2_buffer_done(&vb_buf->vb.vb2_buf, VB2_BUF_STATE_DONE);
@@ -576,6 +642,7 @@ int sc0710_dma_channel_service(struct sc0710_dma_channel *ch)
 	const struct sc0710_format *cached_fmt;
 	u32 cached_framesize;
 	u32 cached_width, cached_height;
+	u32 cached_interlaced;
 	u32 wbm[2];
 	u32 v;
 	int i;
@@ -600,6 +667,7 @@ int sc0710_dma_channel_service(struct sc0710_dma_channel *ch)
 	cached_framesize = cached_fmt ? cached_fmt->framesize : 0;
 	cached_width = cached_fmt ? cached_fmt->width : 0;
 	cached_height = cached_fmt ? cached_fmt->height : 0;
+	cached_interlaced = cached_fmt ? cached_fmt->interlaced : 0;
 
 	/* Read how many descriptors have complete, if this hasn't changed
 	 * single we last checked, end early, nothing for us to do.
@@ -654,7 +722,8 @@ int sc0710_dma_channel_service(struct sc0710_dma_channel *ch)
 			 */
 			if (ch->mediatype == CHTYPE_VIDEO) {
 				sc0710_dma_dequeue_video(ch, chain, cached_framesize,
-					cached_width, cached_height);
+					cached_width, cached_height,
+					cached_interlaced);
 			} else
 			if (ch->mediatype == CHTYPE_AUDIO) {
 				sc0710_dma_dequeue_audio(ch, chain);

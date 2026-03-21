@@ -432,6 +432,8 @@ struct sc0710_dev {
 	enum sc0710_scaler_mode    scaler_mode;
 	u8                        *scaler_staging_buf;  /* Contiguous frame for scaling input */
 	u32                        scaler_staging_size;  /* Current allocation size */
+	u8                        *weave_staging_buf;   /* Destination for interlaced field weaving */
+	u32                        weave_staging_size;
 	u32                        auto_scaler_active;   /* Was auto-scaler triggered this frame? */
 
 	/* Procamp */
