@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # SC0710 Control Utility - Unified for Atomic and Non-Atomic distros
 # Detects distro type at runtime and branches accordingly.
 
