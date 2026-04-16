@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 #
 # SC0710 Driver Installer - Unified for Atomic and Non-Atomic distros
 #
