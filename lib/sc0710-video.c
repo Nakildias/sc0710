@@ -1145,8 +1145,10 @@ static const struct vb2_ops sc0710_video_qops = {
 	.buf_queue       = sc0710_buf_queue,
 	.start_streaming = sc0710_start_streaming,
 	.stop_streaming  = sc0710_stop_streaming,
+#if LINUX_VERSION_CODE < KERNEL_VERSION(7, 0, 0)
 	.wait_prepare    = vb2_ops_wait_prepare,
 	.wait_finish     = vb2_ops_wait_finish,
+#endif
 };
 
 /* ----------------------------------------------------------- */
