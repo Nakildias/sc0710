@@ -1,5 +1,8 @@
 { config, pkgs, lib, ... }:
 let
+    compatibleKernels = [ "6.12" "6.13" "6.14" "6.15" "6.16" "6.17" "6.18" "6.19" "7.0" ];
+    currentKernelMajorMinor = lib.versions.majorMinor config.hardware.sc0710.kernel.version;
+
     package-version = builtins.readFile ./version;
 
     cli = pkgs.writeShellScriptBin "sc0710-cli" (builtins.readFile ./scripts/sc0710-cli.sh);
@@ -35,6 +38,13 @@ in
         };
     };
     config = (lib.mkIf (config.hardware.sc0710.enable) {
+        assertions = [
+            {
+                assertion = lib.elem currentKernelMajorMinor compatibleKernels;
+                message = "sc0710 driver is not compatible with kernel ${currentKernelMajorMinor}. Compatible versions: ${lib.concatStringsSep ", " compatibleKernels}";
+            }
+        ];
+
         boot.extraModulePackages   = [ driver   ];
         boot.kernelModules         = [ "sc0710" ];
         environment.systemPackages = [ cli      ];
