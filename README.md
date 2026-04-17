@@ -39,6 +39,42 @@ Install `sc0710-dkms-git` using your preferred helper. Note that the CLI utility
 yay -S sc0710-dkms-git
 ```
 
+### NixOS (flakes)
+
+In your system flake, add `github:Nakildias/sc0710` as an input, and import the module `sc0710.nixosModules.default`.
+```nix
+{
+  inputs = {
+    # ...
+    sc0710.url = "github:Nakildias/sc0710";
+  };
+
+  outputs = { self, nixpkgs, sc0710 }: {
+    # replace <your-hostname> with your actual hostname
+    nixosConfigurations.<your-hostname> = nixpkgs.lib.nixosSystem {
+      # ...
+      modules = [
+        # ...
+        sc0710.nixosModules.default
+      ];
+    };
+  };
+}
+```
+
+In your host configuration, you can use following options:
+```nix
+# enable the kernel module and `sc0710-cli` script
+hardware.sc0710.enable = true;
+
+# enable automatic firmware updates with the systemd service
+hardware.sc0710.enableFirmware = true;
+
+# if, for whatever reason, you need to override the kernel version that the module is built for.
+# default is your current kernel (what `boot.kernelPackages.kernel` is set to)
+#hardware.sc0710.kernel = pkgs.linuxPackages_6_19.kernel;
+```
+
 ### Manual Compilation
 For other distributions or development usage.
 

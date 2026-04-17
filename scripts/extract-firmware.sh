@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Extract ECP5 firmware from the Elgato 4K Pro Windows driver installer.
 # Unified script for both Atomic and Non-Atomic distros.
 #
