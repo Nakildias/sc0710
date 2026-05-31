@@ -15,7 +15,7 @@ let
         enableParallelBuilding = true;
 
         src = ./.;
-        nativeBuildInputs = [ config.hardware.sc0710.kernel.moduleBuildDependencies ];
+        nativeBuildInputs = config.hardware.sc0710.kernel.moduleBuildDependencies;
 
         makeFlags = [
             "KBUILD_DIR=${config.hardware.sc0710.kernel.dev}/lib/modules/${config.hardware.sc0710.kernel.modDirVersion}/build"
