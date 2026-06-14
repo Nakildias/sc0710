@@ -100,6 +100,53 @@ sc0710_cli_ensure_ecp5() {
     sc0710_ensure_ecp5_programmed "$attempts"
 }
 
+sc0710_cli_atomic_load() {
+    local fw_lib err
+
+    if fw_lib=$(sc0710_firmware_lib_path 2>/dev/null); then
+        mkdir -p /var/log/sc0710
+        # shellcheck source=/dev/null
+        SC0710_FW_LOG_FILE="/var/log/sc0710/load_$(date '+%Y%m%d_%H%M%S').log" source "$fw_lib"
+        sc0710_init_firmware_paths
+        sc0710_load_driver
+        return $?
+    fi
+
+    local extra_dir="/lib/modules/$(uname -r)/extra/${DRV_NAME}"
+    rmmod "$DRV_NAME" 2>/dev/null || true
+    if [[ -d "$extra_dir" ]]; then
+        rm -rf "$extra_dir"
+        depmod -a "$(uname -r)" 2>/dev/null || depmod -a 2>/dev/null || true
+    fi
+    for dep in videodev videobuf2-common videobuf2-v4l2 videobuf2-vmalloc snd-pcm; do
+        modprobe "$dep" 2>/dev/null || true
+    done
+    err=$(insmod "$SRC_DIR/build/${DRV_NAME}.ko" 2>&1) || {
+        [[ -n "$err" ]] && echo "$err" >&2
+        return 1
+    }
+    return 0
+}
+
+sc0710_cli_clear_stale_registration() {
+    local fw_lib extra_dir="/lib/modules/$(uname -r)/extra/${DRV_NAME}"
+
+    if fw_lib=$(sc0710_firmware_lib_path 2>/dev/null); then
+        mkdir -p /var/log/sc0710
+        # shellcheck source=/dev/null
+        SC0710_FW_LOG_FILE="/var/log/sc0710/remove_$(date '+%Y%m%d_%H%M%S').log" source "$fw_lib"
+        sc0710_init_firmware_paths
+        sc0710_clear_stale_kernel_registration
+        return 0
+    fi
+
+    rmmod "$DRV_NAME" 2>/dev/null || true
+    if [[ -d "$extra_dir" ]]; then
+        rm -rf "$extra_dir"
+        depmod -a "$(uname -r)" 2>/dev/null || depmod -a 2>/dev/null || true
+    fi
+}
+
 sc0710_cli_refresh_firmware_services() {
     local src_root="${1:-}"
     local fw_script fw_lib verify_after
@@ -476,11 +523,8 @@ case "$1" in
             exit 0
         fi
         echo -e "${BLUE}::${NC} Loading driver..."
-        for dep in videodev videobuf2-common videobuf2-v4l2 videobuf2-vmalloc snd-pcm; do
-            modprobe "$dep" 2>/dev/null || true
-        done
         if [[ "$IS_ATOMIC" == "true" ]]; then
-            if insmod "$SRC_DIR/build/${DRV_NAME}.ko" 2>/dev/null; then
+            if sc0710_cli_atomic_load; then
                 if sc0710_is_4k_pro_card && sc0710_firmware_lib_path >/dev/null; then
                     # shellcheck source=/dev/null
                     SC0710_FW_LOG_FILE="/var/log/sc0710/load_$(date '+%Y%m%d_%H%M%S').log" source "$(sc0710_firmware_lib_path)"
@@ -500,8 +544,12 @@ case "$1" in
                 echo -e "${RED}[ERROR]${NC} Module not found. Run ${BOLD}sc0710-cli --rebuild${NC} first."
             else
                 echo -e "${RED}[ERROR]${NC} Failed to load driver. Run ${BOLD}sc0710-cli --rebuild${NC} if kernel was updated."
+                echo -e "  Check: ${BOLD}journalctl -u sc0710-build.service -b${NC}"
             fi
         else
+            for dep in videodev videobuf2-common videobuf2-v4l2 videobuf2-vmalloc snd-pcm; do
+                modprobe "$dep" 2>/dev/null || true
+            done
             if modprobe "$DRV_NAME"; then
                 if sc0710_is_4k_pro_card && sc0710_firmware_lib_path >/dev/null; then
                     if sc0710_cli_ensure_ecp5 3; then
@@ -514,6 +562,8 @@ case "$1" in
                 else
                     echo -e "${GREEN}[OK]${NC} Driver loaded successfully."
                 fi
+            else
+                echo -e "${RED}[ERROR]${NC} Failed to load driver."
             fi
         fi
         ;;
@@ -910,7 +960,7 @@ case "$1" in
                 echo "$(uname -r)" > "$SRC_DIR/.built-for-kernel"
                 chcon -t modules_object_t "$SRC_DIR/build/${DRV_NAME}.ko" 2>/dev/null || true
                 for dep in videodev videobuf2-common videobuf2-v4l2 videobuf2-vmalloc snd-pcm; do modprobe "$dep" 2>/dev/null || true; done
-                if insmod "$SRC_DIR/build/${DRV_NAME}.ko" 2>/dev/null; then
+                if sc0710_cli_atomic_load; then
                     if sc0710_is_4k_pro_card && sc0710_firmware_lib_path >/dev/null; then
                         if sc0710_cli_ensure_ecp5 5; then
                             echo -e "${GREEN}[OK]${NC} Driver updated (v${NEW_VER}), ECP5 FPGA programmed."
@@ -990,9 +1040,9 @@ case "$1" in
             systemctl disable sc0710-build.service 2>/dev/null || true
             rm -f /etc/systemd/system/sc0710-build.service
             systemctl daemon-reload
-            rmmod "$DRV_NAME" 2>/dev/null || true
+            sc0710_cli_clear_stale_registration
             rm -rf "$SRC_DIR"
-            echo -e "  ${YELLOW}NOTE:${NC} To remove layered deps: ${BOLD}sudo rpm-ostree uninstall gcc make kernel-devel git${NC}"
+            echo -e "  ${YELLOW}NOTE:${NC} Layered build packages were left unchanged (no rpm-ostree changes, no reboot needed)."
         else
             for ver_item in $(dkms status 2>/dev/null | awk -F'[:,]' '/^sc0710/ {print $1}' | tr -d ' '); do
                 dkms remove "$ver_item" --all >/dev/null 2>&1 || rm -rf "/var/lib/dkms/$(echo "$ver_item" | tr ',' '/')" 2>/dev/null

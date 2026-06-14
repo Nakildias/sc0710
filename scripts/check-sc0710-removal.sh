@@ -224,5 +224,7 @@ echo -e "${RED}[TRACES FOUND]${NC} ${TRACE_COUNT} remnant(s) detected."
 echo ""
 echo -e "If removal was intentional, try:"
 echo -e "  ${BOLD}sudo sc0710-cli --remove${NC}   (if the CLI is still installed)"
+echo -e "  Stale atomic installs may leave ${BOLD}/lib/modules/\$(uname -r)/extra/${DRV_NAME}/${NC}"
+echo -e "  Remove that directory and run ${BOLD}sudo depmod -a${NC} if modinfo still finds the module."
 echo -e "  Or remove any paths listed above manually, then run this script again."
 exit 1

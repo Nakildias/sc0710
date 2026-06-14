@@ -63,6 +63,7 @@ if [[ -f "$FIRMWARE_LIB" ]]; then
     # shellcheck source=/dev/null
     SC0710_FW_LOG_FILE="$LOG_FILE" source "$FIRMWARE_LIB"
     sc0710_init_firmware_paths
+    sc0710_clear_stale_kernel_registration
 
     if sc0710_is_4k_pro; then
         log "Elgato 4K Pro detected — ensuring ECP5 firmware is programmed."
@@ -74,6 +75,39 @@ if [[ -f "$FIRMWARE_LIB" ]]; then
         log "=== SC0710 boot-time build completed (4K Pro ECP5 OK) ==="
         exit 0
     fi
+
+    LOADED=false
+    for attempt in 1 2 3; do
+        if sc0710_driver_loaded; then
+            LOADED=true
+            break
+        fi
+        if sc0710_load_driver; then
+            LOADED=true
+            break
+        fi
+        log "Driver load attempt $attempt failed, retrying in ${attempt}s..."
+        sleep "$attempt"
+    done
+
+    if [[ "$LOADED" == "true" ]]; then
+        log "Driver loaded successfully."
+        log "=== SC0710 boot-time build completed ==="
+        exit 0
+    fi
+
+    log "ERROR: Failed to load driver module after 3 attempts."
+    log "Recent kernel messages:"
+    dmesg | tail -15 >> "$LOG_FILE"
+    exit 1
+fi
+
+extra_dir="/lib/modules/${KERNEL_VER}/extra/${DRV_NAME}"
+rmmod "$DRV_NAME" 2>/dev/null || true
+if [[ -d "$extra_dir" ]]; then
+    log "Removing stale kernel module tree: $extra_dir"
+    rm -rf "$extra_dir"
+    depmod -a "$KERNEL_VER" 2>/dev/null || depmod -a 2>/dev/null || true
 fi
 
 for dep in videodev videobuf2-common videobuf2-v4l2 videobuf2-vmalloc snd-pcm; do
@@ -86,10 +120,11 @@ for attempt in 1 2 3; do
         LOADED=true
         break
     fi
-    if insmod "$SRC_DIR/build/${DRV_NAME}.ko" 2>>"$LOG_FILE"; then
+    if insmod_err=$(insmod "$SRC_DIR/build/${DRV_NAME}.ko" 2>&1); then
         LOADED=true
         break
     fi
+    [[ -n "$insmod_err" ]] && log "insmod error: $insmod_err"
     log "insmod attempt $attempt failed, retrying in ${attempt}s..."
     sleep "$attempt"
 done

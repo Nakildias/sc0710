@@ -374,11 +374,14 @@ if [[ "$NEEDS_LAYER" == "true" ]]; then
     echo ""
 
     if confirm "Layer build dependencies now?" "Y"; then
-        msg2 "Layering packages via rpm-ostree..."
-        if ! rpm-ostree install --idempotent --allow-inactive "${LAYER_PKGS[@]}" 2>&1 | tee -a "$LOG_FILE"; then
-            error "Failed to layer packages via rpm-ostree."
-            echo -e "  ${YELLOW}Try manually:${NC} ${BOLD}sudo rpm-ostree install ${LAYER_PKGS[*]}${NC}"
-            exit 1
+        msg2 "Layering packages via rpm-ostree (apply-live, no reboot if possible)..."
+        if ! rpm-ostree install --apply-live --idempotent --allow-inactive "${LAYER_PKGS[@]}" 2>&1 | tee -a "$LOG_FILE"; then
+            warning "apply-live failed; trying staged ostree install (may require reboot)..."
+            if ! rpm-ostree install --idempotent --allow-inactive "${LAYER_PKGS[@]}" 2>&1 | tee -a "$LOG_FILE"; then
+                error "Failed to layer packages via rpm-ostree."
+                echo -e "  ${YELLOW}Try manually:${NC} ${BOLD}sudo rpm-ostree install --apply-live ${LAYER_PKGS[*]}${NC}"
+                exit 1
+            fi
         fi
         log "rpm-ostree install completed for: ${LAYER_PKGS[*]}"
 
@@ -700,6 +703,14 @@ if [[ ${#FAILED_DEPS[@]} -gt 0 ]]; then
 fi
 
 # Load the driver (4K Pro uses ECP5-aware loader with retries)
+if [[ -f "$SRC_DIR/sc0710-firmware-lib.sh" ]]; then
+    # shellcheck source=/dev/null
+    SC0710_FW_LOG_FILE="$LOG_FILE" source "$SRC_DIR/sc0710-firmware-lib.sh"
+    sc0710_init_firmware_paths
+    sc0710_clear_stale_kernel_registration
+    log "Cleared stale kernel module registrations (if any)"
+fi
+
 if lspci -n -v -d 12ab:0710 2>/dev/null | grep -qi "1cfa:0012" && [[ -f "$SRC_DIR/sc0710-firmware-lib.sh" ]]; then
     # shellcheck source=/dev/null
     SC0710_FW_LOG_FILE="$LOG_FILE" source "$SRC_DIR/sc0710-firmware-lib.sh"
@@ -711,6 +722,19 @@ if lspci -n -v -d 12ab:0710 2>/dev/null | grep -qi "1cfa:0012" && [[ -f "$SRC_DI
         warning "Try after reboot: sudo sc0710-cli --restart"
     fi
 elif ! DRIVER_ERR=$(insmod "$SRC_DIR/build/${DRV_NAME}.ko" 2>&1); then
+    if [[ -f "$SRC_DIR/sc0710-firmware-lib.sh" ]]; then
+        # shellcheck source=/dev/null
+        SC0710_FW_LOG_FILE="$LOG_FILE" source "$SRC_DIR/sc0710-firmware-lib.sh"
+        sc0710_init_firmware_paths
+        sc0710_clear_stale_kernel_registration
+        if sc0710_load_driver; then
+            msg2 "Driver loaded successfully (after clearing stale registration)."
+            DRIVER_ERR=""
+        fi
+    fi
+fi
+
+if [[ -n "${DRIVER_ERR:-}" ]] && ! lsmod | grep -q "^${DRV_NAME}[[:space:]]"; then
     echo ""
     error "Failed to load $DRV_NAME module."
     echo -e "  ${YELLOW}Error: ${DRIVER_ERR}${NC}"

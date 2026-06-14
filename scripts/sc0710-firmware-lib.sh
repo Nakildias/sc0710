@@ -158,25 +158,60 @@ sc0710_unload_driver() {
     return 1
 }
 
+# Remove stale /lib/modules/*/extra/sc0710 trees left by DKMS, kmod, or old installs.
+# Atomic loads via insmod from /var/lib/sc0710/build/ only — a leftover extra/
+# registration makes insmod fail with "File exists" or loads the wrong .ko.
+sc0710_clear_stale_kernel_registration() {
+    local kernel_ver extra_dir
+
+    kernel_ver="$(uname -r)"
+    extra_dir="/lib/modules/${kernel_ver}/extra/${SC0710_DRV_NAME}"
+
+    sc0710_unload_driver || true
+
+    if [[ -d "$extra_dir" ]]; then
+        sc0710_fw_log "Removing stale kernel module tree: ${extra_dir}"
+        rm -rf "$extra_dir"
+        depmod -a "$kernel_ver" 2>/dev/null || depmod -a 2>/dev/null || true
+    fi
+}
+
 sc0710_load_driver() {
-    local dep
+    local dep mod err
+
+    sc0710_clear_stale_kernel_registration
+
     for dep in videodev videobuf2-common videobuf2-v4l2 videobuf2-vmalloc snd-pcm; do
         modprobe "$dep" 2>/dev/null || true
     done
 
     if [[ "$SC0710_DISTRO_TYPE" == "immutable" ]]; then
-        local mod="${SC0710_SRC_DIR}/build/${SC0710_DRV_NAME}.ko"
+        mod="${SC0710_SRC_DIR}/build/${SC0710_DRV_NAME}.ko"
         if [[ ! -f "$mod" ]]; then
             sc0710_fw_log "ERROR: Module not found at $mod"
             return 1
         fi
         chcon -t modules_object_t "$mod" 2>/dev/null || true
-        insmod "$mod" 2>>"${SC0710_FW_LOG_FILE:-/dev/null}"
-        return $?
+        if sc0710_driver_loaded; then
+            sc0710_fw_log "Driver already loaded."
+            return 0
+        fi
+        err=$(insmod "$mod" 2>&1) || {
+            sc0710_fw_log "ERROR: insmod $mod failed: $err"
+            dmesg 2>/dev/null | grep -iE "sc0710|insmod|module" | tail -8 >> "${SC0710_FW_LOG_FILE:-/dev/null}" || true
+            return 1
+        }
+        return 0
     fi
 
-    modprobe "$SC0710_DRV_NAME" 2>>"${SC0710_FW_LOG_FILE:-/dev/null}"
-    return $?
+    if sc0710_driver_loaded; then
+        return 0
+    fi
+    err=$(modprobe "$SC0710_DRV_NAME" 2>&1) || {
+        sc0710_fw_log "ERROR: modprobe ${SC0710_DRV_NAME} failed: $err"
+        return 1
+    }
+    return 0
 }
 
 sc0710_wait_for_ecp5_programming() {
