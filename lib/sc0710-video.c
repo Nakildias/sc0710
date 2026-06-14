@@ -1,7 +1,8 @@
 /*
- *  Driver for the Elgato 4k60 Pro mk.2 HDMI capture card.
+ *  Driver for the Elgato 4k60 Pro MK.2 HDMI capture card.
  *
  *  Copyright (c) 2021-2022 Steven Toth <stoth@kernellabs.com>
+ *  Modifications Copyright (c) 2025-2026 Nakildias <nakildiaspro@gmail.com>
  *
  *  This program is free software; you can redistribute it and/or modify
  *  it under the terms of the GNU General Public License as published by

@@ -1,0 +1,55 @@
+sc0710 — Linux driver for Elgato 4K60 Pro MK.2 and 4K Pro capture cards
+=======================================================================
+
+This project is free software, licensed under the GNU General Public License
+version 2. See the LICENSE file for the full text.
+
+
+Original driver
+---------------
+  Copyright (c) 2021-2022 Steven Toth <stoth@kernellabs.com>
+
+  Reverse-engineered driver for Magewell SC0710-based capture cards.
+  https://github.com/stoth68000/sc0710
+
+
+Intermediate fork
+-----------------
+  Maintained by Subtixx — see README Credits.
+
+
+This fork
+---------
+  Copyright (c) 2025-2026 Nakildias <nakildiaspro@gmail.com>
+  https://github.com/Nakildias/sc0710
+
+  Maintains and extends the driver for the Elgato 4K60 Pro MK.2 and
+  Elgato 4K Pro on modern kernels (6.12+), including 4K Pro ECP5 FPGA
+  support, atomic-distro installation, and capture stability work.
+
+
+File-level attribution
+----------------------
+
+Kernel module (lib/*.c, lib/*.h)
+  Derived from Steven Toth's sc0710 driver. Files in this directory retain
+  the original copyright notice. Substantial modifications in this fork
+  are marked with:
+
+    Modifications Copyright (c) 2025-2026 Nakildias <nakildiaspro@gmail.com>
+
+Installer and tooling (scripts/*.sh)
+  Written for this fork.
+
+    Copyright (c) 2025-2026 Nakildias <nakildiaspro@gmail.com>
+
+
+Contributors
+------------
+  See README Credits for additional contributors (including Onhil's 4K Pro work).
+
+
+Note
+----
+  This driver is not affiliated with or endorsed by Elgato, Magewell, or
+  Kernel Labs.

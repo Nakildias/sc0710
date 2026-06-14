@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# Copyright (C) 2025-2026 Nakildias <nakildiaspro@gmail.com>
+# SPDX-License-Identifier: GPL-2.0-or-later
+#
 # SC0710 Control Utility - Unified for Atomic and Non-Atomic distros
 # Detects distro type at runtime and branches accordingly.
 
@@ -16,8 +19,9 @@ NC='\033[0m'
 
 # --- Auto-elevate to root ---
 if [[ $EUID -ne 0 ]]; then
-    exec sudo "$0" "$@"
+    exec sudo SC0710_INVOKE_USER="$USER" "$0" "$@"
 fi
+DUMP_USER="${SC0710_INVOKE_USER:-${SUDO_USER:-root}}"
 
 # --- Detect atomic distro ---
 is_atomic() {
@@ -72,6 +76,109 @@ save_config() {
     echo -e "${BLUE}[PERSIST]${NC} Settings saved to /etc/modprobe.d/sc0710-params.conf"
 }
 
+sc0710_is_4k_pro_card() {
+    lspci -n -v -d 12ab:0710 2>/dev/null | grep -qi "1cfa:0012"
+}
+
+sc0710_firmware_lib_path() {
+    if [[ "$IS_ATOMIC" == "true" && -f "$SRC_DIR/sc0710-firmware-lib.sh" ]]; then
+        echo "$SRC_DIR/sc0710-firmware-lib.sh"
+    elif [[ -f /usr/local/libexec/sc0710-firmware-lib.sh ]]; then
+        echo "/usr/local/libexec/sc0710-firmware-lib.sh"
+    fi
+}
+
+sc0710_cli_ensure_ecp5() {
+    local attempts="${1:-3}"
+    local fw_lib fw_script
+    sc0710_is_4k_pro_card || return 0
+    fw_lib=$(sc0710_firmware_lib_path) || return 1
+    mkdir -p /var/log/sc0710
+    # shellcheck source=/dev/null
+    SC0710_FW_LOG_FILE="/var/log/sc0710/cli_$(date '+%Y%m%d_%H%M%S').log" source "$fw_lib"
+    sc0710_init_firmware_paths
+    sc0710_ensure_ecp5_programmed "$attempts"
+}
+
+sc0710_cli_refresh_firmware_services() {
+    local src_root="${1:-}"
+    local fw_script fw_lib verify_after
+    sc0710_is_4k_pro_card || return 0
+
+    if [[ "$IS_ATOMIC" == "true" ]]; then
+        fw_script="$SRC_DIR/sc0710-firmware.sh"
+        fw_lib="$SRC_DIR/sc0710-firmware-lib.sh"
+        verify_after="sc0710-build.service"
+        [[ -z "$src_root" ]] && src_root="$SRC_DIR"
+    else
+        fw_script="/usr/local/libexec/sc0710-firmware.sh"
+        fw_lib="/usr/local/libexec/sc0710-firmware-lib.sh"
+        verify_after="systemd-modules-load.service"
+        mkdir -p /usr/local/libexec
+        [[ -z "$src_root" ]] && src_root="$DKMS_SRC"
+        [[ -f "$src_root/scripts/sc0710-firmware.sh" ]] && cp "$src_root/scripts/sc0710-firmware.sh" "$fw_script" && chmod +x "$fw_script"
+        [[ -f "$src_root/scripts/sc0710-firmware-lib.sh" ]] && cp "$src_root/scripts/sc0710-firmware-lib.sh" "$fw_lib" && chmod +x "$fw_lib"
+    fi
+
+    [[ -x "$fw_script" && -f "$fw_lib" ]] || return 0
+
+    cat > "/etc/systemd/system/sc0710-firmware.service" <<FWEOF
+[Unit]
+Description=SC0710 4K Pro ECP5 Firmware Preparation
+After=local-fs.target systemd-udev-settle.service
+Before=${verify_after} sc0710-firmware-verify.service
+ConditionPathExists=${fw_script}
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash ${fw_script}
+RemainAfterExit=yes
+TimeoutStartSec=180
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+FWEOF
+
+    cat > "/etc/systemd/system/sc0710-firmware-verify.service" <<FWVEOF
+[Unit]
+Description=SC0710 4K Pro ECP5 Firmware Verify
+After=${verify_after} sc0710-firmware.service
+ConditionPathExists=${fw_script}
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash ${fw_script} --verify
+RemainAfterExit=yes
+TimeoutStartSec=300
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+FWVEOF
+
+    systemctl daemon-reload
+    systemctl enable sc0710-firmware.service sc0710-firmware-verify.service >/dev/null 2>&1 || true
+}
+
+sc0710_remove_firmware_files() {
+    rm -f /lib/firmware/sc0710/SC0710.FWI.HEX 2>/dev/null || true
+    rmdir /lib/firmware/sc0710 2>/dev/null || true
+
+    rm -f /etc/firmware/sc0710/SC0710.FWI.HEX 2>/dev/null || true
+    if [[ -L /etc/firmware/sc0710 ]]; then
+        rm -f /etc/firmware/sc0710 2>/dev/null || true
+    fi
+    rmdir /etc/firmware/sc0710 2>/dev/null || true
+
+    rm -f /var/lib/sc0710/firmware/SC0710.FWI.HEX 2>/dev/null || true
+    rmdir /var/lib/sc0710/firmware 2>/dev/null || true
+
+    rm -f /usr/local/libexec/sc0710-firmware.sh /usr/local/libexec/sc0710-firmware-lib.sh 2>/dev/null || true
+}
+
 # --- Version Check Function ---
 check_version() {
     local REMOTE_VERSION
@@ -88,6 +195,223 @@ check_version() {
         echo -e "${YELLOW}╚═══════════════════════════════════════════════════════════╝${NC}"
         echo ""
     fi
+}
+
+# --- Debug Dump Helpers ---
+resolve_dump_desktop() {
+    local home uid desktop
+    if [[ "$DUMP_USER" == "root" ]]; then
+        DUMP_DESKTOP="/root/Desktop"
+    else
+        home=$(getent passwd "$DUMP_USER" 2>/dev/null | cut -d: -f6)
+        uid=$(id -u "$DUMP_USER" 2>/dev/null || echo "")
+        if [[ -n "$uid" && -d "/run/user/$uid" ]]; then
+            desktop=$(sudo -u "$DUMP_USER" XDG_RUNTIME_DIR="/run/user/$uid" xdg-user-dir DESKTOP 2>/dev/null || true)
+        fi
+        [[ -z "$desktop" && -n "$home" ]] && desktop="${home}/Desktop"
+        [[ -z "$desktop" && -n "$home" ]] && desktop="$home"
+        DUMP_DESKTOP="${desktop:-/root/Desktop}"
+    fi
+    mkdir -p "$DUMP_DESKTOP"
+}
+
+dump_section() {
+    printf '\n=== %s ===\n' "$1" >> "$DUMP_FILE"
+}
+
+dump_cmd() {
+    local label="$1"
+    shift
+    printf '\n--- %s ---\n' "$label" >> "$DUMP_FILE"
+    if command -v "${1%% *}" &>/dev/null || [[ "$1" == cat ]] || [[ "$1" == ls ]]; then
+        "$@" >> "$DUMP_FILE" 2>&1 || printf '(command failed: %s)\n' "$*" >> "$DUMP_FILE"
+    else
+        printf '(not available)\n' >> "$DUMP_FILE"
+    fi
+}
+
+dump_file_if_exists() {
+    local path="$1"
+    if [[ -f "$path" ]]; then
+        printf '\n--- %s ---\n' "$path" >> "$DUMP_FILE"
+        cat "$path" >> "$DUMP_FILE" 2>&1
+    else
+        printf '%s: (not present)\n' "$path" >> "$DUMP_FILE"
+    fi
+}
+
+get_hostname() {
+    local name=""
+    if [[ -f /etc/hostname ]]; then
+        name=$(tr -d '[:space:]' < /etc/hostname)
+    fi
+    if [[ -z "$name" ]]; then
+        name=$(hostname -s 2>/dev/null || hostname 2>/dev/null || uname -n 2>/dev/null || true)
+    fi
+    printf '%s' "${name:-unknown}"
+}
+
+write_debug_dump() {
+    local dump_date dump_stamp
+    dump_date=$(date '+%d-%m-%Y')
+    dump_stamp=$(date '+%Y-%m-%d %H:%M:%S %Z')
+    resolve_dump_desktop
+    DUMP_FILE="${DUMP_DESKTOP}/dump-${dump_date}.txt"
+
+    {
+        printf 'SC0710 Debug Dump\n'
+        printf 'Generated: %s\n' "$dump_stamp"
+        printf 'Collected by: %s\n' "$DUMP_USER"
+    } > "$DUMP_FILE"
+
+    dump_section "System"
+    {
+        if [[ -f /etc/os-release ]]; then
+            # shellcheck disable=SC1091
+            . /etc/os-release
+            printf 'Linux Distro: %s\n' "${PRETTY_NAME:-$NAME}"
+            printf 'ID: %s\n' "${ID:-unknown}"
+            printf 'Version: %s\n' "${VERSION_ID:-unknown}"
+        else
+            printf 'Linux Distro: unknown\n'
+        fi
+        printf 'Kernel Version: %s\n' "$(uname -r)"
+        printf 'System Type: %s\n' "$([[ "$IS_ATOMIC" == "true" ]] && echo Atomic || echo Standard)"
+        printf 'Architecture: %s\n' "$(uname -m)"
+        printf 'Hostname: %s\n' "$(get_hostname)"
+        printf 'Uptime: %s\n' "$(uptime -p 2>/dev/null || uptime 2>/dev/null || echo unknown)"
+        if [[ "$IS_ATOMIC" == "true" ]]; then
+            printf 'Ostree Booted: %s\n' "$([[ -f /run/ostree-booted ]] && echo yes || echo no)"
+            command -v rpm-ostree &>/dev/null && printf 'rpm-ostree: available\n' || printf 'rpm-ostree: not found\n'
+        fi
+    } >> "$DUMP_FILE"
+
+    dump_section "Driver"
+    {
+        printf 'Driver Version: %s\n' "${CURRENT_VERSION:-unknown}"
+        if command -v sc0710-cli &>/dev/null || [[ -f /usr/local/bin/sc0710-cli ]]; then
+            printf 'CLI Installed: yes (%s)\n' "$(command -v sc0710-cli 2>/dev/null || echo /usr/local/bin/sc0710-cli)"
+        else
+            printf 'CLI Installed: no\n'
+        fi
+        if lsmod | grep -q "^${DRV_NAME}[[:space:]]"; then
+            printf 'Module Loaded: yes\n'
+            lsmod | awk -v m="$DRV_NAME" '$1 == m {printf "Module Size: %s bytes\nModule Reference Count: %s\n", $2, $3}'
+            awk -v m="$DRV_NAME" '$1 == m {print "Used By:", $4}' /proc/modules 2>/dev/null
+        else
+            printf 'Module Loaded: no\n'
+        fi
+        if [[ "$IS_ATOMIC" == "true" ]]; then
+            printf 'Source Directory: %s\n' "$SRC_DIR"
+            dump_file_if_exists "$SRC_DIR/.built-for-kernel"
+        elif [[ -n "$DKMS_SRC" ]]; then
+            printf 'DKMS Source Directory: %s\n' "$DKMS_SRC"
+        else
+            printf 'Installed Source: not found\n'
+        fi
+    } >> "$DUMP_FILE"
+
+    dump_section "Install State"
+    if [[ "$IS_ATOMIC" == "true" ]]; then
+        dump_cmd "rpm-ostree status" bash -c "rpm-ostree status 2>/dev/null || echo '(rpm-ostree unavailable)'"
+        dump_cmd "Atomic build service" systemctl status sc0710-build.service --no-pager
+        dump_cmd "sc0710-build.service journal (last 50 lines)" bash -c "journalctl -u sc0710-build.service -n 50 --no-pager 2>/dev/null || echo '(no journal entries)'"
+        dump_file_if_exists "$SRC_DIR/.built-for-kernel"
+        dump_file_if_exists "$SRC_DIR/build-and-load.sh"
+        [[ -f "$SRC_DIR/build/${DRV_NAME}.ko" ]] && printf 'Built module: %s (%s bytes)\n' "$SRC_DIR/build/${DRV_NAME}.ko" "$(stat -c %s "$SRC_DIR/build/${DRV_NAME}.ko" 2>/dev/null || echo unknown)" >> "$DUMP_FILE" \
+            || printf 'Built module: not found\n' >> "$DUMP_FILE"
+        printf 'Note: /etc/modules-load.d/%s.conf is not used on Atomic distros (module loaded via insmod).\n' "$DRV_NAME" >> "$DUMP_FILE"
+    else
+        dump_cmd "DKMS status" dkms status
+        dump_cmd "DKMS status (sc0710 only)" bash -c "dkms status 2>/dev/null | grep -i sc0710 || echo '(no sc0710 DKMS entries)'"
+        for d in /usr/src/${DRV_NAME}-*; do
+            [[ -d "$d" ]] && printf 'DKMS source present: %s\n' "$d" >> "$DUMP_FILE"
+        done
+        [[ -d "/var/lib/dkms/${DRV_NAME}" ]] && printf 'DKMS lib dir present: /var/lib/dkms/%s\n' "$DRV_NAME" >> "$DUMP_FILE" \
+            || printf 'DKMS lib dir: not present\n' >> "$DUMP_FILE"
+    fi
+    dump_cmd "Firmware service" systemctl status sc0710-firmware.service --no-pager
+    for fw in /var/lib/sc0710/firmware/SC0710.FWI.HEX /etc/firmware/sc0710/SC0710.FWI.HEX /lib/firmware/sc0710/SC0710.FWI.HEX; do
+        [[ -f "$fw" ]] && printf 'Firmware present: %s\n' "$fw" >> "$DUMP_FILE"
+    done
+
+    dump_section "PCI Devices"
+    dump_cmd "lspci (SC0710 / Magewell / Elgato related)" bash -c "lspci -nn 2>/dev/null | grep -iE '12ab:0710|1cfa:|magewell|sc0710' || echo '(no matching PCI devices)'"
+    dump_cmd "lspci -nn (full)" lspci -nn
+    dump_cmd "lspci -nnv (SC0710 device)" bash -c "lspci -nnv -d 12ab:0710 2>/dev/null || echo '(device 12ab:0710 not found)'"
+
+    dump_section "Video Devices"
+    dump_cmd "Video device nodes" bash -c "ls -la /dev/video* 2>/dev/null || echo '(no /dev/video* nodes)'"
+    dump_cmd "v4l2 device list" bash -c "v4l2-ctl --list-devices 2>/dev/null || echo '(v4l2-ctl not installed)'"
+    dump_cmd "v4l2loopback module" bash -c "lsmod | grep -E '^v4l2loopback|Module' || echo '(v4l2loopback not loaded)'"
+    if lsmod | grep -q "^${DRV_NAME}[[:space:]]"; then
+        dump_cmd "Driver-bound PCI devices" bash -c "ls -d /sys/bus/pci/drivers/${DRV_NAME}/0* 2>/dev/null | while read -r p; do echo \"\$(basename \"\$p\")\"; done || echo '(none bound)'"
+    fi
+
+    dump_section "Device Usage"
+    dump_cmd "Processes using video devices (fuser)" bash -c "fuser -v /dev/video* 2>&1 || echo '(none or fuser unavailable)'"
+    dump_cmd "Processes using video devices (lsof)" bash -c "lsof /dev/video* 2>/dev/null || echo '(none or lsof unavailable)'"
+    dump_cmd "Processes using audio devices (fuser)" bash -c "fuser -v /dev/snd/* 2>&1 || echo '(none or fuser unavailable)'"
+
+    dump_section "Configuration"
+    dump_file_if_exists "/etc/modules-load.d/${DRV_NAME}.conf"
+    dump_file_if_exists "/etc/modprobe.d/${DRV_NAME}.conf"
+    dump_file_if_exists "/etc/modprobe.d/${DRV_NAME}-params.conf"
+    dump_file_if_exists "/etc/systemd/system/sc0710-build.service"
+    dump_file_if_exists "/etc/systemd/system/sc0710-firmware.service"
+    if [[ "$DUMP_USER" != "root" ]]; then
+        printf '\n--- User groups (%s) ---\n' "$DUMP_USER" >> "$DUMP_FILE"
+        groups "$DUMP_USER" >> "$DUMP_FILE" 2>&1 || true
+    fi
+
+    dump_section "Module Details"
+    if lsmod | grep -q "^${DRV_NAME}[[:space:]]"; then
+        if modinfo "$DRV_NAME" &>/dev/null; then
+            dump_cmd "modinfo" modinfo "$DRV_NAME"
+        elif [[ "$IS_ATOMIC" == "true" && -f "$SRC_DIR/build/${DRV_NAME}.ko" ]]; then
+            dump_cmd "modinfo (built module)" modinfo "$SRC_DIR/build/${DRV_NAME}.ko"
+        fi
+        dump_cmd "Module parameters" bash -c "ls -la /sys/module/${DRV_NAME}/parameters/ 2>/dev/null && for p in /sys/module/${DRV_NAME}/parameters/*; do printf '%s=%s\n' \"\$(basename \"\$p\")\" \"\$(cat \"\$p\" 2>/dev/null)\"; done"
+        dump_file_if_exists "/proc/sc0710-state"
+    else
+        printf 'Module not loaded — skipping live parameters.\n' >> "$DUMP_FILE"
+        if [[ "$IS_ATOMIC" == "true" && -f "$SRC_DIR/build/${DRV_NAME}.ko" ]]; then
+            dump_cmd "modinfo (built module)" modinfo "$SRC_DIR/build/${DRV_NAME}.ko"
+        else
+            dump_cmd "modinfo (if module file exists)" bash -c "modinfo ${DRV_NAME} 2>/dev/null || echo '(module not available in kernel tree)'"
+        fi
+    fi
+
+    dump_section "PipeWire / Audio Stack"
+    dump_cmd "PipeWire processes" bash -c "pgrep -a pipewire 2>/dev/null || echo '(pipewire not running)'"
+    if [[ "$DUMP_USER" != "root" ]]; then
+        uid=$(id -u "$DUMP_USER" 2>/dev/null || echo "")
+        if [[ -n "$uid" ]]; then
+            dump_cmd "PipeWire user services ($DUMP_USER)" bash -c "sudo -u '#$uid' XDG_RUNTIME_DIR='/run/user/$uid' systemctl --user status pipewire.socket pipewire.service wireplumber.service --no-pager 2>&1"
+        fi
+    fi
+
+    dump_section "Kernel Log (sc0710)"
+    dump_cmd "dmesg (sc0710, last 150 lines)" bash -c "dmesg 2>/dev/null | grep -i sc0710 | tail -150 || echo '(no sc0710 messages in dmesg)'"
+    dump_cmd "dmesg (v4l2loopback)" bash -c "dmesg 2>/dev/null | grep -i v4l2loopback | tail -50 || echo '(no v4l2loopback messages)'"
+
+    dump_section "Install Logs"
+    if [[ -d /var/log/sc0710 ]]; then
+        dump_cmd "Install log directory listing" ls -la /var/log/sc0710
+        for log in /var/log/sc0710/*; do
+            [[ -f "$log" ]] && dump_cmd "$(basename "$log") (last 80 lines)" bash -c "tail -80 '$log'"
+        done
+    else
+        printf '/var/log/sc0710: (not present)\n' >> "$DUMP_FILE"
+    fi
+
+    if [[ "$DUMP_USER" != "root" ]]; then
+        chown "$DUMP_USER:$DUMP_USER" "$DUMP_FILE" 2>/dev/null || true
+    fi
+    chmod 0644 "$DUMP_FILE" 2>/dev/null || true
+
+    echo -e "${GREEN}[OK]${NC} Debug dump written to ${BOLD}${DUMP_FILE}${NC}"
+    echo -e "${BLUE}[INFO]${NC} Attach this file when reporting issues on GitHub."
 }
 
 # --- Help Function ---
@@ -113,6 +437,7 @@ show_help() {
     echo -e "    ${BOLD}-pt, --procedural-timings${NC} Toggle timing calculation mode (merge/procedural/static)"
     echo -e "    ${BOLD}-U, --update${NC}     Check for updates and reinstall"
     echo -e "    ${BOLD}-r, -R, --remove${NC} Completely uninstall driver and CLI"
+    echo -e "    ${BOLD}--dump${NC}           Save a debug report to the Desktop"
     if [[ "$IS_ATOMIC" == "true" ]]; then
         echo -e "    ${BOLD}--rebuild${NC}        Force rebuild the module for current kernel"
     fi
@@ -136,7 +461,18 @@ fi
 case "$1" in
     -l|--load)
         if lsmod | grep -q "$DRV_NAME"; then
-            echo -e "${GREEN}[OK]${NC} Driver is already loaded."
+            if sc0710_is_4k_pro_card && sc0710_firmware_lib_path >/dev/null; then
+                echo -e "${BLUE}::${NC} Driver loaded — verifying ECP5 FPGA..."
+                if sc0710_cli_ensure_ecp5 3; then
+                    echo -e "${GREEN}[OK]${NC} Driver loaded and ECP5 FPGA programmed."
+                else
+                    echo -e "${RED}[ERROR]${NC} ECP5 programming failed."
+                    echo -e "  Run: ${BOLD}sc0710-cli --restart${NC}"
+                    exit 1
+                fi
+            else
+                echo -e "${GREEN}[OK]${NC} Driver is already loaded."
+            fi
             exit 0
         fi
         echo -e "${BLUE}::${NC} Loading driver..."
@@ -145,14 +481,40 @@ case "$1" in
         done
         if [[ "$IS_ATOMIC" == "true" ]]; then
             if insmod "$SRC_DIR/build/${DRV_NAME}.ko" 2>/dev/null; then
-                echo -e "${GREEN}[OK]${NC} Driver loaded successfully."
+                if sc0710_is_4k_pro_card && sc0710_firmware_lib_path >/dev/null; then
+                    # shellcheck source=/dev/null
+                    SC0710_FW_LOG_FILE="/var/log/sc0710/load_$(date '+%Y%m%d_%H%M%S').log" source "$(sc0710_firmware_lib_path)"
+                    mkdir -p /var/log/sc0710
+                    sc0710_init_firmware_paths
+                    if sc0710_wait_for_ecp5_programming 12 || sc0710_cli_ensure_ecp5 3; then
+                        echo -e "${GREEN}[OK]${NC} Driver loaded successfully."
+                    else
+                        echo -e "${RED}[ERROR]${NC} Driver loaded but ECP5 programming failed."
+                        echo -e "  Run: ${BOLD}sc0710-cli --restart${NC}"
+                        exit 1
+                    fi
+                else
+                    echo -e "${GREEN}[OK]${NC} Driver loaded successfully."
+                fi
             elif [[ ! -f "$SRC_DIR/build/${DRV_NAME}.ko" ]]; then
                 echo -e "${RED}[ERROR]${NC} Module not found. Run ${BOLD}sc0710-cli --rebuild${NC} first."
             else
                 echo -e "${RED}[ERROR]${NC} Failed to load driver. Run ${BOLD}sc0710-cli --rebuild${NC} if kernel was updated."
             fi
         else
-            modprobe "$DRV_NAME" && echo -e "${GREEN}[OK]${NC} Driver loaded successfully."
+            if modprobe "$DRV_NAME"; then
+                if sc0710_is_4k_pro_card && sc0710_firmware_lib_path >/dev/null; then
+                    if sc0710_cli_ensure_ecp5 3; then
+                        echo -e "${GREEN}[OK]${NC} Driver loaded and ECP5 FPGA programmed."
+                    else
+                        echo -e "${RED}[ERROR]${NC} Driver loaded but ECP5 programming failed."
+                        echo -e "  Run: ${BOLD}sc0710-cli --restart${NC}"
+                        exit 1
+                    fi
+                else
+                    echo -e "${GREEN}[OK]${NC} Driver loaded successfully."
+                fi
+            fi
         fi
         ;;
     -u|--unload)
@@ -220,6 +582,16 @@ case "$1" in
         fi
         ;;
     --restart)
+        if sc0710_is_4k_pro_card && sc0710_firmware_lib_path >/dev/null; then
+            if sc0710_cli_ensure_ecp5 5; then
+                echo -e "${GREEN}[OK]${NC} Driver restarted and ECP5 FPGA programmed."
+            else
+                echo -e "${RED}[ERROR]${NC} ECP5 programming failed."
+                echo -e "  Run: ${BOLD}sudo bash $(dirname "$(sc0710_firmware_lib_path)")/sc0710-firmware.sh --verify${NC}"
+                exit 1
+            fi
+            exit 0
+        fi
         "$0" --unload
         sleep 1
         "$0" --load
@@ -299,7 +671,7 @@ case "$1" in
                     BOARD_NAME=$(dmesg 2>/dev/null | grep -E "sc0710.*subsystem: ${SUBVEN}:${SUBDEV}.*board:" | tail -1 | sed 's/.*board: \([^\[]*\).*/\1/' | sed 's/ *$//')
                     if [[ -z "$BOARD_NAME" ]]; then
                         case "$SUBVEN:$SUBDEV" in
-                            1cfa:000e) BOARD_NAME="Elgato 4k60 Pro mk.2" ;;
+                            1cfa:000e) BOARD_NAME="Elgato 4k60 Pro MK.2" ;;
                             1cfa:0012) BOARD_NAME="Elgato 4K Pro" ;;
                             1cfa:0006) BOARD_NAME="Elgato HD60 Pro (1cfa:0006)" ;;
                             *) BOARD_NAME="UNKNOWN/GENERIC" ;;
@@ -428,10 +800,17 @@ case "$1" in
             done
             [[ "$FW_FOUND" == "false" ]] && echo -e "   ${RED}○${NC} Firmware missing. Run: ${BOLD}sudo bash $( [[ "$IS_ATOMIC" == "true" ]] && echo /var/lib/sc0710/sc0710-firmware.sh || echo /usr/local/libexec/sc0710-firmware.sh )${NC}"
             ECP5_MSG=$(dmesg 2>/dev/null | grep -E "sc0710.*ECP5" | tail -1)
-            echo "$ECP5_MSG" | grep -q "firmware programmed successfully" && echo -e "   ${GREEN}●${NC} ECP5 FPGA programmed"
-            echo "$ECP5_MSG" | grep -q "already configured" && echo -e "   ${GREEN}●${NC} ECP5 FPGA configured"
-            echo "$ECP5_MSG" | grep -qE "Failed to load firmware|programming failed" && echo -e "   ${RED}○${NC} ECP5 FPGA not programmed"
+            ECP5_OK=false
+            echo "$ECP5_MSG" | grep -q "firmware programmed successfully" && ECP5_OK=true && echo -e "   ${GREEN}●${NC} ECP5 FPGA programmed"
+            echo "$ECP5_MSG" | grep -q "already configured" && ECP5_OK=true && echo -e "   ${GREEN}●${NC} ECP5 FPGA configured (warm boot)"
+            echo "$ECP5_MSG" | grep -qiE "Failed to load firmware|firmware upload failed|programming failed" && echo -e "   ${RED}○${NC} ECP5 FPGA not programmed"
+            if [[ "$FW_FOUND" == "true" && "$ECP5_OK" == "false" ]] && lsmod | grep -q "^${DRV_NAME}[[:space:]]"; then
+                echo -e "   ${RED}⚠ WARNING:${NC} Firmware file exists but ECP5 is NOT programmed."
+                echo -e "     Run: ${BOLD}sudo bash $( [[ "$IS_ATOMIC" == "true" ]] && echo /var/lib/sc0710/sc0710-firmware.sh || echo /usr/local/libexec/sc0710-firmware.sh ) --verify${NC}"
+                echo -e "     Or:  ${BOLD}sc0710-cli --restart${NC}"
+            fi
             systemctl is-enabled sc0710-firmware.service >/dev/null 2>&1 && echo -e "   ${GREEN}●${NC} Firmware service enabled" || echo -e "   ${YELLOW}○${NC} Firmware service not installed"
+            systemctl is-enabled sc0710-firmware-verify.service >/dev/null 2>&1 && echo -e "   ${GREEN}●${NC} Firmware verify service enabled" || true
         fi
         echo ""
         ;;
@@ -517,6 +896,10 @@ case "$1" in
             curl -fsSL "https://github.com/Nakildias/sc0710/archive/refs/heads/main.tar.gz" -o "$TEMP_TAR" || { echo -e "${RED}[ERROR]${NC} Download failed."; rm -f "$TEMP_TAR"; exit 1; }
             tar -xzf "$TEMP_TAR" --strip-components=1 -C "$SRC_DIR" || { rm -f "$TEMP_TAR"; exit 1; }
             rm -f "$TEMP_TAR"
+            [[ -f "$SRC_DIR/scripts/build-and-load.sh" ]] && cp "$SRC_DIR/scripts/build-and-load.sh" "$SRC_DIR/build-and-load.sh" && chmod +x "$SRC_DIR/build-and-load.sh"
+            [[ -f "$SRC_DIR/scripts/sc0710-firmware.sh" ]] && cp "$SRC_DIR/scripts/sc0710-firmware.sh" "$SRC_DIR/sc0710-firmware.sh" && chmod +x "$SRC_DIR/sc0710-firmware.sh"
+            [[ -f "$SRC_DIR/scripts/sc0710-firmware-lib.sh" ]] && cp "$SRC_DIR/scripts/sc0710-firmware-lib.sh" "$SRC_DIR/sc0710-firmware-lib.sh" && chmod +x "$SRC_DIR/sc0710-firmware-lib.sh"
+            sc0710_cli_refresh_firmware_services
             NEW_VER="$CURRENT_VERSION"
             [[ -f "$SRC_DIR/version" ]] && NEW_VER=$(cat "$SRC_DIR/version" | tr -d '[:space:]')
             lsmod | grep -q "$DRV_NAME" && "$0" --unload
@@ -528,7 +911,16 @@ case "$1" in
                 chcon -t modules_object_t "$SRC_DIR/build/${DRV_NAME}.ko" 2>/dev/null || true
                 for dep in videodev videobuf2-common videobuf2-v4l2 videobuf2-vmalloc snd-pcm; do modprobe "$dep" 2>/dev/null || true; done
                 if insmod "$SRC_DIR/build/${DRV_NAME}.ko" 2>/dev/null; then
-                    echo -e "${GREEN}[OK]${NC} Driver updated (v${NEW_VER})."
+                    if sc0710_is_4k_pro_card && sc0710_firmware_lib_path >/dev/null; then
+                        if sc0710_cli_ensure_ecp5 5; then
+                            echo -e "${GREEN}[OK]${NC} Driver updated (v${NEW_VER}), ECP5 FPGA programmed."
+                        else
+                            echo -e "${YELLOW}[WARNING]${NC} Driver updated (v${NEW_VER}) but ECP5 programming failed."
+                            echo -e "  Run: ${BOLD}sc0710-cli --restart${NC}"
+                        fi
+                    else
+                        echo -e "${GREEN}[OK]${NC} Driver updated (v${NEW_VER})."
+                    fi
                 else
                     echo -e "${YELLOW}[WARNING]${NC} Try: sc0710-cli --load"
                     [[ ! -f "$SRC_DIR/build/${DRV_NAME}.ko" ]] && echo -e "   ${YELLOW}If module doesn't exist, please reinstall using:${NC}" && echo -e "   sudo bash -c \"\$(curl -fsSL https://raw.githubusercontent.com/Nakildias/sc0710/main/scripts/install-sc0710.sh)\""
@@ -558,10 +950,20 @@ case "$1" in
             rm -rf /usr/src/${DRV_NAME}-*
             
             mv "$TEMP_DIR" "$NEW_DKMS_SRC"
-            
+            sc0710_cli_refresh_firmware_services "$NEW_DKMS_SRC"
+
             dkms add -m "$DRV_NAME" -v "$REAL_NEW_VER" >/dev/null 2>&1
             if dkms install -m "$DRV_NAME" -v "$REAL_NEW_VER" -k "$(uname -r)" 2>&1; then
-                echo -e "${GREEN}[OK]${NC} Driver updated (v${REAL_NEW_VER})."
+                if sc0710_is_4k_pro_card && sc0710_firmware_lib_path >/dev/null; then
+                    if sc0710_cli_ensure_ecp5 5; then
+                        echo -e "${GREEN}[OK]${NC} Driver updated (v${REAL_NEW_VER}), ECP5 FPGA programmed."
+                    else
+                        echo -e "${YELLOW}[WARNING]${NC} Driver updated (v${REAL_NEW_VER}) but ECP5 programming failed."
+                        echo -e "  Run: ${BOLD}sc0710-cli --restart${NC}"
+                    fi
+                else
+                    echo -e "${GREEN}[OK]${NC} Driver updated (v${REAL_NEW_VER})."
+                fi
             else
                 echo -e "${RED}[ERROR]${NC} DKMS rebuild failed."
                 exit 1
@@ -597,16 +999,22 @@ case "$1" in
             done
             rmdir "/var/lib/dkms/${DRV_NAME}" 2>/dev/null || true
             rm -rf /usr/src/${DRV_NAME}-*
-            rm -f /usr/local/libexec/sc0710-firmware.sh
         fi
+        sc0710_remove_firmware_files
         systemctl stop sc0710-firmware.service 2>/dev/null || true
         systemctl disable sc0710-firmware.service 2>/dev/null || true
+        systemctl stop sc0710-firmware-verify.service 2>/dev/null || true
+        systemctl disable sc0710-firmware-verify.service 2>/dev/null || true
         rm -f /etc/systemd/system/sc0710-firmware.service
+        rm -f /etc/systemd/system/sc0710-firmware-verify.service
         rm -f /etc/modules-load.d/${DRV_NAME}.conf /etc/modprobe.d/${DRV_NAME}.conf /etc/modprobe.d/${DRV_NAME}-params.conf
         systemctl daemon-reload 2>/dev/null || true
         rm -rf /var/log/sc0710
         rm -f /usr/local/bin/sc0710-cli
-        echo -e "${GREEN}[OK]${NC} Driver and CLI removed."
+        echo -e "${GREEN}[OK]${NC} Driver, CLI, services, and firmware removed."
+        ;;
+    --dump)
+        write_debug_dump
         ;;
     -v|--version)
         [[ "$IS_ATOMIC" == "true" ]] && echo -e "${BOLD}SC0710${NC} Driver Control Utility (Atomic Edition)" || echo -e "${BOLD}SC0710${NC} Driver Control Utility"

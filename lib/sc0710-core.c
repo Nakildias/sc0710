@@ -1,7 +1,11 @@
 /*
- *  Driver for the Elgato 4k60 Pro mk.2 HDMI capture card.
+ *  Driver for the Elgato 4k60 Pro MK.2 and Elgato 4K Pro HDMI capture cards.
  *
  *  Copyright (c) 2021-2022 Steven Toth <stoth@kernellabs.com>
+ *  Modifications Copyright (c) 2025-2026 Nakildias <nakildiaspro@gmail.com>
+ *
+ *  Based on the sc0710 driver by Steven Toth. Maintained as a community fork
+ *  for Elgato capture cards on modern Linux kernels.
  *
  *  This program is free software; you can redistribute it and/or modify
  *  it under the terms of the GNU General Public License as published by
@@ -19,11 +23,13 @@
  */
 
 #include <linux/vmalloc.h>
+#include <linux/module.h>
 #include "sc0710.h"
 
-MODULE_DESCRIPTION("Driver for SC0710 based TV cards");
-MODULE_AUTHOR("Steven Toth <stoth@kernellabs.com>");
+MODULE_DESCRIPTION("Elgato 4K60 Pro MK.2 / 4K Pro capture driver");
+MODULE_AUTHOR("Steven Toth <stoth@kernellabs.com>, Nakildias <nakildiaspro@gmail.com>");
 MODULE_LICENSE("GPL");
+MODULE_VERSION(SC0710_DRV_VERSION);
 
 /* 1 = Basic device statistics
  * 2 = PCIe register dump for entire device

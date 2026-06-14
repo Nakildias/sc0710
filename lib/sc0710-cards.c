@@ -1,7 +1,8 @@
 /*
- *  Driver for the Elgato 4k60 Pro mk.2 HDMI capture card.
+ *  Driver for the Elgato 4k60 Pro MK.2 HDMI capture card.
  *
  *  Copyright (c) 2021-2022 Steven Toth <stoth@kernellabs.com>
+ *  Modifications Copyright (c) 2025-2026 Nakildias <nakildiaspro@gmail.com>
  *
  *  This program is free software; you can redistribute it and/or modify
  *  it under the terms of the GNU General Public License as published by
@@ -30,7 +31,7 @@ struct sc0710_board sc0710_boards[] = {
 		/* Ensure safe default for unknown boards */
 	},
 	[SC0710_BOARD_ELGATEO_4KP60_MK2] = {
-		.name		= "Elgato 4k60 Pro mk.2",
+		.name		= "Elgato 4k60 Pro MK.2",
 		.bar1_index	= 1,
 	},
 
@@ -437,6 +438,9 @@ static int sc0710_ecp5_firmware_check(struct sc0710_dev *dev)
 
 	printk(KERN_INFO "%s: Programming ECP5 firmware\n", dev->name);
 
+	/* Cold boot: PCI/FPGA may need extra settle time before SPI programming. */
+	msleep(1500);
+
 	/* Try standard kernel firmware loader first (/lib/firmware/) */
 	ret = request_firmware(&fw, "sc0710/SC0710.FWI.HEX", &dev->pci->dev);
 	if (ret) {
@@ -513,7 +517,14 @@ static int sc0710_ecp5_firmware_check(struct sc0710_dev *dev)
 		release_firmware(fw);
 	vfree(alt_buf);
 
-	ret = ecp5_program_bitstream(dev, decoded, half_size * 2);
+	for (i = 0; i < 3; i++) {
+		ret = ecp5_program_bitstream(dev, decoded, half_size * 2);
+		if (!ret)
+			break;
+		printk(KERN_WARNING "%s: ECP5 programming attempt %d failed, retrying...\n",
+			dev->name, i + 1);
+		msleep(500);
+	}
 	vfree(decoded);
 
 	if (ret)

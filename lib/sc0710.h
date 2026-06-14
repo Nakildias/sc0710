@@ -1,7 +1,8 @@
 /*
- *  Driver for the Elgato 4k60 Pro mk.2 HDMI capture card.
+ *  Driver for the Elgato 4k60 Pro MK.2 and Elgato 4K Pro HDMI capture cards.
  *
  *  Copyright (c) 2021-2022 Steven Toth <stoth@kernellabs.com>
+ *  Modifications Copyright (c) 2025-2026 Nakildias <nakildiaspro@gmail.com>
  *
  *  This program is free software; you can redistribute it and/or modify
  *  it under the terms of the GNU General Public License as published by
@@ -67,11 +68,10 @@
 #endif
 
 #include "sc0710-reg.h"
+#include "sc0710-version.h"
 
 #define SC0710_VERSION_CODE KERNEL_VERSION(1, 0, 0)
-#ifndef SC0710_DRV_VERSION
-#define SC0710_DRV_VERSION "0.0.0.0-unknown"
-#endif
+#define SC0710_DRV_VERSION SC0710_DRV_VERSION_STRING
 
 /* Global debug mode - extern declaration for use in all source files */
 extern unsigned int sc0710_debug_mode;
