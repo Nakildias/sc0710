@@ -161,19 +161,52 @@ sc0710_unload_driver() {
 # Remove stale /lib/modules/*/extra/sc0710 trees left by DKMS, kmod, or old installs.
 # Atomic loads via insmod from /var/lib/sc0710/build/ only — a leftover extra/
 # registration makes insmod fail with "File exists" or loads the wrong .ko.
+# On ostree/Bazzite, extra/ often lives on a read-only deployment; blacklist +
+# rmmod is enough — deleting the file is optional.
+sc0710_ensure_modprobe_blacklist() {
+    local conf="/etc/modprobe.d/${SC0710_DRV_NAME}-atomic.conf"
+
+    [[ "${SC0710_DISTRO_TYPE:-}" == "immutable" ]] || return 0
+    [[ -f "$conf" ]] && grep -q "^blacklist ${SC0710_DRV_NAME}\$" "$conf" 2>/dev/null && return 0
+
+    cat > "$conf" <<EOF
+# SC0710 on atomic distros: do not auto-load stale copies under /lib/modules/*/extra/.
+# sc0710-build.service loads ${SC0710_SRC_DIR:-/var/lib/sc0710}/build/${SC0710_DRV_NAME}.ko via insmod.
+blacklist ${SC0710_DRV_NAME}
+EOF
+    sc0710_fw_log "Installed modprobe blacklist at ${conf}"
+}
+
 sc0710_clear_stale_kernel_registration() {
-    local kernel_ver extra_dir
+    local kernel_ver extra_dir owner ko_path
 
     kernel_ver="$(uname -r)"
     extra_dir="/lib/modules/${kernel_ver}/extra/${SC0710_DRV_NAME}"
 
+    sc0710_ensure_modprobe_blacklist
     sc0710_unload_driver || true
 
-    if [[ -d "$extra_dir" ]]; then
-        sc0710_fw_log "Removing stale kernel module tree: ${extra_dir}"
-        rm -rf "$extra_dir"
+    [[ -d "$extra_dir" ]] || return 0
+
+    sc0710_fw_log "Removing stale kernel module tree: ${extra_dir}"
+    if rm -rf "$extra_dir" 2>/dev/null; then
         depmod -a "$kernel_ver" 2>/dev/null || depmod -a 2>/dev/null || true
+        return 0
     fi
+
+    sc0710_fw_log "WARNING: Could not remove ${extra_dir} (read-only filesystem — common on ostree/Bazzite)"
+    sc0710_fw_log "WARNING: The stale .ko can stay on disk; blacklist + unload lets our insmod path work."
+
+    for ko_path in "${extra_dir}/${SC0710_DRV_NAME}.ko.xz" "${extra_dir}/${SC0710_DRV_NAME}.ko"; do
+        if [[ -f "$ko_path" ]] && command -v rpm &>/dev/null; then
+            owner=$(rpm -qf "$ko_path" 2>/dev/null || true)
+            if [[ -n "$owner" ]]; then
+                sc0710_fw_log "NOTE: Stale module is owned by RPM: ${owner}"
+                sc0710_fw_log "NOTE: To remove permanently: rpm-ostree uninstall <package-name> (then reboot)"
+                break
+            fi
+        fi
+    done
 }
 
 sc0710_load_driver() {
@@ -197,6 +230,16 @@ sc0710_load_driver() {
             return 0
         fi
         err=$(insmod "$mod" 2>&1) || {
+            if [[ "$err" == *"File exists"* ]]; then
+                sc0710_fw_log "Module slot occupied; unloading and retrying insmod..."
+                rmmod "$SC0710_DRV_NAME" 2>/dev/null || true
+                sleep 0.5
+                if sc0710_driver_loaded; then
+                    sc0710_fw_log "Driver still loaded after rmmod attempt."
+                elif err=$(insmod "$mod" 2>&1); then
+                    return 0
+                fi
+            fi
             sc0710_fw_log "ERROR: insmod $mod failed: $err"
             dmesg 2>/dev/null | grep -iE "sc0710|insmod|module" | tail -8 >> "${SC0710_FW_LOG_FILE:-/dev/null}" || true
             return 1

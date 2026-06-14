@@ -625,7 +625,8 @@ msg "Configuring module parameters..."
 
 cat > "/etc/modprobe.d/${DRV_NAME}.conf" <<EOF
 # Parameter persistence for sc0710 (loaded via insmod by sc0710-build.service)
-# softdep is informational only; actual dependency loading is handled by the build script.
+# Blacklist stops stale copies under /lib/modules/extra/ from loading at boot (ostree read-only).
+blacklist $DRV_NAME
 softdep $DRV_NAME pre: videodev videobuf2-v4l2 videobuf2-vmalloc videobuf2-common snd-pcm
 EOF
 log "Module parameters configured"

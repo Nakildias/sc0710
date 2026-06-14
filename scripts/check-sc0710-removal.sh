@@ -165,6 +165,7 @@ section "Boot configuration"
 for conf in \
     "/etc/modules-load.d/${DRV_NAME}.conf" \
     "/etc/modprobe.d/${DRV_NAME}.conf" \
+    "/etc/modprobe.d/${DRV_NAME}-atomic.conf" \
     "/etc/modprobe.d/${DRV_NAME}-params.conf"; do
     if [[ -f "$conf" ]]; then
         trace_found "Configuration file present" "$conf"
@@ -224,7 +225,8 @@ echo -e "${RED}[TRACES FOUND]${NC} ${TRACE_COUNT} remnant(s) detected."
 echo ""
 echo -e "If removal was intentional, try:"
 echo -e "  ${BOLD}sudo sc0710-cli --remove${NC}   (if the CLI is still installed)"
-echo -e "  Stale atomic installs may leave ${BOLD}/lib/modules/\$(uname -r)/extra/${DRV_NAME}/${NC}"
-echo -e "  Remove that directory and run ${BOLD}sudo depmod -a${NC} if modinfo still finds the module."
+echo -e "  Stale atomic installs may leave ${BOLD}/lib/modules/\$(uname -r)/extra/${DRV_NAME}/${NC} on the read-only ostree image."
+echo -e "  That path often cannot be deleted manually; blacklist + unload is enough for sc0710 to work."
+echo -e "  To find the owning package: ${BOLD}rpm -qf /lib/modules/\$(uname -r)/extra/${DRV_NAME}/sc0710.ko.xz${NC}"
 echo -e "  Or remove any paths listed above manually, then run this script again."
 exit 1

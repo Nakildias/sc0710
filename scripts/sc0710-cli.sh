@@ -142,8 +142,13 @@ sc0710_cli_clear_stale_registration() {
 
     rmmod "$DRV_NAME" 2>/dev/null || true
     if [[ -d "$extra_dir" ]]; then
-        rm -rf "$extra_dir"
+        rm -rf "$extra_dir" 2>/dev/null || true
         depmod -a "$(uname -r)" 2>/dev/null || depmod -a 2>/dev/null || true
+    fi
+    if [[ "$IS_ATOMIC" == "true" ]]; then
+        cat > "/etc/modprobe.d/${DRV_NAME}-atomic.conf" <<EOF
+blacklist ${DRV_NAME}
+EOF
     fi
 }
 
@@ -403,6 +408,7 @@ write_debug_dump() {
     dump_section "Configuration"
     dump_file_if_exists "/etc/modules-load.d/${DRV_NAME}.conf"
     dump_file_if_exists "/etc/modprobe.d/${DRV_NAME}.conf"
+    dump_file_if_exists "/etc/modprobe.d/${DRV_NAME}-atomic.conf"
     dump_file_if_exists "/etc/modprobe.d/${DRV_NAME}-params.conf"
     dump_file_if_exists "/etc/systemd/system/sc0710-build.service"
     dump_file_if_exists "/etc/systemd/system/sc0710-firmware.service"
@@ -1057,7 +1063,7 @@ case "$1" in
         systemctl disable sc0710-firmware-verify.service 2>/dev/null || true
         rm -f /etc/systemd/system/sc0710-firmware.service
         rm -f /etc/systemd/system/sc0710-firmware-verify.service
-        rm -f /etc/modules-load.d/${DRV_NAME}.conf /etc/modprobe.d/${DRV_NAME}.conf /etc/modprobe.d/${DRV_NAME}-params.conf
+        rm -f /etc/modules-load.d/${DRV_NAME}.conf /etc/modprobe.d/${DRV_NAME}.conf /etc/modprobe.d/${DRV_NAME}-params.conf /etc/modprobe.d/${DRV_NAME}-atomic.conf
         systemctl daemon-reload 2>/dev/null || true
         rm -rf /var/log/sc0710
         rm -f /usr/local/bin/sc0710-cli
