@@ -12,12 +12,6 @@ Original driver
   Reverse-engineered driver for Magewell SC0710-based capture cards.
   https://github.com/stoth68000/sc0710
 
-
-Intermediate fork
------------------
-  Maintained by Subtixx — see README Credits.
-
-
 This fork
 ---------
   Copyright (c) 2025-2026 Nakildias <nakildiaspro@gmail.com>
