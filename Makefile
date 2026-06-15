@@ -7,39 +7,53 @@ sc0710-objs := \
 
 obj-m += sc0710.o
 
+# User/DKMS entry (KBUILD_EXTMOD unset). kbuild sets KBUILD_EXTMOD when it
+# includes this Makefile — do not define "all" there or kbuild recurses.
+ifeq ($(KBUILD_EXTMOD),)
+
+.DEFAULT_GOAL := all
+
 TARFILES = Makefile lib/*.h lib/*.c *.txt *.md
 
-KVERSION = $(shell uname -r)
-# Robust version detection for DKMS and local builds
-VERSION := $(shell cat $(PWD)/version 2>/dev/null || cat version 2>/dev/null || echo "unknown")
-KBUILD_DIR = /lib/modules/$(KVERSION)/build
+KVERSION ?= $(shell uname -r)
+KERNEL_VER := $(if $(KERNELRELEASE),$(KERNELRELEASE),$(KVERSION))
+VERSION_HDR := lib/sc0710-version.h
+SYNC_VERSION := scripts/sync-version-header.sh
+KBUILD_DIR = /lib/modules/$(KERNEL_VER)/build
+MODULE_OUTPUT_DIR := $(CURDIR)/build
 
 # Auto-detect kernel compiler.
 # Modern distributions correctly use the LLVM toolchain.
-# We must force LLVM if the kernel was built with it, explicitly 
+# We must force LLVM if the kernel was built with it, explicitly
 # ignoring legacy GCC variables that DKMS might inject.
 KERNEL_IS_CLANG := $(shell grep -s '^CONFIG_CC_IS_CLANG=y' $(KBUILD_DIR)/.config 2>/dev/null)
 ifneq ($(KERNEL_IS_CLANG),)
   $(info Auto-detected Clang-built kernel, forcing LLVM toolchain)
-  CC = clang
-  LLVM = 1
+  KBUILD_CC = CC=clang LLVM=1
 endif
 
-all:
-	make -C $(KBUILD_DIR) M=$(PWD) MO=$(PWD)/build EXTRA_CFLAGS="-DSC0710_DRV_VERSION_RAW=$(VERSION)" $(if $(LLVM),CC=$(CC) LLVM=$(LLVM)) modules
+$(VERSION_HDR): version $(SYNC_VERSION)
+	bash "$(SYNC_VERSION)"
+
+all: $(VERSION_HDR)
+	@mkdir -p "$(MODULE_OUTPUT_DIR)"
+	$(MAKE) -C "$(KBUILD_DIR)" M="$(CURDIR)" MO="$(MODULE_OUTPUT_DIR)" $(KBUILD_CC) modules
 	@# Fallback for kernels < 6.13 where MO= is not supported:
 	@# the .ko ends up at the source root instead of build/.
-	@mkdir -p build
-	@if [ -f sc0710.ko ] && [ ! -f build/sc0710.ko ]; then \
-		cp sc0710.ko build/sc0710.ko; \
+	@if [ -f "$(CURDIR)/sc0710.ko" ] && [ ! -f "$(MODULE_OUTPUT_DIR)/sc0710.ko" ]; then \
+		cp "$(CURDIR)/sc0710.ko" "$(MODULE_OUTPUT_DIR)/sc0710.ko"; \
 	fi
-clean:
-	rm -rf build/*.o build/*.ko build/*.mod build/*.mod.c build/*.mod.o build/.*.cmd build/.tmp_versions build/lib
-	rm -f sc0710.ko sc0710.o sc0710.mod sc0710.mod.c sc0710.mod.o .module-common.o Module.symvers modules.order .sc0710*.cmd .module-common*.cmd .modules*.cmd
-	rm -rf .tmp_versions
-	make -C $(KBUILD_DIR) M=$(PWD) MO=$(PWD)/build clean 2>/dev/null || true
 
-load:	all
+clean:
+	rm -rf "$(MODULE_OUTPUT_DIR)"/*.o "$(MODULE_OUTPUT_DIR)"/*.ko "$(MODULE_OUTPUT_DIR)"/*.mod \
+		"$(MODULE_OUTPUT_DIR)"/*.mod.c "$(MODULE_OUTPUT_DIR)"/*.mod.o "$(MODULE_OUTPUT_DIR)"/.*.cmd \
+		"$(MODULE_OUTPUT_DIR)"/.tmp_versions "$(MODULE_OUTPUT_DIR)"/lib
+	rm -f sc0710.ko sc0710.o sc0710.mod sc0710.mod.c sc0710.mod.o .module-common.o \
+		Module.symvers modules.order .sc0710*.cmd .module-common*.cmd .modules*.cmd
+	rm -rf .tmp_versions
+	$(MAKE) -C "$(KBUILD_DIR)" M="$(CURDIR)" MO="$(MODULE_OUTPUT_DIR)" clean 2>/dev/null || true
+
+load: all
 	sudo dmesg -c >/dev/null
 	sudo cp /dev/null /var/log/debug
 	#sudo modprobe videobuf2-core
@@ -126,6 +140,8 @@ dvtimings:
 probe:
 	# See https://codecalamity.com/encoding-uhd-4k-hdr10-videos-with-ffmpeg/
 	./ffprobe-hevc -hide_banner -loglevel warning -select_streams v -print_format json -show_frames \
-		-read_intervals "%+#1" -show_entries "frame=color_space,color_primaries,color_transfer,side_data_list,pix_fmt" -i recording.ts 
+		-read_intervals "%+#1" -show_entries "frame=color_space,color_primaries,color_transfer,side_data_list,pix_fmt" -i recording.ts
 
 #yuv422p10le 10bit 4:2:2
+
+endif

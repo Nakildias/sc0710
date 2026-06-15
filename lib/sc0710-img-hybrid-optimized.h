@@ -1,6 +1,12 @@
 #ifndef _SC0710_IMG_OPTIMIZED_H
 #define _SC0710_IMG_OPTIMIZED_H
 
+/*
+ * Status overlay image data for the sc0710 driver.
+ * Modifications Copyright (c) 2025-2026 Nakildias <nakildiaspro@gmail.com>
+ * Licensed under GPL-2.0-or-later. See COPYRIGHT.
+ */
+
 #define STATUS_IMAGE_WIDTH  1920
 #define STATUS_IMAGE_HEIGHT 1080
 

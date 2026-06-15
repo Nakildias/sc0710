@@ -1,6 +1,6 @@
 # Elgato 4K60 Pro MK.2 (1cfa:000e) and Elgato 4K Pro (1cfa:0012) Linux Driver
 
-[![Kernel Compatibility](https://img.shields.io/badge/Kernel-6.12%20--%206.18%2B-blueviolet)](https://github.com/Nakildias/sc0710)
+[![Kernel Compatibility](https://img.shields.io/badge/Kernel-6.12%20--%207.0%2B-blueviolet)](https://github.com/Nakildias/sc0710)
 [![AUR version](https://img.shields.io/aur/version/sc0710-dkms-git?logo=arch-linux)](https://aur.archlinux.org/packages/sc0710-dkms-git)
 [![Status](https://img.shields.io/badge/Status-Maintained-success)](#)
 [![GitHub last commit](https://img.shields.io/github/last-commit/Nakildias/sc0710)](https://github.com/Nakildias/sc0710/commits/main)
@@ -9,39 +9,96 @@
 [![GitHub stars](https://img.shields.io/github/stars/Nakildias/sc0710?style=flat)](https://github.com/Nakildias/sc0710/stargazers)
 [![GitHub issues](https://img.shields.io/github/issues/Nakildias/sc0710)](https://github.com/Nakildias/sc0710/issues)
 
-High-performance, multi-client Linux driver for the Elgato 4K60 Pro MK.2 and Elgato 4K Pro PCI-e capture card. Engineered for stability on modern kernels (6.12+).
-*For older kernels, please use the original [stoth68000/sc0710](https://github.com/stoth68000/sc0710) repository (Only for MK.2).*
+High-performance, multi-client Linux driver for the Elgato 4K60 Pro MK.2 and Elgato 4K Pro PCI-e capture cards. Engineered for stability on modern kernels (6.12 through 7.0+).
 
-## Kernel Compatibility
+*For older kernels, use the original [stoth68000/sc0710](https://github.com/stoth68000/sc0710) repository (MK.2 only).*
 
-| Distribution | Kernel Version | Status | Notes |
-|--------------|---------------|--------|-------|
-| **Arch Linux** | 6.18.7+ | Stable | Standard configuration. |
-| **Fedora** | 6.17.12+ | Stable | Standard configuration. |
-| **Debian** | 6.12.57+ | Stable | **Warning:** Repository version of OBS may crash. Use Flatpak OBS. |
-| **Fedora Atomic** | 6.17.7+ | **Experimental** | Supported on Bazzite, Bluefin, Aurora, Silverblue. |
+## Supported cards
+
+| Card | Subsystem ID | Notes |
+|------|-------------|-------|
+| **Elgato 4k60 Pro MK.2** | `1cfa:000e` | Plug-and-play after driver load. No FPGA firmware step. |
+| **Elgato 4K Pro** | `1cfa:0012` | Requires **ECP5 FPGA firmware** programming on every **cold boot**. The automatic installer handles this; manual/AUR installs need extra steps (see below). |
+
+Both cards share the same `12ab:0710` Magewell chipset but use different board profiles in the driver.
+
+## Kernel compatibility
+
+| Distribution | Status | Notes |
+|--------------|--------|-------|
+| **Arch Linux** | Stable | DKMS or manual build. AUR package is driver-only (see below). |
+| **Fedora / RHEL** | Stable | DKMS via the automatic installer. |
+| **Debian / Ubuntu** | Stable | **Warning:** distro OBS packages may crash; prefer Flatpak OBS. |
+| **Fedora Atomic** (Bazzite, Bluefin, Aurora, Silverblue) | Stable | Boot-time build service at `/var/lib/sc0710`. No DKMS. 4K Pro ECP5 stack included. |
+| **NixOS** | Supported | Flake module available; firmware stack is simpler than the bash installer (see below). |
+
+Tested on kernel **6.12 through 7.0+**. Newer kernels may work but are not guaranteed until tested.
 
 ## Installation
 
-### Automatic Installation (Recommended)
-Unified installer that auto-detects your distro (Atomic or standard) and runs the appropriate flow. Supported on Arch Linux, Debian/Ubuntu, Fedora, and Fedora Atomic (Bazzite, Silverblue, Bluefin, Aurora).
+### Automatic installation (recommended)
+
+Unified installer — auto-detects atomic vs standard distros. Supported on Arch, Debian/Ubuntu, Fedora, and Fedora Atomic (Bazzite, Silverblue, Bluefin, Aurora).
 
 ```bash
 sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/Nakildias/sc0710/main/scripts/install-sc0710.sh)"
 ```
 
-On Fedora Atomic distros, the installer sets up a boot-time build service instead of DKMS. Both the above URL and `atomic-install-sc0710.sh` work (they use the same unified script).
+**Standard distros** get DKMS (optional) or a manual module build, `sc0710-cli`, and boot-time module loading via `modules-load.d`.
+
+**Atomic distros** get:
+- Driver source at `/var/lib/sc0710/` (persists across `rpm-ostree` updates)
+- `sc0710-build.service` — rebuilds and loads the module on each boot
+- `sc0710-cli` with atomic-specific commands (`--rebuild`, etc.)
+
+**4K Pro on any distro** additionally gets:
+- Automatic download/extraction of `SC0710.FWI.HEX` from the Elgato Windows driver
+- `sc0710-firmware.service` — prepares firmware files and symlinks before driver load
+- `sc0710-firmware-verify.service` — verifies ECP5 programming after the module loads, with automatic retries
+
+### 4K Pro ECP5 firmware (cold boot)
+
+The 4K Pro has a Lattice ECP5 FPGA whose configuration is **volatile** — it is lost on full power-off / cold boot. Windows programs it on every boot; this driver does the same.
+
+**Symptoms when ECP5 is not programmed:**
+- HDMI input shows as locked/detected
+- Video is black
+- `dmesg` has no `ECP5 FPGA programmed` message
+
+**After automatic install**, boot services handle programming. If video is still black:
+
+```bash
+sudo sc0710-cli --restart
+# or
+sudo bash /var/lib/sc0710/sc0710-firmware.sh --verify          # atomic
+sudo bash /usr/local/libexec/sc0710-firmware.sh --verify     # standard
+```
+
+Existing atomic installs can pick up the latest firmware stack with:
+
+```bash
+sudo sc0710-cli --update
+```
 
 ### Arch Linux (AUR)
-Install `sc0710-dkms-git` using your preferred helper. Note that the CLI utility is not currently included in the AUR package.
 
 ```bash
 yay -S sc0710-dkms-git
 ```
 
+The AUR package installs **only the DKMS kernel module**. It does **not** include:
+- `sc0710-cli`
+- ECP5 firmware extraction or programming scripts
+- `sc0710-firmware` / `sc0710-firmware-verify` services
+
+**MK.2 users** on Arch can use the AUR package and load with `sudo modprobe sc0710`.
+
+**4K Pro users** on Arch should use the **automatic installer** instead, or manually place `SC0710.FWI.HEX` in `/lib/firmware/sc0710/` and handle cold-boot programming yourself.
+
 ### NixOS (flakes)
 
-In your system flake, add `github:Nakildias/sc0710` as an input, and import the module `sc0710.nixosModules.default`.
+Add `github:Nakildias/sc0710` as a flake input and import `sc0710.nixosModules.default`:
+
 ```nix
 {
   inputs = {
@@ -50,9 +107,7 @@ In your system flake, add `github:Nakildias/sc0710` as an input, and import the 
   };
 
   outputs = { self, nixpkgs, sc0710 }: {
-    # replace <your-hostname> with your actual hostname
     nixosConfigurations.<your-hostname> = nixpkgs.lib.nixosSystem {
-      # ...
       modules = [
         # ...
         sc0710.nixosModules.default
@@ -62,70 +117,122 @@ In your system flake, add `github:Nakildias/sc0710` as an input, and import the 
 }
 ```
 
-In your host configuration, you can use following options:
+Host configuration:
+
 ```nix
-# enable the kernel module and `sc0710-cli` script
-hardware.sc0710.enable = true;
-
-# enable automatic firmware updates with the systemd service
-hardware.sc0710.enableFirmware = true;
-
-# if, for whatever reason, you need to override the kernel version that the module is built for.
-# default is your current kernel (what `boot.kernelPackages.kernel` is set to)
-#hardware.sc0710.kernel = pkgs.linuxPackages_6_19.kernel;
+hardware.sc0710.enable = true;          # kernel module + sc0710-cli
+hardware.sc0710.enableFirmware = true;  # basic firmware oneshot service
+# hardware.sc0710.kernel = pkgs.linuxPackages_6_19.kernel;  # optional override
 ```
 
-### Manual Compilation
-For other distributions or development usage.
+**Note:** The NixOS module builds the driver and installs `sc0710-cli`, but its firmware service is a single oneshot unit — it does not include the full ECP5 verify/retry stack that the bash installer provides for atomic distros. **4K Pro users on NixOS** may need manual intervention after cold boot until the Nix module is brought up to parity.
 
-1.  **Install Dependencies**
-    *   **Arch Linux:** `sudo pacman -S base-devel linux-headers git dkms`
-    *   **Debian/Ubuntu:** `apt install build-essential linux-headers-$(uname -r) git dkms`
-    *   **Fedora/RHEL:** `dnf install kernel-modules-$(uname -r) kernel-devel kernel-headers gcc make git dkms`
-2.  **Build and Load**
-    ```bash
-    git clone https://github.com/Nakildias/sc0710
-    cd sc0710
-    make
-    sudo insmod build/sc0710.ko
-    ```
+### Manual compilation
 
-## Driver Management (CLI)
-The `sc0710-cli` tool (installed via the automatic script) provides real-time control.
+For development or unsupported distros.
 
-| Command | Description |
+1. **Install dependencies**
+   - **Arch:** `sudo pacman -S base-devel linux-headers git`
+   - **Debian/Ubuntu:** `sudo apt install build-essential linux-headers-$(uname -r) git`
+   - **Fedora/RHEL:** `sudo dnf install kernel-modules-$(uname -r) kernel-devel kernel-headers gcc make git`
+
+2. **Build and load**
+   ```bash
+   git clone https://github.com/Nakildias/sc0710
+   cd sc0710
+   make
+   sudo insmod build/sc0710.ko
+   ```
+
+3. **4K Pro only** — `insmod` alone is not enough on cold boot. You also need:
+   - `SC0710.FWI.HEX` in `/lib/firmware/sc0710/` (extract with `scripts/extract-firmware.sh`)
+   - Reload the module after cold boot so the driver can program the ECP5, or use the automatic installer
+
+## Driver management (`sc0710-cli`)
+
+Installed by the automatic installer and the NixOS module. Provides real-time control on both atomic and standard distros.
+
+| Command | Alias | Description |
+|---------|-------|-------------|
+| `--status` | `-s` | Module state, card info, signal format, scaler, ECP5 status (4K Pro), DKMS or build service status |
+| `--load` | `-l` | Load the module. On 4K Pro, verifies ECP5 programming after load |
+| `--unload` | `-u` | Unload the module (stops PipeWire consumers if the module is busy) |
+| `--restart` | | Full reload. On 4K Pro, runs ECP5 programming with retries |
+| `--debug` | `-d` | Toggle verbose `dmesg` logging |
+| `--image-toggle` | `-it` | Toggle No Signal images vs colorbars |
+| `--software-scaler` | `-ss` | Toggle software scaler modes (all cards) |
+| `--toggle-auto-scalar` | `-as` | Toggle automatic safety scaler |
+| `--procedural-timings` | `-pt` | Cycle timing mode: merge → procedural-only → static-only |
+| `--update` | `-U` | Pull latest source, rebuild, reload. Refreshes firmware services on 4K Pro |
+| `--rebuild` | | *(Atomic only)* Force rebuild the module for the running kernel |
+| `--dump` | | Save a debug report to the Desktop (`dump-DD-MM-YYYY.txt`) for GitHub issues |
+| `--remove` | `-r`, `-R` | Uninstall driver, CLI, services, config files, and 4K Pro firmware |
+| `--version` | `-v` | Show installed driver version |
+| `--help` | `-h` | Show all options |
+
+After `sc0710-cli --remove`, verify everything is gone:
+
+```bash
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/Nakildias/sc0710/main/scripts/check-sc0710-removal.sh)"
+```
+
+### Verify complete removal
+
+Same command as above — checks module, DKMS, CLI, systemd units, config files, logs, and 4K Pro firmware. No clone or sudo required. Exits `0` when fully clean.
+
+## Features
+
+* **Multi-client support** — multiple apps (e.g. OBS + Discord) can open the device simultaneously
+* **DKMS integration** — automatic rebuilds on kernel updates (standard distros)
+* **Atomic / immutable support** — boot-time rebuild via `sc0710-build.service` (Bazzite, Silverblue, etc.)
+* **4K Pro ECP5 auto-programming** — firmware extraction, cold-boot programming, verify service, and CLI retries
+* **Status images** — storage-efficient No Signal / No Device screens
+* **Connection sensing** — distinguishes unplugged cables from signal loss (not 100% reliable)
+* **Video formats** — 4K60, 1440p144, 1080p240 (EDID changes require Windows)
+* **Mode-switch stability** — DMA resync, restart validation, and watchdog recovery during resolution/refresh changes
+* **Safety scaling** — auto-scaler and dynamic-resolution paths reduce crash-prone transitions
+* **Timing controls** — runtime modes (`merge`, `procedural-only`, `static-only`) via CLI
+* **Debug dumps** — `sc0710-cli --dump` collects distro, kernel, `lspci`, driver version, and service state for issue reports
+
+## Troubleshooting
+
+| Problem | What to try |
 |---------|-------------|
-| `sc0710-cli --status` | Show signal format, DKMS status, and module state. |
-| `sc0710-cli --load` | Load the kernel module. |
-| `sc0710-cli --unload` | Unload the kernel module (safely checks for usage). |
-| `sc0710-cli --restart` | Reload the module. |
-| `sc0710-cli --debug` | Toggle verbose dmesg logging. |
-| `sc0710-cli --image-toggle` | Toggle between No Signal images and Colorbars. |
-| `sc0710-cli --software-scaler` | Toggle software scaler modes (all cards). |
-| `sc0710-cli --toggle-auto-scalar` | Toggle automatic safety scaler on/off. |
-| `sc0710-cli --procedural-timings` | Toggle timing mode (`merge`, `procedural-only`, `static-only`). |
-| `sc0710-cli --update` | Pull latest code and rebuild. |
-| `sc0710-cli --remove` | Completely uninstall driver and CLI. |
-| `sc0710-cli --version` | Show installed driver version. |
-| `sc0710-cli --help` | Show usage information. |
+| **4K Pro: signal locked, black video** (cold boot) | `sudo sc0710-cli --restart` or `sudo sc0710-cli --update` then reboot |
+| **4K Pro: ECP5 warning in `--status`** | `sudo bash …/sc0710-firmware.sh --verify` (path above) |
+| **Module won't unload** (app in use) | `sc0710-cli --unload` stops PipeWire first; close OBS/etc. |
+| **Atomic: module not built after kernel update** | `sudo sc0710-cli --rebuild` or check `journalctl -u sc0710-build.service -b` |
+| **Driver still present after `--remove`** | Run `sudo sc0710-cli --remove` again, then the [removal check script](#verify-complete-removal) |
+| **4K60 tearing / frame shifts** at max bandwidth | Under investigation; try lower resolution/refresh or close extra consumers in the meantime |
 
-## Features & capabilities
-*   **Multi-Client Support:** Direct access for multiple simultaneous applications (e.g., OBS + Discord).
-*   **DKMS Integration:** Automatically rebuilds on kernel updates (Standard distros).
-*   **Atomic Support:** Custom systemd service for boot-time rebuilds on immutable/atomic distros (Bazzite, etc.).
-*   **Status Images:** Storage-efficient implementation of "No Signal" / "No Device" screens.
-*   **Connection Sensing:** Distinguishes between unplugged cables and signal loss (not 100% reliable).
-*   **Video Formats:** Supports 4K60, 1440p144, 1080p240 (requires Windows to change the EDID).
-*   **Mode-Switch Stability:** Atomic DMA resync, restart validation, and watchdog recovery significantly improve resolution/refresh switching while apps are open.
-*   **Safety Scaling Paths:** Auto-scaler and dynamic-resolution compatibility keep streams alive during geometry mismatches and reduce crash-prone transitions.
-*   **Timing Controls:** Runtime timing calculation modes (`merge`, `procedural-only`, `static-only`) via CLI.
+For GitHub issues, attach output from `sc0710-cli --dump`.
 
-## Known Limitations / Roadmap
-*   **HDR Tonemapping (On Hold):** Requires opaque I2C commands to onboard ARM MCU.
-*   **10-bit Pixel Format (On Hold):** Hardware register map for P010/P016 unknown.
-*   **EDID Switching (On Hold):** EEPROM write protocol unknown. (Workaround: Set EDID in Windows first).
+## Known limitations / roadmap
 
-## Credits
-* ### Based on original reverse engineering by **[Steven Toth (@stoth68000)](https://github.com/stoth68000)** and subsequent work by **[@Subtixx](https://github.com/Subtixx)**.
+* **4K60 DMA tearing** — horizontal tears or frame shifts at 4K60 (~995 MB/s) under heavy load; **under active investigation**
+* **HDR tonemapping (on hold)** — requires opaque I2C commands to the onboard ARM MCU
+* **10-bit pixel format (on hold)** — P010/P016 register map unknown
+* **EDID switching (on hold)** — EEPROM write protocol unknown; set EDID in Windows first
 
-* ### Thanks to **[Onhil (@Onhil)](https://github.com/Onhil)** for his work on the Elgato 4K Pro
+## Help wanted
+
+Maintainer **[Nakildias](https://github.com/Nakildias)** only has an **Elgato 4k60 Pro MK.2** available for hands-on testing. That limits how much can be validated on other hardware.
+
+Contributions and testing help are especially welcome for:
+
+* **Elgato 4K Pro** — ECP5 cold-boot behavior, atomic/Bazzite installs, and general capture stability
+* **Unsupported cards** — other `12ab:0710` subsystem IDs (e.g. HD60 Pro) that are not yet fully supported
+* **Open issues** — bugs that need reproduction on hardware the maintainer does not own (4K60 tearing, edge-case distros, etc.)
+
+If you can test, debug, or submit patches for any of the above, please [open an issue](https://github.com/Nakildias/sc0710/issues) or a pull request. Include `sc0710-cli --dump` output when reporting problems.
+
+## Credits and copyright
+
+This fork is maintained by **[Nakildias](https://github.com/Nakildias)** (`nakildiaspro@gmail.com`).
+
+* Based on original reverse engineering by **[Steven Toth (@stoth68000)](https://github.com/stoth68000)** and subsequent work by **[@Subtixx](https://github.com/Subtixx)**.
+* Thanks to **[Onhil (@Onhil)](https://github.com/Onhil)** for work on the Elgato 4K Pro.
+
+The kernel module is a derivative of Steven Toth's sc0710 driver (GPL v2). Original copyright notices are preserved in source files; modifications in this fork are attributed separately. Installer scripts are original work in this repository. See **[COPYRIGHT](COPYRIGHT)** for details.
+
+This project is not affiliated with or endorsed by Elgato, Magewell, or Kernel Labs.

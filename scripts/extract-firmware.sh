@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# Copyright (C) 2025-2026 Nakildias <nakildiaspro@gmail.com>
+# SPDX-License-Identifier: GPL-2.0-or-later
+#
 # Extract ECP5 firmware from the Elgato 4K Pro Windows driver installer.
 # Unified script for both Atomic and Non-Atomic distros.
 #
@@ -159,12 +162,11 @@ if [[ "$DISTRO_TYPE" == "atomic" ]]; then
     chcon -t firmware_t "$FIRMWARE_STORE/$FIRMWARE_FILE" 2>/dev/null || true
     msg2 "Firmware stored at: $FIRMWARE_STORE/$FIRMWARE_FILE"
 
-    # Create symlink for kernel firmware loader
-    if [[ ! -d "/lib/firmware/sc0710" ]]; then
-        mkdir -p "/etc/firmware/sc0710"
-        ln -sf "$FIRMWARE_STORE/$FIRMWARE_FILE" "/etc/firmware/sc0710/$FIRMWARE_FILE"
-        msg2 "Symlink created: /etc/firmware/sc0710/$FIRMWARE_FILE -> $FIRMWARE_STORE/$FIRMWARE_FILE"
-    fi
+    # Symlink for the kernel firmware loader on immutable distros
+    mkdir -p "/etc/firmware/sc0710"
+    ln -sfn "$FIRMWARE_STORE/$FIRMWARE_FILE" "/etc/firmware/sc0710/$FIRMWARE_FILE"
+    chcon -h -t firmware_t "/etc/firmware/sc0710/$FIRMWARE_FILE" 2>/dev/null || true
+    msg2 "Symlink created: /etc/firmware/sc0710/$FIRMWARE_FILE -> $FIRMWARE_STORE/$FIRMWARE_FILE"
 else
     mkdir -p "$FIRMWARE_DIR"
     cp "$SRC" "$FIRMWARE_DIR/$FIRMWARE_FILE"

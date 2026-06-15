@@ -1,7 +1,8 @@
 /*
- *  Driver for the Elgato 4k60 Pro mk.2 HDMI capture card.
+ *  Driver for the Elgato 4k60 Pro MK.2 and Elgato 4K Pro HDMI capture cards.
  *
  *  Copyright (c) 2021-2022 Steven Toth <stoth@kernellabs.com>
+ *  Modifications Copyright (c) 2025-2026 Nakildias <nakildiaspro@gmail.com>
  *
  *  This program is free software; you can redistribute it and/or modify
  *  it under the terms of the GNU General Public License as published by
@@ -67,11 +68,10 @@
 #endif
 
 #include "sc0710-reg.h"
+#include "sc0710-version.h"
 
 #define SC0710_VERSION_CODE KERNEL_VERSION(1, 0, 0)
-#ifndef SC0710_DRV_VERSION
-#define SC0710_DRV_VERSION "0.0.0.0-unknown"
-#endif
+#define SC0710_DRV_VERSION SC0710_DRV_VERSION_STRING
 
 /* Global debug mode - extern declaration for use in all source files */
 extern unsigned int sc0710_debug_mode;
@@ -373,6 +373,9 @@ struct sc0710_audio_dev
 	struct  snd_card          *card;
 	snd_pcm_uframes_t          buffer_ptr;
 	snd_pcm_uframes_t          period_pos;
+	bool                       running;
+	bool                       silence_active;
+	struct timer_list          silence_timer;
 };
 
 struct sc0710_dev {
@@ -561,6 +564,8 @@ int  sc0710_audio_register(struct sc0710_dev *dev);
 void sc0710_audio_unregister(struct sc0710_dev *dev);
 int  sc0710_audio_deliver_samples(struct sc0710_dev *dev, struct sc0710_dma_channel *ch,
         const u8 *buf, int bitdepth, int strideBytes, int channels, int samplesPerChannel);
+void sc0710_audio_on_signal_lost(struct sc0710_dev *dev);
+void sc0710_audio_on_signal_restored(struct sc0710_dev *dev);
 
 /* -scaler.c (software scaler) */
 bool sc0710_software_scaler_allowed(const struct sc0710_dev *dev);

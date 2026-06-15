@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# Copyright (C) 2025-2026 Nakildias <nakildiaspro@gmail.com>
+# SPDX-License-Identifier: GPL-2.0-or-later
 #
 # SC0710 Driver Installer - Unified for Atomic and Non-Atomic distros
 #
@@ -131,6 +133,64 @@ verify_essential_files() {
         return 1
     fi
     return 0
+}
+
+install_4k_pro_firmware_stack() {
+    local fw_script="$1"
+    local fw_lib="$2"
+    local verify_after="${3:-sc0710-build.service}"
+    local src_root="${4:-}"
+
+    [[ -z "$src_root" ]] && src_root="${SOURCE:-/var/lib/sc0710}"
+
+    [[ -f "$src_root/scripts/sc0710-firmware.sh" ]] && cp "$src_root/scripts/sc0710-firmware.sh" "$fw_script" && chmod +x "$fw_script"
+    [[ -f "$src_root/scripts/sc0710-firmware-lib.sh" ]] && cp "$src_root/scripts/sc0710-firmware-lib.sh" "$fw_lib" && chmod +x "$fw_lib"
+
+    if [[ ! -x "$fw_script" || ! -f "$fw_lib" ]]; then
+        warning "Firmware scripts missing; 4K Pro ECP5 auto-programming may not work."
+        return 1
+    fi
+
+    cat > "/etc/systemd/system/sc0710-firmware.service" <<FWEOF
+[Unit]
+Description=SC0710 4K Pro ECP5 Firmware Preparation
+After=local-fs.target systemd-udev-settle.service
+Before=${verify_after} sc0710-firmware-verify.service
+ConditionPathExists=${fw_script}
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash ${fw_script}
+RemainAfterExit=yes
+TimeoutStartSec=180
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+FWEOF
+
+    cat > "/etc/systemd/system/sc0710-firmware-verify.service" <<FWVEOF
+[Unit]
+Description=SC0710 4K Pro ECP5 Firmware Verify
+After=${verify_after} sc0710-firmware.service
+ConditionPathExists=${fw_script}
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash ${fw_script} --verify
+RemainAfterExit=yes
+TimeoutStartSec=300
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+FWVEOF
+
+    systemctl daemon-reload
+    systemctl enable sc0710-firmware.service sc0710-firmware-verify.service
+    log "Installed sc0710-firmware.service and sc0710-firmware-verify.service"
 }
 
 confirm() {
@@ -314,11 +374,14 @@ if [[ "$NEEDS_LAYER" == "true" ]]; then
     echo ""
 
     if confirm "Layer build dependencies now?" "Y"; then
-        msg2 "Layering packages via rpm-ostree..."
-        if ! rpm-ostree install --idempotent --allow-inactive "${LAYER_PKGS[@]}" 2>&1 | tee -a "$LOG_FILE"; then
-            error "Failed to layer packages via rpm-ostree."
-            echo -e "  ${YELLOW}Try manually:${NC} ${BOLD}sudo rpm-ostree install ${LAYER_PKGS[*]}${NC}"
-            exit 1
+        msg2 "Layering packages via rpm-ostree (apply-live, no reboot if possible)..."
+        if ! rpm-ostree install --apply-live --idempotent --allow-inactive "${LAYER_PKGS[@]}" 2>&1 | tee -a "$LOG_FILE"; then
+            warning "apply-live failed; trying staged ostree install (may require reboot)..."
+            if ! rpm-ostree install --idempotent --allow-inactive "${LAYER_PKGS[@]}" 2>&1 | tee -a "$LOG_FILE"; then
+                error "Failed to layer packages via rpm-ostree."
+                echo -e "  ${YELLOW}Try manually:${NC} ${BOLD}sudo rpm-ostree install --apply-live ${LAYER_PKGS[*]}${NC}"
+                exit 1
+            fi
         fi
         log "rpm-ostree install completed for: ${LAYER_PKGS[*]}"
 
@@ -502,59 +565,14 @@ else
 fi
 
 # --- 5.6. Firmware Service (4K Pro only) ---
-# Install a systemd service that ensures the ECP5 firmware file is present
-# on every boot and triggers a driver reload if the FPGA wasn't programmed.
 if lspci -n -v -d 12ab:0710 2>/dev/null | grep -qi "1cfa:0012"; then
-    if systemctl is-enabled sc0710-firmware.service >/dev/null 2>&1; then
-        msg2 "4K Pro firmware service already installed and enabled"
-    else
-        msg "4K Pro detected — installing firmware service..."
-
-        if [[ "$IS_ATOMIC" == "true" ]]; then
-            FW_SERVICE_SCRIPT="/var/lib/sc0710/sc0710-firmware.sh"
-        else
-            FW_SERVICE_SCRIPT="/usr/local/libexec/sc0710-firmware.sh"
-            mkdir -p "$(dirname "$FW_SERVICE_SCRIPT")"
-        fi
-        FW_SERVICE_SCRIPT_SRC="$SOURCE/scripts/sc0710-firmware.sh"
-        if [[ -f "$FW_SERVICE_SCRIPT_SRC" ]]; then
-            cp "$FW_SERVICE_SCRIPT_SRC" "$FW_SERVICE_SCRIPT"
-        elif [[ -f "./scripts/sc0710-firmware.sh" ]]; then
-            cp "./scripts/sc0710-firmware.sh" "$FW_SERVICE_SCRIPT"
-        else
-            warning "scripts/sc0710-firmware.sh not found in source tree."
-            FW_SERVICE_SCRIPT=""
-        fi
-
-        if [[ -n "$FW_SERVICE_SCRIPT" ]]; then
-            chmod +x "$FW_SERVICE_SCRIPT"
-
-            cat > "/etc/systemd/system/sc0710-firmware.service" <<FWEOF
-[Unit]
-Description=SC0710 4K Pro ECP5 Firmware Loader
-After=local-fs.target network-online.target
-Wants=network-online.target
-Before=sc0710-build.service
-ConditionPathExists=$FW_SERVICE_SCRIPT
-
-[Service]
-Type=oneshot
-ExecStart=/bin/bash $FW_SERVICE_SCRIPT
-RemainAfterExit=yes
-TimeoutStartSec=120
-StandardOutput=journal
-StandardError=journal
-
-[Install]
-WantedBy=multi-user.target
-FWEOF
-
-            systemctl daemon-reload
-            systemctl enable sc0710-firmware.service
-            msg2 "Firmware service enabled: sc0710-firmware.service"
-            log "Created and enabled sc0710-firmware.service"
-        fi
-    fi
+    msg "4K Pro detected — installing firmware services..."
+    install_4k_pro_firmware_stack \
+        "/var/lib/sc0710/sc0710-firmware.sh" \
+        "/var/lib/sc0710/sc0710-firmware-lib.sh" \
+        "sc0710-build.service" \
+        "$SOURCE"
+    msg2 "4K Pro firmware services installed (atomic)."
 else
     log "No 4K Pro card detected, skipping firmware service installation"
 fi
@@ -563,105 +581,13 @@ fi
 msg "Creating boot-time build script..."
 
 BUILD_SCRIPT="/var/lib/sc0710/build-and-load.sh"
-cat > "$BUILD_SCRIPT" <<'BUILDEOF'
-#!/bin/bash
-#
-# SC0710 Boot-time Build and Load Script
-# Called by systemd on every boot to compile the driver against the running kernel.
-#
-
-set -eo pipefail
-export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
-
-DRV_NAME="sc0710"
-SRC_DIR="/var/lib/sc0710"
-KERNEL_VER="$(uname -r)"
-LOG_FILE="/var/log/sc0710/build_$(date '+%Y%m%d_%H%M%S').log"
-
-mkdir -p /var/log/sc0710
-
-log() { echo "$*" >> "$LOG_FILE"; echo "$*"; }
-
-log "=== SC0710 boot-time build started ==="
-log "Kernel: $KERNEL_VER"
-log "Timestamp: $(date)"
-
-# Verify source directory exists
-if [[ ! -d "$SRC_DIR" || ! -f "$SRC_DIR/Makefile" ]]; then
-    log "ERROR: Source directory $SRC_DIR is missing or incomplete."
-    exit 1
-fi
-
-# Verify kernel headers exist
-if [[ ! -d "/lib/modules/${KERNEL_VER}/build" ]]; then
-    log "ERROR: Kernel headers for $KERNEL_VER are missing."
-    log "Run: sudo rpm-ostree install kernel-devel"
-    exit 1
-fi
-
-# Check if the module is already built for this exact kernel
-BUILT_MOD="$SRC_DIR/build/${DRV_NAME}.ko"
-STAMP_FILE="$SRC_DIR/.built-for-kernel"
-
-# cd into source dir — the Makefile uses M=$(PWD) which must resolve to the source tree
-cd "$SRC_DIR"
-
-if [[ -f "$BUILT_MOD" && -f "$STAMP_FILE" ]]; then
-    LAST_KERNEL=$(cat "$STAMP_FILE")
-    if [[ "$LAST_KERNEL" == "$KERNEL_VER" ]]; then
-        log "Module already built for kernel $KERNEL_VER, skipping rebuild."
-    else
-        log "Kernel changed ($LAST_KERNEL -> $KERNEL_VER), rebuilding..."
-        make clean 2>/dev/null || true
-        make KVERSION="$KERNEL_VER" -j"$(nproc)" >> "$LOG_FILE" 2>&1
-        echo "$KERNEL_VER" > "$STAMP_FILE"
-    fi
+if [[ -f "$SOURCE/scripts/build-and-load.sh" ]]; then
+    cp "$SOURCE/scripts/build-and-load.sh" "$BUILD_SCRIPT"
+    chmod +x "$BUILD_SCRIPT"
+    log "Installed build script from source: $BUILD_SCRIPT"
 else
-    log "Building module for kernel $KERNEL_VER..."
-    make clean 2>/dev/null || true
-    make KVERSION="$KERNEL_VER" -j"$(nproc)" >> "$LOG_FILE" 2>&1
-    echo "$KERNEL_VER" > "$STAMP_FILE"
+    warning "scripts/build-and-load.sh not found in source tree."
 fi
-
-# Set SELinux context so insmod works from a systemd service.
-# Files in /var/lib/ have var_lib_t context by default, which restricted domains
-# (like systemd services) cannot load as kernel modules. Kernel modules require
-# modules_object_t context.
-chcon -t modules_object_t "$SRC_DIR/build/${DRV_NAME}.ko" 2>/dev/null || true
-
-log "Module built at $SRC_DIR/build/${DRV_NAME}.ko"
-
-# Load dependency modules (these are part of the immutable kernel image, modprobe works)
-for dep in videodev videobuf2-common videobuf2-v4l2 videobuf2-vmalloc snd-pcm; do
-    modprobe "$dep" 2>/dev/null || log "WARNING: Failed to load dependency: $dep"
-done
-
-# Load the driver via insmod with retry logic.
-# At boot, the V4L2/media subsystem may still be initializing after modprobe returns.
-# Retry up to 5 times with increasing delays to handle this race condition.
-LOADED=false
-for attempt in 1 2 3; do
-    if insmod "$SRC_DIR/build/${DRV_NAME}.ko" 2>>"$LOG_FILE"; then
-        LOADED=true
-        break
-    fi
-    log "insmod attempt $attempt failed, retrying in ${attempt}s..."
-    sleep "$attempt"
-done
-
-if [[ "$LOADED" == "true" ]]; then
-    log "Driver loaded successfully."
-else
-    log "ERROR: Failed to load driver module after 3 attempts."
-    log "Recent kernel messages:"
-    dmesg | tail -15 >> "$LOG_FILE"
-    exit 1
-fi
-
-log "=== SC0710 boot-time build completed ==="
-BUILDEOF
-chmod +x "$BUILD_SCRIPT"
-log "Created build script: $BUILD_SCRIPT"
 
 # --- 7. Create the systemd service ---
 msg "Creating systemd service for boot-time module build..."
@@ -699,7 +625,8 @@ msg "Configuring module parameters..."
 
 cat > "/etc/modprobe.d/${DRV_NAME}.conf" <<EOF
 # Parameter persistence for sc0710 (loaded via insmod by sc0710-build.service)
-# softdep is informational only; actual dependency loading is handled by the build script.
+# Blacklist stops stale copies under /lib/modules/extra/ from loading at boot (ostree read-only).
+blacklist $DRV_NAME
 softdep $DRV_NAME pre: videodev videobuf2-v4l2 videobuf2-vmalloc videobuf2-common snd-pcm
 EOF
 log "Module parameters configured"
@@ -776,8 +703,39 @@ if [[ ${#FAILED_DEPS[@]} -gt 0 ]]; then
     log "ERROR: Failed to load kernel modules: ${FAILED_DEPS[*]}"
 fi
 
-# Load the driver via insmod (cannot use modprobe — /lib/modules/ is read-only)
-if ! DRIVER_ERR=$(insmod "$SRC_DIR/build/${DRV_NAME}.ko" 2>&1); then
+# Load the driver (4K Pro uses ECP5-aware loader with retries)
+if [[ -f "$SRC_DIR/sc0710-firmware-lib.sh" ]]; then
+    # shellcheck source=/dev/null
+    SC0710_FW_LOG_FILE="$LOG_FILE" source "$SRC_DIR/sc0710-firmware-lib.sh"
+    sc0710_init_firmware_paths
+    sc0710_clear_stale_kernel_registration
+    log "Cleared stale kernel module registrations (if any)"
+fi
+
+if lspci -n -v -d 12ab:0710 2>/dev/null | grep -qi "1cfa:0012" && [[ -f "$SRC_DIR/sc0710-firmware-lib.sh" ]]; then
+    # shellcheck source=/dev/null
+    SC0710_FW_LOG_FILE="$LOG_FILE" source "$SRC_DIR/sc0710-firmware-lib.sh"
+    sc0710_init_firmware_paths
+    if sc0710_ensure_ecp5_programmed 3; then
+        msg2 "Driver loaded and ECP5 FPGA programmed."
+    else
+        warning "ECP5 programming failed during install. Check: journalctl -u sc0710-build.service -b"
+        warning "Try after reboot: sudo sc0710-cli --restart"
+    fi
+elif ! DRIVER_ERR=$(insmod "$SRC_DIR/build/${DRV_NAME}.ko" 2>&1); then
+    if [[ -f "$SRC_DIR/sc0710-firmware-lib.sh" ]]; then
+        # shellcheck source=/dev/null
+        SC0710_FW_LOG_FILE="$LOG_FILE" source "$SRC_DIR/sc0710-firmware-lib.sh"
+        sc0710_init_firmware_paths
+        sc0710_clear_stale_kernel_registration
+        if sc0710_load_driver; then
+            msg2 "Driver loaded successfully (after clearing stale registration)."
+            DRIVER_ERR=""
+        fi
+    fi
+fi
+
+if [[ -n "${DRIVER_ERR:-}" ]] && ! lsmod | grep -q "^${DRV_NAME}[[:space:]]"; then
     echo ""
     error "Failed to load $DRV_NAME module."
     echo -e "  ${YELLOW}Error: ${DRIVER_ERR}${NC}"
@@ -890,35 +848,13 @@ if lspci -n -v -d 12ab:0710 2>/dev/null | grep -qi "1cfa:0012"; then
         msg "4K Pro detected — extracting ECP5 firmware..."
         [[ -f "$SOURCE/scripts/extract-firmware.sh" ]] && bash "$SOURCE/scripts/extract-firmware.sh" && msg2 "Firmware extracted." || warning "Firmware extraction failed."
     fi
-    if ! systemctl is-enabled sc0710-firmware.service >/dev/null 2>&1; then
-        msg "4K Pro — installing firmware service..."
-        FW_SERVICE_SCRIPT="/usr/local/libexec/sc0710-firmware.sh"
-        mkdir -p "$(dirname "$FW_SERVICE_SCRIPT")"
-        [[ -f "$SOURCE/scripts/sc0710-firmware.sh" ]] && cp "$SOURCE/scripts/sc0710-firmware.sh" "$FW_SERVICE_SCRIPT" && chmod +x "$FW_SERVICE_SCRIPT"
-        if [[ -f "$FW_SERVICE_SCRIPT" ]]; then
-            cat > /etc/systemd/system/sc0710-firmware.service << 'FWSVC'
-[Unit]
-Description=SC0710 4K Pro ECP5 Firmware Loader
-After=local-fs.target network-online.target
-Wants=network-online.target
-Before=sc0710-build.service
-ConditionPathExists=/usr/local/libexec/sc0710-firmware.sh
-
-[Service]
-Type=oneshot
-ExecStart=/bin/bash /usr/local/libexec/sc0710-firmware.sh
-RemainAfterExit=yes
-TimeoutStartSec=120
-StandardOutput=journal
-StandardError=journal
-
-[Install]
-WantedBy=multi-user.target
-FWSVC
-            systemctl daemon-reload
-            systemctl enable sc0710-firmware.service
-        fi
-    fi
+    msg "4K Pro detected — installing firmware services..."
+    mkdir -p "/usr/local/libexec"
+    install_4k_pro_firmware_stack \
+        "/usr/local/libexec/sc0710-firmware.sh" \
+        "/usr/local/libexec/sc0710-firmware-lib.sh" \
+        "systemd-modules-load.service" \
+        "$SOURCE"
 fi
 
 USE_DKMS=false
@@ -952,7 +888,16 @@ echo 'softdep sc0710 pre: videodev videobuf2-v4l2 videobuf2-vmalloc videobuf2-co
 
 msg2 "Loading module..."
 for dep in videodev videobuf2-common videobuf2-v4l2 videobuf2-vmalloc snd-pcm; do modprobe "$dep" 2>/dev/null || true; done
-if ! DRIVER_ERR=$(modprobe "$DRV_NAME" 2>&1); then
+if lspci -n -v -d 12ab:0710 2>/dev/null | grep -qi "1cfa:0012" && [[ -f "/usr/local/libexec/sc0710-firmware-lib.sh" ]]; then
+    # shellcheck source=/dev/null
+    SC0710_FW_LOG_FILE="$LOG_FILE" source "/usr/local/libexec/sc0710-firmware-lib.sh"
+    sc0710_init_firmware_paths
+    if sc0710_ensure_ecp5_programmed 3; then
+        msg2 "Driver loaded and ECP5 FPGA programmed."
+    else
+        warning "ECP5 programming failed. Run: sudo bash /usr/local/libexec/sc0710-firmware.sh --verify"
+    fi
+elif ! DRIVER_ERR=$(modprobe "$DRV_NAME" 2>&1); then
     error "Failed to load $DRV_NAME. Error: $DRIVER_ERR"
     warning "Driver installed but could not be loaded. It may work after a reboot."
 else

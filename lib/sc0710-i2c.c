@@ -1,7 +1,8 @@
 /*
- *  Driver for the Elgato 4k60 Pro mk.2 HDMI capture card.
+ *  Driver for the Elgato 4k60 Pro MK.2 HDMI capture card.
  *
  *  Copyright (c) 2021-2022 Steven Toth <stoth@kernellabs.com>
+ *  Modifications Copyright (c) 2025-2026 Nakildias <nakildiaspro@gmail.com>
  *
  *  This program is free software; you can redistribute it and/or modify
  *  it under the terms of the GNU General Public License as published by
@@ -645,6 +646,9 @@ int sc0710_i2c_read_hdmi_status(struct sc0710_dev *dev)
 		}
 	}
 
+	if (was_locked && (!dev->locked || !dev->fmt))
+		sc0710_audio_on_signal_lost(dev);
+
 	mutex_unlock(&dev->signalMutex);
 	return 0; /* Success */
 
@@ -785,6 +789,8 @@ confirmed_timing_change:
 
 	if (!auto_scaler && dev->scaler_mode == SCALER_MODE_DISABLED)
 		sc0710_video_notify_source_change(dev);
+
+	sc0710_audio_on_signal_restored(dev);
 
 	return 0;
 }

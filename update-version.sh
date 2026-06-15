@@ -6,14 +6,19 @@
 #   - If a version for today already exists, increments the revision.
 #
 # Files updated:
-#   ./version   — contains "YYYY.MM.DD-REV"
-#   ./dkms.conf — PACKAGE_VERSION="YYYY.MM.DD.REV"
+#   ./version                  — canonical version string (YYYY.MM.DD-REV)
+#   ./dkms.conf                — PACKAGE_VERSION="YYYY.MM.DD.REV"
+#   ./lib/sc0710-version.h     — C header consumed by the kernel module
+#
+# The kernel module reads the version from lib/sc0710-version.h (modinfo, dmesg).
+# Rebuild after bumping: make, dkms build, or sc0710-cli --update
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VERSION_FILE="${SCRIPT_DIR}/version"
 DKMS_FILE="${SCRIPT_DIR}/dkms.conf"
+SYNC_HEADER="${SCRIPT_DIR}/scripts/sync-version-header.sh"
 
 TODAY=$(date +%Y.%m.%d)
 
@@ -50,6 +55,15 @@ echo "$NEW_VERSION" > "$VERSION_FILE"
 # Update dkms.conf — replace the PACKAGE_VERSION line
 sed -i "s/^PACKAGE_VERSION=.*/PACKAGE_VERSION=\"${NEW_DKMS_VERSION}\"/" "$DKMS_FILE"
 
+# Sync C header used by the kernel module (modinfo version, boot message)
+bash "$SYNC_HEADER"
+
+echo ""
 echo "Updated:"
-echo "  ${VERSION_FILE}  -> ${NEW_VERSION}"
-echo "  ${DKMS_FILE} -> PACKAGE_VERSION=\"${NEW_DKMS_VERSION}\""
+echo "  ${VERSION_FILE}           -> ${NEW_VERSION}"
+echo "  ${DKMS_FILE}              -> PACKAGE_VERSION=\"${NEW_DKMS_VERSION}\""
+echo "  lib/sc0710-version.h      -> ${NEW_VERSION}"
+echo ""
+echo "Rebuild the module for modinfo/dmesg to show the new version:"
+echo "  make"
+echo "  sudo sc0710-cli --update   # installed systems"

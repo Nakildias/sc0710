@@ -1,7 +1,8 @@
 /*
- *  Driver for the Elgato 4k60 Pro mk.2 HDMI capture card.
+ *  Driver for the Elgato 4k60 Pro MK.2 HDMI capture card.
  *
  *  Copyright (c) 2021-2022 Steven Toth <stoth@kernellabs.com>
+ *  Modifications Copyright (c) 2025-2026 Nakildias <nakildiaspro@gmail.com>
  *
  *  This program is free software; you can redistribute it and/or modify
  *  it under the terms of the GNU General Public License as published by
@@ -19,16 +20,158 @@
  */
 
 #include <linux/vmalloc.h>
+#include <linux/timer.h>
 #include "sc0710.h"
 
 static unsigned int audio_debug = 0;
 module_param(audio_debug, int, 0644);
 MODULE_PARM_DESC(audio_debug, "enable debug messages [audio]");
 
+#define SC0710_AUDIO_RATE_HZ        48000
+#define SC0710_AUDIO_SILENCE_MS       10
+#define SC0710_AUDIO_SILENCE_SAMPLES  ((SC0710_AUDIO_RATE_HZ * SC0710_AUDIO_SILENCE_MS) / 1000)
+
 #define dprintk(level, fmt, arg...)\
 	do { if (audio_debug >= level)\
 		printk(KERN_DEBUG "%s/0: " fmt, dev->name, ## arg);\
 	} while (0)
+
+static bool sc0710_audio_hdmi_active(struct sc0710_dev *dev)
+{
+	bool active;
+
+	mutex_lock(&dev->signalMutex);
+	active = dev->locked && dev->fmt;
+	mutex_unlock(&dev->signalMutex);
+
+	return active;
+}
+
+static void sc0710_audio_push_frames(struct sc0710_audio_dev *chip,
+				     unsigned int samples, const u8 *src,
+				     unsigned int stride_bytes, bool silence)
+{
+	struct snd_pcm_substream *substream = chip->substream;
+	struct snd_pcm_runtime *runtime;
+	snd_pcm_uframes_t period_size;
+	unsigned int i;
+
+	if (!substream)
+		return;
+
+	runtime = substream->runtime;
+	if (!runtime || !runtime->dma_area || !runtime->buffer_size)
+		return;
+
+	period_size = runtime->period_size;
+	if (!period_size)
+		return;
+
+	for (i = 0; i < samples; i++) {
+		u32 *dst = (u32 *)(runtime->dma_area + chip->buffer_ptr * 4);
+
+		if (silence)
+			*dst = 0;
+		else
+			*dst = *(const u32 *)(src + (i * stride_bytes));
+
+		chip->buffer_ptr++;
+		if (chip->buffer_ptr >= runtime->buffer_size)
+			chip->buffer_ptr = 0;
+	}
+
+	chip->period_pos += samples;
+	while (chip->period_pos >= period_size) {
+		chip->period_pos -= period_size;
+		snd_pcm_period_elapsed(substream);
+	}
+}
+
+#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 14, 0)
+static void sc0710_audio_silence_timer_fn(unsigned long data)
+{
+	struct sc0710_audio_dev *chip = (struct sc0710_audio_dev *)data;
+#else
+static void sc0710_audio_silence_timer_fn(struct timer_list *t)
+{
+	struct sc0710_audio_dev *chip = container_of(t, struct sc0710_audio_dev, silence_timer);
+#endif
+	struct sc0710_dev *dev = chip->dev;
+	struct sc0710_dma_channel *ch = &dev->channel[1];
+
+	mutex_lock(&ch->lock);
+	if (!chip->running || !chip->substream || !chip->silence_active) {
+		mutex_unlock(&ch->lock);
+		return;
+	}
+
+	if (sc0710_audio_hdmi_active(dev)) {
+		chip->silence_active = false;
+		mutex_unlock(&ch->lock);
+		return;
+	}
+
+	sc0710_audio_push_frames(chip, SC0710_AUDIO_SILENCE_SAMPLES, NULL, 0, true);
+
+	if (chip->silence_active && chip->running && chip->substream)
+		mod_timer(&chip->silence_timer,
+			  jiffies + msecs_to_jiffies(SC0710_AUDIO_SILENCE_MS));
+
+	mutex_unlock(&ch->lock);
+}
+
+static void sc0710_audio_stop_silence(struct sc0710_audio_dev *chip)
+{
+	if (!chip)
+		return;
+
+	chip->silence_active = false;
+	timer_delete_sync(&chip->silence_timer);
+}
+
+void sc0710_audio_on_signal_lost(struct sc0710_dev *dev)
+{
+	struct sc0710_dma_channel *ch = &dev->channel[1];
+	struct sc0710_audio_dev *chip = ch->audio_dev;
+
+	if (!chip || !chip->running || !chip->substream || chip->silence_active)
+		return;
+
+	chip->silence_active = true;
+	mod_timer(&chip->silence_timer,
+		  jiffies + msecs_to_jiffies(SC0710_AUDIO_SILENCE_MS));
+
+	if (audio_debug)
+		printk(KERN_INFO "%s: HDMI signal lost, delivering ALSA silence\n", dev->name);
+}
+
+void sc0710_audio_on_signal_restored(struct sc0710_dev *dev)
+{
+	struct sc0710_dma_channel *ch = &dev->channel[1];
+	struct sc0710_audio_dev *chip = ch->audio_dev;
+
+	if (!chip || !chip->silence_active)
+		return;
+
+	if (!sc0710_audio_hdmi_active(dev))
+		return;
+
+	sc0710_audio_stop_silence(chip);
+
+	if (audio_debug)
+		printk(KERN_INFO "%s: HDMI signal restored, resuming capture audio\n", dev->name);
+}
+
+static void sc0710_audio_init_silence_timer(struct sc0710_audio_dev *chip)
+{
+#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 14, 0)
+	init_timer(&chip->silence_timer);
+	chip->silence_timer.function = sc0710_audio_silence_timer_fn;
+	chip->silence_timer.data = (unsigned long)chip;
+#else
+	timer_setup(&chip->silence_timer, sc0710_audio_silence_timer_fn, 0);
+#endif
+}
 
 int sc0710_audio_deliver_samples(struct sc0710_dev *dev, struct sc0710_dma_channel *ch,
 	const u8 *buf, int bitdepth, int strideBytes, int channels, int samplesPerChannel)
@@ -36,9 +179,6 @@ int sc0710_audio_deliver_samples(struct sc0710_dev *dev, struct sc0710_dma_chann
 	struct sc0710_audio_dev *chip;
 	struct snd_pcm_substream *substream;
 	struct snd_pcm_runtime *runtime;
-	const u8 *ptr = buf;
-	snd_pcm_uframes_t period_size;
-	int i;
 
 	if (channels != 2 || bitdepth != 16 || samplesPerChannel <= 0)
 		return -1;
@@ -55,38 +195,13 @@ int sc0710_audio_deliver_samples(struct sc0710_dev *dev, struct sc0710_dma_chann
 	if (!runtime || !runtime->dma_area || !runtime->buffer_size)
 		return -1;
 
-	period_size = runtime->period_size;
-	if (!period_size)
+	if (!runtime->period_size)
 		return -1;
 
-	/* Hardware delivers interleaved s16 pairs at the given stride.
-	 * Only the first L/R pair (4 bytes) per stride is valid.
-	 * Use 32-bit writes instead of 4 individual byte copies.
-	 */
-	for (i = 0; i < samplesPerChannel; i++) {
-		u32 *dst;
-
-		dst = (u32 *)(runtime->dma_area + chip->buffer_ptr * 4);
-		*dst = *(const u32 *)ptr;
-
-		ptr += strideBytes;
-		chip->buffer_ptr++;
-		if (chip->buffer_ptr >= runtime->buffer_size)
-			chip->buffer_ptr = 0;
-	}
+	sc0710_audio_push_frames(chip, samplesPerChannel, buf, strideBytes, false);
 
 	sc0710_things_per_second_update(&ch->audioSamplesPerSecond,
 					samplesPerChannel * 2);
-
-	/* Only notify ALSA when an actual period boundary has been crossed.
-	 * Calling snd_pcm_period_elapsed() on every DMA completion (even
-	 * partial periods) causes over-reporting and audio glitches.
-	 */
-	chip->period_pos += samplesPerChannel;
-	while (chip->period_pos >= period_size) {
-		chip->period_pos -= period_size;
-		snd_pcm_period_elapsed(substream);
-	}
 
 	return 0;
 }
@@ -151,6 +266,8 @@ static int snd_sc0710_pcm_close(struct snd_pcm_substream *substream)
 
 	/* Stop the hardware */
 	mutex_lock(&ch->lock);
+	chip->running = false;
+	sc0710_audio_stop_silence(chip);
 	chip->substream = NULL;
 	mutex_unlock(&ch->lock);
 
@@ -225,9 +342,14 @@ static int snd_sc0710_capture_trigger(struct snd_pcm_substream *substream, int c
 
 	switch (cmd) {
 	case SNDRV_PCM_TRIGGER_START:
+		chip->running = true;
+		if (!sc0710_audio_hdmi_active(dev))
+			sc0710_audio_on_signal_lost(dev);
 		return 0;
 
 	case SNDRV_PCM_TRIGGER_STOP:
+		chip->running = false;
+		sc0710_audio_stop_silence(chip);
 		return 0;
 
 	default:
@@ -277,6 +399,7 @@ void sc0710_audio_unregister(struct sc0710_dev *dev)
 		return;
 	}
 
+	sc0710_audio_stop_silence(chip);
 	snd_card_free(chip->card);
 }
 
@@ -322,6 +445,9 @@ int sc0710_audio_register(struct sc0710_dev *dev)
 	chip->card = card;
 	chip->dev = dev;
 	chip->buffer_ptr = 0;
+	chip->running = false;
+	chip->silence_active = false;
+	sc0710_audio_init_silence_timer(chip);
 
 	err = snd_sc0710_pcm(chip, 0, "sc0710 HDMI");
 	if (err < 0)
