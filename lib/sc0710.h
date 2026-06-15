@@ -373,6 +373,9 @@ struct sc0710_audio_dev
 	struct  snd_card          *card;
 	snd_pcm_uframes_t          buffer_ptr;
 	snd_pcm_uframes_t          period_pos;
+	bool                       running;
+	bool                       silence_active;
+	struct timer_list          silence_timer;
 };
 
 struct sc0710_dev {
@@ -561,6 +564,8 @@ int  sc0710_audio_register(struct sc0710_dev *dev);
 void sc0710_audio_unregister(struct sc0710_dev *dev);
 int  sc0710_audio_deliver_samples(struct sc0710_dev *dev, struct sc0710_dma_channel *ch,
         const u8 *buf, int bitdepth, int strideBytes, int channels, int samplesPerChannel);
+void sc0710_audio_on_signal_lost(struct sc0710_dev *dev);
+void sc0710_audio_on_signal_restored(struct sc0710_dev *dev);
 
 /* -scaler.c (software scaler) */
 bool sc0710_software_scaler_allowed(const struct sc0710_dev *dev);
