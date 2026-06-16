@@ -108,15 +108,33 @@ else
     trace_clear "No /var/lib/dkms/${DRV_NAME}"
 fi
 
-# --- CLI and atomic install tree ---
+# --- CLI and install files ---
 section "CLI and install files"
 
-if [[ -x "/usr/local/bin/sc0710-cli" ]]; then
-    trace_found "CLI utility installed" "/usr/local/bin/sc0710-cli"
-elif command -v sc0710-cli &>/dev/null; then
-    trace_found "CLI utility found in PATH" "$(command -v sc0710-cli)"
-else
-    trace_clear "sc0710-cli not installed"
+cli_traces=false
+for cli_path in /usr/bin/sc0710-cli /usr/local/bin/sc0710-cli; do
+    if [[ -x "$cli_path" ]]; then
+        cli_traces=true
+        trace_found "CLI utility installed" "$cli_path"
+    fi
+done
+if [[ "$cli_traces" == "false" ]]; then
+    if command -v sc0710-cli &>/dev/null; then
+        trace_found "CLI utility found in PATH" "$(command -v sc0710-cli)"
+    else
+        trace_clear "sc0710-cli not installed"
+    fi
+fi
+
+if command -v pacman &>/dev/null; then
+  aur_pkg_found=false
+  for pkg in sc0710-dkms-git sc0710-dkms; do
+      if pacman -Q "$pkg" &>/dev/null; then
+          aur_pkg_found=true
+          trace_found "AUR package still installed" "$(pacman -Q "$pkg")"
+      fi
+  done
+  [[ "$aur_pkg_found" == "false" ]] && trace_clear "No sc0710 AUR package installed"
 fi
 
 if [[ -d "/var/lib/sc0710" ]]; then
@@ -125,7 +143,16 @@ else
     trace_clear "No /var/lib/sc0710"
 fi
 
+if [[ -d "/usr/lib/sc0710" ]]; then
+    trace_found "AUR firmware helper directory" "/usr/lib/sc0710"
+else
+    trace_clear "No /usr/lib/sc0710"
+fi
+
 for libexec in \
+    /usr/lib/sc0710/sc0710-firmware.sh \
+    /usr/lib/sc0710/sc0710-firmware-lib.sh \
+    /usr/lib/sc0710/extract-firmware.sh \
     /usr/local/libexec/sc0710-firmware.sh \
     /usr/local/libexec/sc0710-firmware-lib.sh \
     /var/lib/sc0710/sc0710-firmware.sh \
@@ -225,6 +252,7 @@ echo -e "${RED}[TRACES FOUND]${NC} ${TRACE_COUNT} remnant(s) detected."
 echo ""
 echo -e "If removal was intentional, try:"
 echo -e "  ${BOLD}sudo sc0710-cli --remove${NC}   (if the CLI is still installed)"
+echo -e "  ${BOLD}yay -R sc0710-dkms-git${NC}     (AUR package; removes firmware systemd units)"
 echo -e "  Stale atomic installs may leave ${BOLD}/lib/modules/\$(uname -r)/extra/${DRV_NAME}/${NC} on the read-only ostree image."
 echo -e "  That path often cannot be deleted manually; blacklist + unload is enough for sc0710 to work."
 echo -e "  To find the owning package: ${BOLD}rpm -qf /lib/modules/\$(uname -r)/extra/${DRV_NAME}/sc0710.ko.xz${NC}"

@@ -37,9 +37,9 @@ git clone "$MAIN_REPO_URL" "$MAIN_DIR"
 echo "Cloning AUR repository..."
 git clone "$AUR_REPO_URL" "$AUR_DIR"
 
-# 5. Copy the PKGBUILD from main to AUR
-echo "Transferring PKGBUILD..."
-cp "$MAIN_DIR/aur/PKGBUILD" "$AUR_DIR/"
+# 5. Copy packaging files from main to AUR
+echo "Transferring PKGBUILD and install hook..."
+cp "$MAIN_DIR/aur/PKGBUILD" "$MAIN_DIR/aur/sc0710.install" "$AUR_DIR/"
 
 # 6. Update the PKGBUILD version using makepkg (The Arch Linux standard)
 echo "Updating pkgver..."
@@ -59,7 +59,7 @@ FULL_VERSION="${NEW_VERSION}-${NEW_REL}"
 
 # 9. Commit and push the updates directly to AUR
 echo "Pushing to AUR..."
-git add PKGBUILD .SRCINFO
+git add PKGBUILD sc0710.install .SRCINFO
 
 # Check if there are actually changes to commit before attempting
 if git diff-index --quiet HEAD --; then
