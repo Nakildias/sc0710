@@ -77,15 +77,168 @@ save_config() {
 }
 
 sc0710_is_4k_pro_card() {
+    local fw_lib=""
+
+    if [[ "$IS_ATOMIC" == "true" && -f "$SRC_DIR/sc0710-firmware-lib.sh" ]]; then
+        fw_lib="$SRC_DIR/sc0710-firmware-lib.sh"
+    elif [[ -f /usr/lib/sc0710/sc0710-firmware-lib.sh ]]; then
+        fw_lib="/usr/lib/sc0710/sc0710-firmware-lib.sh"
+    elif [[ -f /usr/local/libexec/sc0710-firmware-lib.sh ]]; then
+        fw_lib="/usr/local/libexec/sc0710-firmware-lib.sh"
+    fi
+
+    if [[ -n "$fw_lib" ]]; then
+        # shellcheck source=/dev/null
+        source "$fw_lib"
+        sc0710_is_4k_pro
+        return $?
+    fi
+
     lspci -n -v -d 12ab:0710 2>/dev/null | grep -qi "1cfa:0012"
 }
 
 sc0710_firmware_lib_path() {
     if [[ "$IS_ATOMIC" == "true" && -f "$SRC_DIR/sc0710-firmware-lib.sh" ]]; then
         echo "$SRC_DIR/sc0710-firmware-lib.sh"
+    elif [[ -f /usr/lib/sc0710/sc0710-firmware-lib.sh ]]; then
+        echo "/usr/lib/sc0710/sc0710-firmware-lib.sh"
     elif [[ -f /usr/local/libexec/sc0710-firmware-lib.sh ]]; then
         echo "/usr/local/libexec/sc0710-firmware-lib.sh"
     fi
+}
+
+sc0710_firmware_script_path() {
+    local lib
+    lib=$(sc0710_firmware_lib_path) || return 1
+    echo "$(dirname "$lib")/sc0710-firmware.sh"
+}
+
+sc0710_cli_path() {
+    readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}"
+}
+
+sc0710_installed_aur_package() {
+    local pkg owner
+
+    command -v pacman &>/dev/null || return 1
+    for pkg in sc0710-dkms-git sc0710-dkms; do
+        pacman -Q "$pkg" &>/dev/null && {
+            printf '%s' "$pkg"
+            return 0
+        }
+    done
+
+    if [[ -x /usr/bin/sc0710-cli ]]; then
+        owner=$(pacman -Qo /usr/bin/sc0710-cli 2>/dev/null | awk '{print $NF}' || true)
+        case "$owner" in
+            sc0710-dkms-git|sc0710-dkms)
+                printf '%s' "$owner"
+                return 0
+                ;;
+        esac
+    fi
+
+    return 1
+}
+
+sc0710_detect_aur_helper() {
+    local helper
+
+    for helper in yay paru trizen pikaur aura; do
+        command -v "$helper" &>/dev/null && {
+            printf '%s' "$helper"
+            return 0
+        }
+    done
+    command -v pacman &>/dev/null && {
+        printf '%s' "pacman"
+        return 0
+    }
+    return 1
+}
+
+sc0710_run_as_invoke_user() {
+    local user="${SC0710_INVOKE_USER:-${SUDO_USER:-root}}"
+
+    if [[ -z "$user" || "$user" == root ]]; then
+        "$@"
+    else
+        sudo -u "$user" -H "$@"
+    fi
+}
+
+sc0710_cli_remove_user_state() {
+    sc0710_remove_firmware_files
+    systemctl stop sc0710-firmware.service 2>/dev/null || true
+    systemctl disable sc0710-firmware.service 2>/dev/null || true
+    systemctl stop sc0710-firmware-verify.service 2>/dev/null || true
+    systemctl disable sc0710-firmware-verify.service 2>/dev/null || true
+    rm -f /etc/systemd/system/sc0710-firmware.service
+    rm -f /etc/systemd/system/sc0710-firmware-verify.service
+    rm -f /etc/modules-load.d/${DRV_NAME}.conf /etc/modprobe.d/${DRV_NAME}.conf \
+        /etc/modprobe.d/${DRV_NAME}-params.conf /etc/modprobe.d/${DRV_NAME}-atomic.conf
+    systemctl daemon-reload 2>/dev/null || true
+    rm -rf /var/log/sc0710
+}
+
+sc0710_cli_remove_aur_install() {
+    local pkg="$1" helper
+
+    helper=$(sc0710_detect_aur_helper) || {
+        echo -e "${RED}[ERROR]${NC} No AUR helper or pacman found."
+        return 1
+    }
+
+    echo -e "${BLUE}[INFO]${NC} AUR install detected. Removing ${BOLD}${pkg}${NC} via ${BOLD}${helper} -R ${pkg}${NC}..."
+    sc0710_cli_remove_user_state
+
+    if [[ "$helper" == pacman ]]; then
+        pacman -R "$pkg" || return 1
+    else
+        sc0710_run_as_invoke_user "$helper" -R "$pkg" || return 1
+    fi
+
+    echo -e "${GREEN}[OK]${NC} ${pkg} removed via ${helper}."
+}
+
+sc0710_detect_install_method() {
+    local pkg cli_path
+
+    if pkg=$(sc0710_installed_aur_package); then
+        printf 'AUR (%s %s)' "$pkg" "$(pacman -Q "$pkg" | awk '{print $2}')"
+        return 0
+    fi
+
+    if [[ "$IS_ATOMIC" == "true" && -d /var/lib/sc0710 ]]; then
+        printf 'GitHub (atomic installer)'
+        return 0
+    fi
+
+    if [[ -x /usr/local/bin/sc0710-cli ]] || [[ -f /usr/local/libexec/sc0710-firmware.sh ]]; then
+        printf 'GitHub (install-sc0710.sh)'
+        return 0
+    fi
+
+    cli_path=$(sc0710_cli_path)
+    case "$cli_path" in
+        /usr/bin/sc0710-cli)
+            if [[ -f /usr/lib/sc0710/sc0710-firmware-lib.sh ]]; then
+                printf 'AUR (sc0710-dkms-git, package database not found)'
+                return 0
+            fi
+            ;;
+        /usr/local/bin/sc0710-cli)
+            printf 'GitHub (install-sc0710.sh)'
+            return 0
+            ;;
+    esac
+
+    if [[ "$cli_path" != /usr/bin/sc0710-cli && "$cli_path" != /usr/local/bin/sc0710-cli ]]; then
+        printf 'Development (local script: %s)' "$cli_path"
+        return 0
+    fi
+
+    printf 'Unknown'
 }
 
 sc0710_cli_ensure_ecp5() {
@@ -163,13 +316,18 @@ sc0710_cli_refresh_firmware_services() {
         verify_after="sc0710-build.service"
         [[ -z "$src_root" ]] && src_root="$SRC_DIR"
     else
-        fw_script="/usr/local/libexec/sc0710-firmware.sh"
-        fw_lib="/usr/local/libexec/sc0710-firmware-lib.sh"
         verify_after="systemd-modules-load.service"
-        mkdir -p /usr/local/libexec
-        [[ -z "$src_root" ]] && src_root="$DKMS_SRC"
-        [[ -f "$src_root/scripts/sc0710-firmware.sh" ]] && cp "$src_root/scripts/sc0710-firmware.sh" "$fw_script" && chmod +x "$fw_script"
-        [[ -f "$src_root/scripts/sc0710-firmware-lib.sh" ]] && cp "$src_root/scripts/sc0710-firmware-lib.sh" "$fw_lib" && chmod +x "$fw_lib"
+        if [[ -f /usr/lib/sc0710/sc0710-firmware.sh && -f /usr/lib/sc0710/sc0710-firmware-lib.sh ]]; then
+            fw_script="/usr/lib/sc0710/sc0710-firmware.sh"
+            fw_lib="/usr/lib/sc0710/sc0710-firmware-lib.sh"
+        else
+            fw_script="/usr/local/libexec/sc0710-firmware.sh"
+            fw_lib="/usr/local/libexec/sc0710-firmware-lib.sh"
+            mkdir -p /usr/local/libexec
+            [[ -z "$src_root" ]] && src_root="$DKMS_SRC"
+            [[ -f "$src_root/scripts/sc0710-firmware.sh" ]] && cp "$src_root/scripts/sc0710-firmware.sh" "$fw_script" && chmod +x "$fw_script"
+            [[ -f "$src_root/scripts/sc0710-firmware-lib.sh" ]] && cp "$src_root/scripts/sc0710-firmware-lib.sh" "$fw_lib" && chmod +x "$fw_lib"
+        fi
     fi
 
     [[ -x "$fw_script" && -f "$fw_lib" ]] || return 0
@@ -232,21 +390,74 @@ sc0710_remove_firmware_files() {
 }
 
 # --- Version Check Function ---
-check_version() {
-    local REMOTE_VERSION
-    REMOTE_VERSION=$(curl -fsSL "$VERSION_URL" 2>/dev/null | tr -d '[:space:]')
-    if [[ -n "$REMOTE_VERSION" && "$REMOTE_VERSION" != "$CURRENT_VERSION" ]]; then
-        echo ""
-        echo -e "${YELLOW}╔═══════════════════════════════════════════════════════════╗${NC}"
-        echo -e "${YELLOW}║   UPDATE AVAILABLE                                        ║${NC}"
-        echo -e "${YELLOW}╠═══════════════════════════════════════════════════════════╣${NC}"
-        echo -e "${YELLOW}║${NC}  Current: ${RED}${CURRENT_VERSION}${NC}                                    ${YELLOW}║${NC}"
-        printf "${YELLOW}║${NC}  Latest:  ${GREEN}%-47s${NC} ${YELLOW}║${NC}\n" "$REMOTE_VERSION"
-        echo -e "${YELLOW}╠═══════════════════════════════════════════════════════════╣${NC}"
-        echo -e "${YELLOW}║${NC}  Run ${BOLD}sc0710-cli -U${NC} or ${BOLD}sc0710-cli --update${NC} to update       ${YELLOW}║${NC}"
-        echo -e "${YELLOW}╚═══════════════════════════════════════════════════════════╝${NC}"
-        echo ""
+SC0710_BOX_WIDTH=59
+SC0710_BOX_RULE='═══════════════════════════════════════════════════════════'
+
+sc0710_box_border() {
+    local frame="$1" type="$2"
+    local left right
+
+    case "$type" in
+        top) left='╔'; right='╗' ;;
+        mid) left='╠'; right='╣' ;;
+        bot) left='╚'; right='╝' ;;
+    esac
+    printf '%b%s%s%s%b\n' "$frame" "$left" "$SC0710_BOX_RULE" "$right" "$NC"
+}
+
+sc0710_box_line() {
+    local frame="$1" plain="$2" rendered="${3:-$2}"
+    local pad=$(( SC0710_BOX_WIDTH - ${#plain} ))
+
+    (( pad < 0 )) && pad=0
+    printf '%b║%b%*s%b║%b\n' "$frame" "$rendered" "$pad" "" "$frame" "$NC"
+}
+
+sc0710_version_state() {
+    local local_ver="$1" remote_ver="$2"
+
+    [[ -z "$local_ver" || -z "$remote_ver" ]] && { echo "unknown"; return; }
+    [[ "$local_ver" == "$remote_ver" ]] && { echo "current"; return; }
+    if [[ "$(printf '%s\n' "$local_ver" "$remote_ver" | sort -V | head -1)" == "$local_ver" ]]; then
+        echo "behind"
+    else
+        echo "ahead"
     fi
+}
+
+check_version() {
+    local REMOTE_VERSION state
+    REMOTE_VERSION=$(curl -fsSL "$VERSION_URL" 2>/dev/null | tr -d '[:space:]')
+    [[ -z "$REMOTE_VERSION" ]] && return 0
+
+    state=$(sc0710_version_state "$CURRENT_VERSION" "$REMOTE_VERSION")
+
+    case "$state" in
+        behind)
+            echo ""
+            sc0710_box_border "$YELLOW" top
+            sc0710_box_line "$YELLOW" "   UPDATE AVAILABLE"
+            sc0710_box_border "$YELLOW" mid
+            sc0710_box_line "$YELLOW" "  Current: ${CURRENT_VERSION}" "  Current: ${RED}${CURRENT_VERSION}${NC}"
+            sc0710_box_line "$YELLOW" "  Latest:  ${REMOTE_VERSION}" "  Latest:  ${GREEN}${REMOTE_VERSION}${NC}"
+            sc0710_box_border "$YELLOW" mid
+            sc0710_box_line "$YELLOW" "  Run sc0710-cli -U or sc0710-cli --update to update" "  Run ${BOLD}sc0710-cli -U${NC} or ${BOLD}sc0710-cli --update${NC} to update"
+            sc0710_box_border "$YELLOW" bot
+            echo ""
+            ;;
+        ahead)
+            echo ""
+            sc0710_box_border "$BLUE" top
+            sc0710_box_line "$BLUE" "   PRE-RELEASE"
+            sc0710_box_border "$BLUE" mid
+            sc0710_box_line "$BLUE" "  Installed: ${CURRENT_VERSION} (newer than published)" "  Installed: ${GREEN}${CURRENT_VERSION}${NC} (newer than published)"
+            sc0710_box_line "$BLUE" "  Published: ${REMOTE_VERSION}" "  Published: ${BOLD}${REMOTE_VERSION}${NC}"
+            sc0710_box_border "$BLUE" mid
+            sc0710_box_line "$BLUE" "  You are running a pre-release build. No update needed."
+            sc0710_box_border "$BLUE" bot
+            echo ""
+            ;;
+    esac
 }
 
 # --- Debug Dump Helpers ---
@@ -489,7 +700,7 @@ show_help() {
     echo -e "    ${BOLD}-as, --toggle-auto-scalar${NC} Toggle automatic safety scaler on/off"
     echo -e "    ${BOLD}-pt, --procedural-timings${NC} Toggle timing calculation mode (merge/procedural/static)"
     echo -e "    ${BOLD}-U, --update${NC}     Check for updates and reinstall"
-    echo -e "    ${BOLD}-r, -R, --remove${NC} Completely uninstall driver and CLI"
+    echo -e "    ${BOLD}-r, -R, --remove${NC} Completely uninstall driver and CLI (AUR: uses yay/paru)"
     echo -e "    ${BOLD}--dump${NC}           Save a debug report to the Desktop"
     if [[ "$IS_ATOMIC" == "true" ]]; then
         echo -e "    ${BOLD}--rebuild${NC}        Force rebuild the module for current kernel"
@@ -654,6 +865,23 @@ case "$1" in
         ;;
     -s|--status)
         check_version
+        echo -e "${BLUE}::${NC} ${BOLD}Install Method${NC}"
+        INSTALL_METHOD="$(sc0710_detect_install_method)"
+        case "$INSTALL_METHOD" in
+            AUR*)
+                echo -e "   ${GREEN}●${NC} ${INSTALL_METHOD}"
+                ;;
+            GitHub*)
+                echo -e "   ${GREEN}●${NC} ${INSTALL_METHOD}"
+                ;;
+            Development*)
+                echo -e "   ${YELLOW}●${NC} ${INSTALL_METHOD}"
+                ;;
+            *)
+                echo -e "   ${YELLOW}○${NC} ${INSTALL_METHOD}"
+                ;;
+        esac
+        echo ""
         if [[ "$IS_ATOMIC" == "true" ]]; then
             echo -e "${BLUE}::${NC} ${BOLD}System Type${NC}"
             echo -e "   Atomic/Immutable (boot-time build)"
@@ -726,12 +954,18 @@ case "$1" in
                     DEV=$(cat "$pcidir/device" 2>/dev/null | grep -iE '0x[0-9a-f]+' -o | sed 's/0x//')
                     BOARD_NAME=$(dmesg 2>/dev/null | grep -E "sc0710.*subsystem: ${SUBVEN}:${SUBDEV}.*board:" | tail -1 | sed 's/.*board: \([^\[]*\).*/\1/' | sed 's/ *$//')
                     if [[ -z "$BOARD_NAME" ]]; then
-                        case "$SUBVEN:$SUBDEV" in
-                            1cfa:000e) BOARD_NAME="Elgato 4k60 Pro MK.2" ;;
-                            1cfa:0012) BOARD_NAME="Elgato 4K Pro" ;;
-                            1cfa:0006) BOARD_NAME="Elgato HD60 Pro (1cfa:0006)" ;;
-                            *) BOARD_NAME="UNKNOWN/GENERIC" ;;
-                        esac
+                        if fw_lib=$(sc0710_firmware_lib_path 2>/dev/null); then
+                            # shellcheck source=/dev/null
+                            source "$fw_lib"
+                            BOARD_NAME=$(sc0710_board_name_from_subsys "${SUBVEN}:${SUBDEV}")
+                        else
+                            case "$SUBVEN:$SUBDEV" in
+                                1cfa:000e) BOARD_NAME="Elgato 4k60 Pro MK.2" ;;
+                                1cfa:0012) BOARD_NAME="Elgato 4K Pro" ;;
+                                1cfa:0006) BOARD_NAME="Elgato HD60 Pro (1cfa:0006)" ;;
+                                *) BOARD_NAME="UNKNOWN/GENERIC" ;;
+                            esac
+                        fi
                     fi
                     echo -e "   ${GREEN}●${NC} Device at PCI ${BOLD}${PCI_ADDR}${NC}"
                     echo -e "     Board: ${BOARD_NAME}"
@@ -838,23 +1072,14 @@ case "$1" in
             echo -e "   ${RED}○${NC} Parameter not available (module not loaded)"
         fi
         # ECP5 Firmware Status
-        IS_4KP=false
-        for pcidir in /sys/bus/pci/drivers/sc0710/0*; do
-            if [[ -d "$pcidir" ]]; then
-                SUBV=$(cat "$pcidir/subsystem_vendor" 2>/dev/null | grep -iE '0x[0-9a-f]+' -o | sed 's/0x//')
-                SUBD=$(cat "$pcidir/subsystem_device" 2>/dev/null | grep -iE '0x[0-9a-f]+' -o | sed 's/0x//')
-                [[ "$SUBV:$SUBD" == "1cfa:0012" ]] && IS_4KP=true && break
-            fi
-        done
-        [[ "$IS_4KP" == "false" ]] && lspci -n -v -d 12ab:0710 2>/dev/null | grep -qi "1cfa:0012" && IS_4KP=true
-        if [[ "$IS_4KP" == "true" ]]; then
+        if sc0710_is_4k_pro_card; then
             echo ""
             echo -e "${BLUE}::${NC} ${BOLD}ECP5 Firmware${NC}"
             FW_FOUND=false
             for p in /var/lib/sc0710/firmware/SC0710.FWI.HEX /etc/firmware/sc0710/SC0710.FWI.HEX /lib/firmware/sc0710/SC0710.FWI.HEX; do
                 if [[ -f "$p" ]]; then FW_FOUND=true; echo -e "   ${GREEN}●${NC} Firmware present: $p"; break; fi
             done
-            [[ "$FW_FOUND" == "false" ]] && echo -e "   ${RED}○${NC} Firmware missing. Run: ${BOLD}sudo bash $( [[ "$IS_ATOMIC" == "true" ]] && echo /var/lib/sc0710/sc0710-firmware.sh || echo /usr/local/libexec/sc0710-firmware.sh )${NC}"
+            [[ "$FW_FOUND" == "false" ]] && echo -e "   ${RED}○${NC} Firmware missing. Run: ${BOLD}sudo bash $( [[ "$IS_ATOMIC" == "true" ]] && echo /var/lib/sc0710/sc0710-firmware.sh || sc0710_firmware_script_path 2>/dev/null || echo /usr/lib/sc0710/sc0710-firmware.sh )${NC}"
             ECP5_MSG=$(dmesg 2>/dev/null | grep -E "sc0710.*ECP5" | tail -1)
             ECP5_OK=false
             echo "$ECP5_MSG" | grep -q "firmware programmed successfully" && ECP5_OK=true && echo -e "   ${GREEN}●${NC} ECP5 FPGA programmed"
@@ -862,7 +1087,7 @@ case "$1" in
             echo "$ECP5_MSG" | grep -qiE "Failed to load firmware|firmware upload failed|programming failed" && echo -e "   ${RED}○${NC} ECP5 FPGA not programmed"
             if [[ "$FW_FOUND" == "true" && "$ECP5_OK" == "false" ]] && lsmod | grep -q "^${DRV_NAME}[[:space:]]"; then
                 echo -e "   ${RED}⚠ WARNING:${NC} Firmware file exists but ECP5 is NOT programmed."
-                echo -e "     Run: ${BOLD}sudo bash $( [[ "$IS_ATOMIC" == "true" ]] && echo /var/lib/sc0710/sc0710-firmware.sh || echo /usr/local/libexec/sc0710-firmware.sh ) --verify${NC}"
+                echo -e "     Run: ${BOLD}sudo bash $( [[ "$IS_ATOMIC" == "true" ]] && echo /var/lib/sc0710/sc0710-firmware.sh || sc0710_firmware_script_path 2>/dev/null || echo /usr/lib/sc0710/sc0710-firmware.sh ) --verify${NC}"
                 echo -e "     Or:  ${BOLD}sc0710-cli --restart${NC}"
             fi
             systemctl is-enabled sc0710-firmware.service >/dev/null 2>&1 && echo -e "   ${GREEN}●${NC} Firmware service enabled" || echo -e "   ${YELLOW}○${NC} Firmware service not installed"
@@ -1041,6 +1266,12 @@ case "$1" in
         echo -e "${BLUE}::${NC} Uninstalling driver and utility..."
         read -r -p "Do you want to unload the driver? [Y/n] " UNLOAD_RESP
         [[ -z "$UNLOAD_RESP" || "$UNLOAD_RESP" =~ ^[yY] ]] && "$0" --unload
+
+        if AUR_PKG=$(sc0710_installed_aur_package); then
+            sc0710_cli_remove_aur_install "$AUR_PKG"
+            exit $?
+        fi
+
         if [[ "$IS_ATOMIC" == "true" ]]; then
             systemctl stop sc0710-build.service 2>/dev/null || true
             systemctl disable sc0710-build.service 2>/dev/null || true
@@ -1056,17 +1287,22 @@ case "$1" in
             rmdir "/var/lib/dkms/${DRV_NAME}" 2>/dev/null || true
             rm -rf /usr/src/${DRV_NAME}-*
         fi
-        sc0710_remove_firmware_files
-        systemctl stop sc0710-firmware.service 2>/dev/null || true
-        systemctl disable sc0710-firmware.service 2>/dev/null || true
-        systemctl stop sc0710-firmware-verify.service 2>/dev/null || true
-        systemctl disable sc0710-firmware-verify.service 2>/dev/null || true
-        rm -f /etc/systemd/system/sc0710-firmware.service
-        rm -f /etc/systemd/system/sc0710-firmware-verify.service
-        rm -f /etc/modules-load.d/${DRV_NAME}.conf /etc/modprobe.d/${DRV_NAME}.conf /etc/modprobe.d/${DRV_NAME}-params.conf /etc/modprobe.d/${DRV_NAME}-atomic.conf
-        systemctl daemon-reload 2>/dev/null || true
-        rm -rf /var/log/sc0710
+        sc0710_cli_remove_user_state
         rm -f /usr/local/bin/sc0710-cli
+
+        if [[ -x /usr/bin/sc0710-cli ]] || \
+            pacman -Q sc0710-dkms-git &>/dev/null || \
+            pacman -Q sc0710-dkms &>/dev/null; then
+            echo -e "${YELLOW}[WARNING]${NC} AUR package files are still installed."
+            if AUR_PKG=$(sc0710_installed_aur_package); then
+                echo -e "  Attempting package removal via AUR helper..."
+                sc0710_cli_remove_aur_install "$AUR_PKG"
+                exit $?
+            fi
+            echo -e "  Run: ${BOLD}yay -R sc0710-dkms-git${NC} or ${BOLD}sudo pacman -R sc0710-dkms-git${NC}"
+            exit 1
+        fi
+
         echo -e "${GREEN}[OK]${NC} Driver, CLI, services, and firmware removed."
         ;;
     --dump)

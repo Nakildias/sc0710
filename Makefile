@@ -18,7 +18,6 @@ TARFILES = Makefile lib/*.h lib/*.c *.txt *.md
 KVERSION ?= $(shell uname -r)
 KERNEL_VER := $(if $(KERNELRELEASE),$(KERNELRELEASE),$(KVERSION))
 VERSION_HDR := lib/sc0710-version.h
-SYNC_VERSION := scripts/sync-version-header.sh
 KBUILD_DIR = /lib/modules/$(KERNEL_VER)/build
 MODULE_OUTPUT_DIR := $(CURDIR)/build
 
@@ -32,8 +31,17 @@ ifneq ($(KERNEL_IS_CLANG),)
   KBUILD_CC = CC=clang LLVM=1
 endif
 
-$(VERSION_HDR): version $(SYNC_VERSION)
-	bash "$(SYNC_VERSION)"
+$(VERSION_HDR): version
+	@VERSION="$$(head -n 1 version | tr -d '[:space:]')"; \
+	printf '%s\n' \
+		'/* Auto-generated from version — do not edit manually. */' \
+		'#ifndef SC0710_VERSION_H' \
+		'#define SC0710_VERSION_H' \
+		'' \
+		"#define SC0710_DRV_VERSION_STRING \"$$VERSION\"" \
+		'' \
+		'#endif /* SC0710_VERSION_H */' \
+		> "$(VERSION_HDR)"
 
 all: $(VERSION_HDR)
 	@mkdir -p "$(MODULE_OUTPUT_DIR)"

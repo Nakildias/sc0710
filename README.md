@@ -18,7 +18,7 @@ High-performance, multi-client Linux driver for the Elgato 4K60 Pro MK.2 and Elg
 | Card | Subsystem ID | Notes |
 |------|-------------|-------|
 | **Elgato 4k60 Pro MK.2** | `1cfa:000e` | Plug-and-play after driver load. No FPGA firmware step. |
-| **Elgato 4K Pro** | `1cfa:0012` | Requires **ECP5 FPGA firmware** programming on every **cold boot**. The automatic installer handles this; manual/AUR installs need extra steps (see below). |
+| **Elgato 4K Pro** | `1cfa:0012` | Requires **ECP5 FPGA firmware** programming on every **cold boot**. Handled automatically by the installer and the AUR package; manual `insmod` builds need extra steps (see below). |
 
 Both cards share the same `12ab:0710` Magewell chipset but use different board profiles in the driver.
 
@@ -26,7 +26,7 @@ Both cards share the same `12ab:0710` Magewell chipset but use different board p
 
 | Distribution | Status | Notes |
 |--------------|--------|-------|
-| **Arch Linux** | Stable | DKMS or manual build. AUR package is driver-only (see below). |
+| **Arch Linux** | Stable | DKMS via AUR (`sc0710-dkms-git`) or manual build. Includes `sc0710-cli` and 4K Pro firmware helpers (see below). |
 | **Fedora / RHEL** | Stable | DKMS via the automatic installer. |
 | **Debian / Ubuntu** | Stable | **Warning:** distro OBS packages may crash; prefer Flatpak OBS. |
 | **Fedora Atomic** (Bazzite, Bluefin, Aurora, Silverblue) | Stable | Boot-time build service at `/var/lib/sc0710`. No DKMS. 4K Pro ECP5 stack included. |
@@ -86,14 +86,39 @@ sudo sc0710-cli --update
 yay -S sc0710-dkms-git
 ```
 
-The AUR package installs **only the DKMS kernel module**. It does **not** include:
-- `sc0710-cli`
-- ECP5 firmware extraction or programming scripts
-- `sc0710-firmware` / `sc0710-firmware-verify` services
+The AUR package installs:
 
-**MK.2 users** on Arch can use the AUR package and load with `sudo modprobe sc0710`.
+- **DKMS kernel module** — rebuilds automatically on kernel updates
+- **`sc0710-cli`** at `/usr/bin/sc0710-cli` — same management tool as the automatic installer
+- **4K Pro firmware helpers** under `/usr/lib/sc0710/` (`extract-firmware.sh`, `sc0710-firmware.sh`, `sc0710-firmware-lib.sh`)
 
-**4K Pro users** on Arch should use the **automatic installer** instead, or manually place `SC0710.FWI.HEX` in `/lib/firmware/sc0710/` and handle cold-boot programming yourself.
+**MK.2 users** can load with `sudo modprobe sc0710` (or enable `/etc/modules-load.d/sc0710.conf` for boot load) and manage the driver with `sc0710-cli`.
+
+**4K Pro users** — if a 4K Pro card (`1cfa:0012`) is present at install/upgrade time, the package hook automatically:
+
+1. Extracts `SC0710.FWI.HEX` when it is not already on disk (needs network; installs `p7zip` if required)
+2. Creates and enables `sc0710-firmware.service` and `sc0710-firmware-verify.service`
+3. Configures boot module loading via `modules-load.d` and `modprobe.d` softdeps
+4. Starts the firmware services and loads the driver
+
+After a **cold boot**, the same systemd units handle ECP5 programming before and after module load. If video is black:
+
+```bash
+sudo sc0710-cli --restart
+# or
+sudo bash /usr/lib/sc0710/sc0710-firmware.sh --verify
+```
+
+If the card was added **after** the AUR install, run `sudo sc0710-cli --update` to refresh firmware services, or extract firmware manually:
+
+```bash
+sudo /usr/lib/sc0710/extract-firmware.sh
+sudo sc0710-cli --restart
+```
+
+**Removing the AUR package** — `yay -R sc0710-dkms-git` stops, disables, and deletes `sc0710-firmware.service` and `sc0710-firmware-verify.service` when the installed package includes the current install hook. If you are on an older AUR build, upgrade once first so the hook is present. Firmware files under `/lib/firmware/sc0710/` are not removed by `yay -R`; use `sc0710-cli --remove` for a full cleanup.
+
+**4K Pro on Arch** — the maintainer primarily tests on MK.2 hardware. Cold-boot ECP5 reports from 4K Pro users are especially welcome ([open an issue](https://github.com/Nakildias/sc0710/issues) with `sc0710-cli --dump`).
 
 ### NixOS (flakes)
 
@@ -150,7 +175,7 @@ For development or unsupported distros.
 
 ## Driver management (`sc0710-cli`)
 
-Installed by the automatic installer and the NixOS module. Provides real-time control on both atomic and standard distros.
+Installed by the automatic installer, the AUR package, and the NixOS module. Provides real-time control on both atomic and standard distros.
 
 | Command | Alias | Description |
 |---------|-------|-------------|
@@ -199,7 +224,7 @@ Same command as above — checks module, DKMS, CLI, systemd units, config files,
 | Problem | What to try |
 |---------|-------------|
 | **4K Pro: signal locked, black video** (cold boot) | `sudo sc0710-cli --restart` or `sudo sc0710-cli --update` then reboot |
-| **4K Pro: ECP5 warning in `--status`** | `sudo bash …/sc0710-firmware.sh --verify` (path above) |
+| **4K Pro: ECP5 warning in `--status`** | `sudo bash …/sc0710-firmware.sh --verify` (atomic: `/var/lib/sc0710/`; AUR: `/usr/lib/sc0710/`; standard installer: `/usr/local/libexec/`) |
 | **Module won't unload** (app in use) | `sc0710-cli --unload` stops PipeWire first; close OBS/etc. |
 | **Atomic: module not built after kernel update** | `sudo sc0710-cli --rebuild` or check `journalctl -u sc0710-build.service -b` |
 | **Driver still present after `--remove`** | Run `sudo sc0710-cli --remove` again, then the [removal check script](#verify-complete-removal) |

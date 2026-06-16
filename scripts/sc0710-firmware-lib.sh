@@ -54,6 +54,45 @@ sc0710_is_4k_pro() {
     lspci -n -v -d 12ab:0710 2>/dev/null | grep -qi "$SC0710_4K_PRO_SUBSYS"
 }
 
+sc0710_pci_subsys() {
+    local pcidir subven subdev line
+
+    for pcidir in /sys/bus/pci/drivers/sc0710/0*; do
+        if [[ -d "$pcidir" ]]; then
+            subven=$(cat "$pcidir/subsystem_vendor" 2>/dev/null | grep -iE '0x[0-9a-f]+' -o | sed 's/0x//')
+            subdev=$(cat "$pcidir/subsystem_device" 2>/dev/null | grep -iE '0x[0-9a-f]+' -o | sed 's/0x//')
+            if [[ -n "$subven" && -n "$subdev" ]]; then
+                printf '%s:%s' "$subven" "$subdev"
+                return 0
+            fi
+        fi
+    done
+
+    line=$(lspci -n -v -d 12ab:0710 2>/dev/null | grep -i '^[[:space:]]*Subsystem:' | head -1) || return 1
+    subven=$(echo "$line" | grep -oiE '[0-9a-f]{4}' | head -1)
+    subdev=$(echo "$line" | grep -oiE '[0-9a-f]{4}' | tail -1)
+    [[ -n "$subven" && -n "$subdev" ]] || return 1
+    printf '%s:%s' "$subven" "$subdev"
+}
+
+sc0710_board_name_from_subsys() {
+    case "$1" in
+        1cfa:000e) printf '%s' 'Elgato 4k60 Pro MK.2' ;;
+        1cfa:0012) printf '%s' 'Elgato 4K Pro' ;;
+        1cfa:0006) printf '%s' 'Elgato HD60 Pro (1cfa:0006)' ;;
+        *) printf '%s' 'UNKNOWN/GENERIC' ;;
+    esac
+}
+
+sc0710_detect_card_name() {
+    local subsys board
+
+    subsys=$(sc0710_pci_subsys) || return 1
+    board=$(dmesg 2>/dev/null | grep -E "sc0710.*subsystem: ${subsys}.*board:" | tail -1 | sed 's/.*board: \([^\[]*\).*/\1/' | sed 's/ *$//')
+    [[ -n "$board" ]] || board=$(sc0710_board_name_from_subsys "$subsys")
+    printf '%s' "$board"
+}
+
 sc0710_firmware_file_valid() {
     local path="$1"
     [[ -f "$path" ]] || return 1

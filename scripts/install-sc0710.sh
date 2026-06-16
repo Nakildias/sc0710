@@ -43,6 +43,7 @@ fi
 # --- Configuration ---
 REPO_URL="https://github.com/Nakildias/sc0710.git"
 VERSION_URL="https://raw.githubusercontent.com/Nakildias/sc0710/main/version"
+GIT_BRANCH="main"
 DRV_NAME="sc0710"
 
 if [[ -f "version" ]]; then
@@ -211,6 +212,35 @@ confirm() {
     if [[ -z "$response" ]]; then response="$default_ans"; fi
     if [[ ! "$response" =~ ^[yY]$ ]]; then return 1; fi
     return 0
+}
+
+prompt_git_branch() {
+    GIT_BRANCH="main"
+
+    if [[ "$NOCONFIRM" == "true" ]]; then
+        msg2 "Using git branch: ${GIT_BRANCH}"
+        log "Git branch (default): ${GIT_BRANCH}"
+        return 0
+    fi
+
+    printf "${BLUE}::${NC} ${BOLD}Git branch to install [main]:${NC} "
+    read -r response
+    if [[ -n "$response" ]]; then
+        GIT_BRANCH="$response"
+    fi
+    msg2 "Using git branch: ${GIT_BRANCH}"
+    log "Selected git branch: ${GIT_BRANCH}"
+}
+
+clone_sc0710_repo() {
+    local dest="$1"
+
+    prompt_git_branch
+    msg2 "Cloning ${REPO_URL} (branch: ${GIT_BRANCH})..."
+    if ! git clone --depth 1 --branch "$GIT_BRANCH" "$REPO_URL" "$dest" >/dev/null 2>&1; then
+        die "Git clone failed for branch '${GIT_BRANCH}'. Check your internet connection and branch name."
+    fi
+    log "Git clone successful (branch: ${GIT_BRANCH})"
 }
 
 check_video_group() {
@@ -525,10 +555,7 @@ if [[ ! -d "$SRC_DIR" ]]; then
         TEMP_DIR=$(mktemp -d -t sc0710.XXXXXX) || die "Failed to create temp directory"
         log "Created temp directory: $TEMP_DIR"
 
-        if ! git clone --depth 1 "$REPO_URL" "$TEMP_DIR" >/dev/null 2>&1; then
-            die "Git clone failed. Check your internet connection."
-        fi
-        log "Git clone successful"
+        clone_sc0710_repo "$TEMP_DIR"
         cp -r "$TEMP_DIR"/* "$SRC_DIR/"
     fi
 
@@ -831,14 +858,21 @@ if lsmod | grep -q "$DRV_NAME"; then
 fi
 
 [[ -d "$SRC_DEST" ]] && rm -rf "$SRC_DEST"
-mkdir -p "$SRC_DEST"
 LOCAL_MODE=false
 [[ -f "$PROJECT_ROOT/Makefile" && -f "$PROJECT_ROOT/lib/sc0710.h" ]] && confirm "Use local source?" "Y" && LOCAL_MODE=true
 if [[ "$LOCAL_MODE" == "true" ]]; then
+    mkdir -p "$SRC_DEST"
     cp -r "$PROJECT_ROOT"/* "$SRC_DEST/"
 else
     TEMP_DIR=$(mktemp -d -t sc0710.XXXXXX) || die "Failed to create temp directory"
-    git clone --depth 1 "$REPO_URL" "$TEMP_DIR" >/dev/null 2>&1 || die "Git clone failed."
+    clone_sc0710_repo "$TEMP_DIR"
+    if [[ -f "$TEMP_DIR/version" ]]; then
+        DRV_VERSION="$(cat "$TEMP_DIR/version" | tr -d '[:space:]')"
+        SRC_DEST="/usr/src/${DRV_NAME}-${DRV_VERSION}"
+        SOURCE="$SRC_DEST"
+    fi
+    [[ -d "$SRC_DEST" ]] && rm -rf "$SRC_DEST"
+    mkdir -p "$SRC_DEST"
     cp -r "$TEMP_DIR"/* "$SRC_DEST/"
 fi
 verify_essential_files "$SRC_DEST" || die "Source verification failed."
