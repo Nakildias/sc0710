@@ -20,7 +20,7 @@
  */
 
 #include <linux/vmalloc.h>
-#include <linux/timer.h>
+#include <linux/workqueue.h>
 #include "sc0710.h"
 
 static unsigned int audio_debug = 0;
@@ -87,15 +87,13 @@ static void sc0710_audio_push_frames(struct sc0710_audio_dev *chip,
 	}
 }
 
-#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 14, 0)
-static void sc0710_audio_silence_timer_fn(unsigned long data)
+/* Runs in a kworker (process context), so it may take the sleeping
+ * ch->lock / signalMutex -- unlike the old timer callback (softirq),
+ * which caused the "scheduling while atomic" panic on signal loss. */
+static void sc0710_audio_silence_work_fn(struct work_struct *work)
 {
-	struct sc0710_audio_dev *chip = (struct sc0710_audio_dev *)data;
-#else
-static void sc0710_audio_silence_timer_fn(struct timer_list *t)
-{
-	struct sc0710_audio_dev *chip = container_of(t, struct sc0710_audio_dev, silence_timer);
-#endif
+	struct sc0710_audio_dev *chip =
+		container_of(work, struct sc0710_audio_dev, silence_work.work);
 	struct sc0710_dev *dev = chip->dev;
 	struct sc0710_dma_channel *ch = &dev->channel[1];
 
@@ -113,20 +111,23 @@ static void sc0710_audio_silence_timer_fn(struct timer_list *t)
 
 	sc0710_audio_push_frames(chip, SC0710_AUDIO_SILENCE_SAMPLES, NULL, 0, true);
 
+	/* re-check: running can be cleared via the ALSA trigger without ch->lock */
 	if (chip->silence_active && chip->running && chip->substream)
-		mod_timer(&chip->silence_timer,
-			  jiffies + msecs_to_jiffies(SC0710_AUDIO_SILENCE_MS));
+		mod_delayed_work(system_wq, &chip->silence_work,
+				 msecs_to_jiffies(SC0710_AUDIO_SILENCE_MS));
 
 	mutex_unlock(&ch->lock);
 }
 
+/* Sync teardown: process context only, never under ch->lock -- the work
+ * takes ch->lock, so a sync cancel there would deadlock. */
 static void sc0710_audio_stop_silence(struct sc0710_audio_dev *chip)
 {
 	if (!chip)
 		return;
 
 	chip->silence_active = false;
-	timer_delete_sync(&chip->silence_timer);
+	cancel_delayed_work_sync(&chip->silence_work);
 }
 
 void sc0710_audio_on_signal_lost(struct sc0710_dev *dev)
@@ -138,8 +139,8 @@ void sc0710_audio_on_signal_lost(struct sc0710_dev *dev)
 		return;
 
 	chip->silence_active = true;
-	mod_timer(&chip->silence_timer,
-		  jiffies + msecs_to_jiffies(SC0710_AUDIO_SILENCE_MS));
+	mod_delayed_work(system_wq, &chip->silence_work,
+			 msecs_to_jiffies(SC0710_AUDIO_SILENCE_MS));
 
 	if (audio_debug)
 		printk(KERN_INFO "%s: HDMI signal lost, delivering ALSA silence\n", dev->name);
@@ -156,21 +157,17 @@ void sc0710_audio_on_signal_restored(struct sc0710_dev *dev)
 	if (!sc0710_audio_hdmi_active(dev))
 		return;
 
-	sc0710_audio_stop_silence(chip);
+	/* async cancel is enough -- the work re-checks and self-stops */
+	chip->silence_active = false;
+	cancel_delayed_work(&chip->silence_work);
 
 	if (audio_debug)
 		printk(KERN_INFO "%s: HDMI signal restored, resuming capture audio\n", dev->name);
 }
 
-static void sc0710_audio_init_silence_timer(struct sc0710_audio_dev *chip)
+static void sc0710_audio_init_silence_work(struct sc0710_audio_dev *chip)
 {
-#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 14, 0)
-	init_timer(&chip->silence_timer);
-	chip->silence_timer.function = sc0710_audio_silence_timer_fn;
-	chip->silence_timer.data = (unsigned long)chip;
-#else
-	timer_setup(&chip->silence_timer, sc0710_audio_silence_timer_fn, 0);
-#endif
+	INIT_DELAYED_WORK(&chip->silence_work, sc0710_audio_silence_work_fn);
 }
 
 int sc0710_audio_deliver_samples(struct sc0710_dev *dev, struct sc0710_dma_channel *ch,
@@ -267,9 +264,12 @@ static int snd_sc0710_pcm_close(struct snd_pcm_substream *substream)
 	/* Stop the hardware */
 	mutex_lock(&ch->lock);
 	chip->running = false;
-	sc0710_audio_stop_silence(chip);
 	chip->substream = NULL;
 	mutex_unlock(&ch->lock);
+
+	/* sync-cancel outside ch->lock (the work takes it); state cleared
+	 * above, so any pending work bails. */
+	sc0710_audio_stop_silence(chip);
 
 	return 0;
 }
@@ -342,14 +342,18 @@ static int snd_sc0710_capture_trigger(struct snd_pcm_substream *substream, int c
 
 	switch (cmd) {
 	case SNDRV_PCM_TRIGGER_START:
+		/* trigger runs under snd_pcm_stream_lock (atomic): read signal
+		 * state locklessly, never via the sleeping signalMutex. */
 		chip->running = true;
-		if (!sc0710_audio_hdmi_active(dev))
+		if (!(READ_ONCE(dev->locked) && READ_ONCE(dev->fmt)))
 			sc0710_audio_on_signal_lost(dev);
 		return 0;
 
 	case SNDRV_PCM_TRIGGER_STOP:
+		/* atomic context: async cancel only; pcm_close() does the sync teardown */
 		chip->running = false;
-		sc0710_audio_stop_silence(chip);
+		chip->silence_active = false;
+		cancel_delayed_work(&chip->silence_work);
 		return 0;
 
 	default:
@@ -447,7 +451,7 @@ int sc0710_audio_register(struct sc0710_dev *dev)
 	chip->buffer_ptr = 0;
 	chip->running = false;
 	chip->silence_active = false;
-	sc0710_audio_init_silence_timer(chip);
+	sc0710_audio_init_silence_work(chip);
 
 	err = snd_sc0710_pcm(chip, 0, "sc0710 HDMI");
 	if (err < 0)
