@@ -497,7 +497,7 @@ static int sc0710_ecp5_firmware_check(struct sc0710_dev *dev)
 	 * Full .bit file = (second half XOR 0xA5) + (first half XOR 0x5A).
 	 * Windows sends all 356,448 bytes including text header.
 	 */
-	decoded = vmalloc(half_size * 2);
+	decoded = vmalloc(fw_size - FWI_HEADER_SIZE);
 	if (!decoded) {
 		if (fw)
 			release_firmware(fw);
