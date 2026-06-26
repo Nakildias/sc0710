@@ -35,6 +35,7 @@
 #include <linux/version.h>
 #include <linux/mutex.h>
 #include <linux/kthread.h>
+#include <linux/workqueue.h>
 #include <linux/freezer.h>
 #include <linux/v4l2-dv-timings.h>
 #include <media/v4l2-device.h>
@@ -375,7 +376,7 @@ struct sc0710_audio_dev
 	snd_pcm_uframes_t          period_pos;
 	bool                       running;
 	bool                       silence_active;
-	struct timer_list          silence_timer;
+	struct delayed_work        silence_work;
 };
 
 struct sc0710_dev {
