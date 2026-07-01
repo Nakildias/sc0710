@@ -45,7 +45,9 @@ $(VERSION_HDR): version
 
 all: $(VERSION_HDR)
 	@mkdir -p "$(MODULE_OUTPUT_DIR)"
-	$(MAKE) -C "$(KBUILD_DIR)" M="$(CURDIR)" $(KBUILD_CC) modules
+	# kbuild must not inherit DKMS's -jN; high parallelism can hit EMFILE in the
+	# kernel tree Makefile on large systems (e.g. -j32 on CachyOS).
+	$(MAKE) -j1 -C "$(KBUILD_DIR)" M="$(CURDIR)" $(KBUILD_CC) modules
 	@# kbuild builds in place; stage the resulting module into build/.
 	@if [ -f "$(CURDIR)/sc0710.ko" ] && [ ! -f "$(MODULE_OUTPUT_DIR)/sc0710.ko" ]; then \
 		cp "$(CURDIR)/sc0710.ko" "$(MODULE_OUTPUT_DIR)/sc0710.ko"; \
@@ -58,7 +60,7 @@ clean:
 	rm -f sc0710.ko sc0710.o sc0710.mod sc0710.mod.c sc0710.mod.o .module-common.o \
 		Module.symvers modules.order .sc0710*.cmd .module-common*.cmd .modules*.cmd
 	rm -rf .tmp_versions
-	$(MAKE) -C "$(KBUILD_DIR)" M="$(CURDIR)" clean 2>/dev/null || true
+	$(MAKE) -j1 -C "$(KBUILD_DIR)" M="$(CURDIR)" clean 2>/dev/null || true
 
 load: all
 	sudo dmesg -c >/dev/null
