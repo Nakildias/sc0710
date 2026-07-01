@@ -28,6 +28,8 @@ sc0710_dkms_cleanup() {
     rm -rf "/usr/src/${drv}-"*
 
     find /usr/lib/modules -path "*/updates/dkms/${drv}.ko*" -delete 2>/dev/null || true
+    find /usr/lib/modules -path "*/kernel/drivers/media/pci/${drv}.ko*" -delete 2>/dev/null || true
+    depmod -a >/dev/null 2>&1 || true
 }
 
 sc0710_dkms_installed_src_version() {

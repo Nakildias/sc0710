@@ -160,6 +160,8 @@ _dkms_cleanup() {
 
     # Drop stale modules left when an older DKMS version was removed without --all.
     find /usr/lib/modules -path "*/updates/dkms/${DRV_NAME}.ko*" -delete 2>/dev/null || true
+    find /usr/lib/modules -path "*/kernel/drivers/media/pci/${DRV_NAME}.ko*" -delete 2>/dev/null || true
+    depmod -a 2>/dev/null || true
 }
 
 pre_install() {

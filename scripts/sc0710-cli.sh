@@ -138,6 +138,8 @@ sc0710_dkms_run_cleanup() {
     rmdir "/var/lib/dkms/${DRV_NAME}" 2>/dev/null || true
     rm -rf /usr/src/${DRV_NAME}-*
     find /usr/lib/modules -path "*/updates/dkms/${DRV_NAME}.ko*" -delete 2>/dev/null || true
+    find /usr/lib/modules -path "*/kernel/drivers/media/pci/${DRV_NAME}.ko*" -delete 2>/dev/null || true
+    depmod -a >/dev/null 2>&1 || true
 }
 
 sc0710_firmware_lib_path() {
