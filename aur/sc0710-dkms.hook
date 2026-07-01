@@ -1,0 +1,10 @@
+[Trigger]
+Operation = Install
+Operation = Upgrade
+Type = Package
+Target = sc0710-dkms-git
+
+[Action]
+Description = Ensure sc0710 DKMS module is installed
+When = PostTransaction
+Exec = /usr/lib/sc0710/sc0710-dkms-ensure.sh
