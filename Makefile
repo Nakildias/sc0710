@@ -45,9 +45,8 @@ $(VERSION_HDR): version
 
 all: $(VERSION_HDR)
 	@mkdir -p "$(MODULE_OUTPUT_DIR)"
-	# kbuild must not inherit DKMS's -jN; high parallelism can hit EMFILE in the
-	# kernel tree Makefile on large systems (e.g. -j32 on CachyOS).
-	$(MAKE) -j1 -C "$(KBUILD_DIR)" M="$(CURDIR)" $(KBUILD_CC) modules
+	@ulimit -n 1048576 2>/dev/null || ulimit -n 65536 2>/dev/null || ulimit -n 4096 2>/dev/null || true; \
+	$(MAKE) MAKEFLAGS= -j1 -C "$(KBUILD_DIR)" M="$(CURDIR)" $(KBUILD_CC) modules
 	@# kbuild builds in place; stage the resulting module into build/.
 	@if [ -f "$(CURDIR)/sc0710.ko" ] && [ ! -f "$(MODULE_OUTPUT_DIR)/sc0710.ko" ]; then \
 		cp "$(CURDIR)/sc0710.ko" "$(MODULE_OUTPUT_DIR)/sc0710.ko"; \

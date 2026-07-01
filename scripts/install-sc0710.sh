@@ -938,7 +938,7 @@ BUILT_MODULE_NAME[0]="$DRV_NAME"
 DEST_MODULE_LOCATION[0]="/kernel/drivers/media/pci/"
 AUTOINSTALL="yes"
 BUILT_MODULE_LOCATION[0]="build/"
-MAKE[0]="make KVERSION=\$kernelver"
+MAKE[0]="bash /usr/lib/sc0710/sc0710-dkms-make.sh \$kernelver"
 DKMSEOF
     sc0710_dkms_cleanup
     dkms add -m "$DRV_NAME" -v "$DKMS_VERSION" >/dev/null 2>&1 || true
