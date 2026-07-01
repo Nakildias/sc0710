@@ -40,6 +40,41 @@ else
     PROJECT_ROOT="$(pwd)"
 fi
 
+if [[ -f /usr/lib/sc0710/sc0710-dkms-lib.sh ]]; then
+    # shellcheck source=/dev/null
+    source /usr/lib/sc0710/sc0710-dkms-lib.sh
+elif [[ -f "${PROJECT_ROOT}/scripts/sc0710-dkms-lib.sh" ]]; then
+    # shellcheck source=/dev/null
+    source "${PROJECT_ROOT}/scripts/sc0710-dkms-lib.sh"
+fi
+
+if ! declare -F sc0710_version_to_dkms >/dev/null; then
+    sc0710_version_to_dkms() {
+        local ver="${1//[[:space:]]/}"
+        if [[ "$ver" == *-* ]]; then
+            printf '%s.%s' "${ver%-*}" "${ver##*-}"
+        else
+            printf '%s' "$ver"
+        fi
+    }
+fi
+
+if ! declare -F sc0710_dkms_cleanup >/dev/null; then
+    sc0710_dkms_cleanup() {
+        local ver_item drv="${SC0710_DRV_NAME:-sc0710}"
+        lsmod | grep -q "^${drv} " && rmmod "$drv" 2>/dev/null || true
+        for ver_item in $(dkms status 2>/dev/null | awk -F'[:,]' "/^${drv}/ {print \$1}" | tr -d ' '); do
+            dkms remove "$ver_item" --all >/dev/null 2>&1 || \
+                rm -rf "/var/lib/dkms/$(echo "$ver_item" | tr ',' '/')" 2>/dev/null
+        done
+        rmdir "/var/lib/dkms/${drv}" 2>/dev/null || true
+        rm -rf "/usr/src/${drv}-"*
+        find /usr/lib/modules -path "*/updates/dkms/${drv}.ko*" -delete 2>/dev/null || true
+        find /usr/lib/modules -path "*/kernel/drivers/media/pci/${drv}.ko*" -delete 2>/dev/null || true
+        depmod -a >/dev/null 2>&1 || true
+    }
+fi
+
 # --- Configuration ---
 REPO_URL="https://github.com/Nakildias/sc0710.git"
 VERSION_URL="https://raw.githubusercontent.com/Nakildias/sc0710/main/version"
@@ -51,6 +86,7 @@ if [[ -f "version" ]]; then
 else
     DRV_VERSION=$(curl -fsSL "$VERSION_URL" | tr -d '[:space:]')
 fi
+DKMS_VERSION="$(sc0710_version_to_dkms "$DRV_VERSION")"
 
 SRC_DIR="/var/lib/sc0710"
 KERNEL_VER="$(uname -r)"
@@ -780,9 +816,9 @@ fi
 else
 # --- NON-ATOMIC FLOW ---
 log "=== SC0710 Driver Installation Started (Non-Atomic) ==="
-log "Version: $DRV_VERSION | Kernel: $KERNEL_VER"
+log "Version: $DRV_VERSION | DKMS: $DKMS_VERSION | Kernel: $KERNEL_VER"
 IS_ATOMIC=false
-SRC_DEST="/usr/src/${DRV_NAME}-${DRV_VERSION}"
+SRC_DEST="/usr/src/${DRV_NAME}-${DKMS_VERSION}"
 SOURCE="$SRC_DEST"
 LOG_FILE="$LOG_FILE_NONATOMIC"
 
@@ -868,7 +904,8 @@ else
     clone_sc0710_repo "$TEMP_DIR"
     if [[ -f "$TEMP_DIR/version" ]]; then
         DRV_VERSION="$(cat "$TEMP_DIR/version" | tr -d '[:space:]')"
-        SRC_DEST="/usr/src/${DRV_NAME}-${DRV_VERSION}"
+        DKMS_VERSION="$(sc0710_version_to_dkms "$DRV_VERSION")"
+        SRC_DEST="/usr/src/${DRV_NAME}-${DKMS_VERSION}"
         SOURCE="$SRC_DEST"
     fi
     [[ -d "$SRC_DEST" ]] && rm -rf "$SRC_DEST"
@@ -896,19 +933,17 @@ confirm "Enable automatic updates (DKMS)?" "Y" && USE_DKMS=true
 if [[ "$USE_DKMS" == "true" ]]; then
     cat > "$SRC_DEST/dkms.conf" << DKMSEOF
 PACKAGE_NAME="$DRV_NAME"
-PACKAGE_VERSION="$DRV_VERSION"
+PACKAGE_VERSION="$DKMS_VERSION"
 BUILT_MODULE_NAME[0]="$DRV_NAME"
 DEST_MODULE_LOCATION[0]="/kernel/drivers/media/pci/"
 AUTOINSTALL="yes"
 BUILT_MODULE_LOCATION[0]="build/"
 MAKE[0]="make KVERSION=\$kernelver -j\$(nproc)"
 DKMSEOF
-    if dkms status 2>/dev/null | grep -q "$DRV_NAME"; then
-        confirm "Remove existing DKMS and reinstall?" "Y" && for ver_item in $(dkms status 2>/dev/null | awk -F'[:,]' '/^sc0710/ {print $1}' | tr -d ' '); do dkms remove "$ver_item" --all >/dev/null 2>&1 || true; done
-    fi
-    dkms add -m "$DRV_NAME" -v "$DRV_VERSION" >/dev/null 2>&1 || true
-    dkms build -m "$DRV_NAME" -v "$DRV_VERSION" -k "$KERNEL_VER" 2>&1 | tee -a "$LOG_FILE" || { error "DKMS build failed."; exit 1; }
-    dkms install -m "$DRV_NAME" -v "$DRV_VERSION" -k "$KERNEL_VER" --force 2>&1 | tee -a "$LOG_FILE" || { error "DKMS install failed."; exit 1; }
+    sc0710_dkms_cleanup
+    dkms add -m "$DRV_NAME" -v "$DKMS_VERSION" >/dev/null 2>&1 || true
+    dkms build -m "$DRV_NAME" -v "$DKMS_VERSION" -k "$KERNEL_VER" 2>&1 | tee -a "$LOG_FILE" || { error "DKMS build failed."; exit 1; }
+    dkms install -m "$DRV_NAME" -v "$DKMS_VERSION" -k "$KERNEL_VER" --force 2>&1 | tee -a "$LOG_FILE" || { error "DKMS install failed."; exit 1; }
 else
     cd "$SRC_DEST"
     make -j"$(nproc)" 2>&1 | tee -a "$LOG_FILE" || { error "Build failed."; exit 1; }

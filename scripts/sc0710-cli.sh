@@ -97,6 +97,51 @@ sc0710_is_4k_pro_card() {
     lspci -n -v -d 12ab:0710 2>/dev/null | grep -qi "1cfa:0012"
 }
 
+sc0710_dkms_lib_path() {
+    local path cli_dir
+    for path in \
+        /usr/lib/sc0710/sc0710-dkms-lib.sh \
+        "$(dirname "$(sc0710_cli_path)")/sc0710-dkms-lib.sh" \
+        "$(dirname "$(sc0710_cli_path)")/../scripts/sc0710-dkms-lib.sh"; do
+        [[ -n "$path" && -f "$path" ]] || continue
+        printf '%s\n' "$path"
+        return 0
+    done
+    return 1
+}
+
+sc0710_version_to_dkms() {
+    local ver="${1//[[:space:]]/}"
+    if [[ "$ver" == *-* ]]; then
+        printf '%s.%s' "${ver%-*}" "${ver##*-}"
+    else
+        printf '%s' "$ver"
+    fi
+}
+
+sc0710_dkms_run_cleanup() {
+    local ver_item dkms_lib
+
+    if dkms_lib=$(sc0710_dkms_lib_path); then
+        # shellcheck source=/dev/null
+        if source "$dkms_lib" && declare -F sc0710_dkms_cleanup >/dev/null 2>&1; then
+            sc0710_dkms_cleanup
+            return 0
+        fi
+    fi
+
+    lsmod | grep -q "^${DRV_NAME} " && rmmod "$DRV_NAME" 2>/dev/null || true
+    for ver_item in $(dkms status 2>/dev/null | awk -F'[:,]' "/^${DRV_NAME}/ {print \$1}" | tr -d ' '); do
+        dkms remove "$ver_item" --all >/dev/null 2>&1 || \
+            rm -rf "/var/lib/dkms/$(echo "$ver_item" | tr ',' '/')" 2>/dev/null
+    done
+    rmdir "/var/lib/dkms/${DRV_NAME}" 2>/dev/null || true
+    rm -rf /usr/src/${DRV_NAME}-*
+    find /usr/lib/modules -path "*/updates/dkms/${DRV_NAME}.ko*" -delete 2>/dev/null || true
+    find /usr/lib/modules -path "*/kernel/drivers/media/pci/${DRV_NAME}.ko*" -delete 2>/dev/null || true
+    depmod -a >/dev/null 2>&1 || true
+}
+
 sc0710_firmware_lib_path() {
     if [[ "$IS_ATOMIC" == "true" && -f "$SRC_DIR/sc0710-firmware-lib.sh" ]]; then
         echo "$SRC_DIR/sc0710-firmware-lib.sh"
@@ -1220,21 +1265,17 @@ case "$1" in
             rm -f "$TEMP_TAR"
             
             REAL_NEW_VER=$(cat "$TEMP_DIR/version" | tr -d '[:space:]')
-            NEW_DKMS_SRC="/usr/src/${DRV_NAME}-${REAL_NEW_VER}"
-            
+            NEW_DKMS_VER=$(sc0710_version_to_dkms "$REAL_NEW_VER")
+
             lsmod | grep -q "$DRV_NAME" && "$0" --unload
-            
-            for ver_item in $(dkms status 2>/dev/null | awk -F'[:,]' '/^sc0710/ {print $1}' | tr -d ' '); do
-                dkms remove "$ver_item" --all >/dev/null 2>&1 || rm -rf "/var/lib/dkms/$(echo "$ver_item" | tr ',' '/')" 2>/dev/null
-            done
-            rmdir "/var/lib/dkms/${DRV_NAME}" 2>/dev/null || true
-            rm -rf /usr/src/${DRV_NAME}-*
-            
+            sc0710_dkms_run_cleanup
+            NEW_DKMS_SRC="/usr/src/${DRV_NAME}-${NEW_DKMS_VER}"
+
             mv "$TEMP_DIR" "$NEW_DKMS_SRC"
             sc0710_cli_refresh_firmware_services "$NEW_DKMS_SRC"
 
-            dkms add -m "$DRV_NAME" -v "$REAL_NEW_VER" >/dev/null 2>&1
-            if dkms install -m "$DRV_NAME" -v "$REAL_NEW_VER" -k "$(uname -r)" 2>&1; then
+            dkms add -m "$DRV_NAME" -v "$NEW_DKMS_VER" >/dev/null 2>&1
+            if dkms install -m "$DRV_NAME" -v "$NEW_DKMS_VER" -k "$(uname -r)" --force 2>&1; then
                 if sc0710_is_4k_pro_card && sc0710_firmware_lib_path >/dev/null; then
                     if sc0710_cli_ensure_ecp5 5; then
                         echo -e "${GREEN}[OK]${NC} Driver updated (v${REAL_NEW_VER}), ECP5 FPGA programmed."
@@ -1281,11 +1322,7 @@ case "$1" in
             rm -rf "$SRC_DIR"
             echo -e "  ${YELLOW}NOTE:${NC} Layered build packages were left unchanged (no rpm-ostree changes, no reboot needed)."
         else
-            for ver_item in $(dkms status 2>/dev/null | awk -F'[:,]' '/^sc0710/ {print $1}' | tr -d ' '); do
-                dkms remove "$ver_item" --all >/dev/null 2>&1 || rm -rf "/var/lib/dkms/$(echo "$ver_item" | tr ',' '/')" 2>/dev/null
-            done
-            rmdir "/var/lib/dkms/${DRV_NAME}" 2>/dev/null || true
-            rm -rf /usr/src/${DRV_NAME}-*
+            sc0710_dkms_run_cleanup
         fi
         sc0710_cli_remove_user_state
         rm -f /usr/local/bin/sc0710-cli
