@@ -56,7 +56,6 @@ package() {
 
     # Ship CLI and 4K Pro firmware helpers outside the stripped DKMS tree.
     install -Dm755 scripts/sc0710-cli.sh "${pkgdir}/usr/bin/sc0710-cli"
-    install -Dm755 scripts/sc0710-firmware.sh "${pkgdir}/usr/lib/sc0710/sc0710-firmware.sh"
     install -Dm755 scripts/sc0710-firmware-lib.sh "${pkgdir}/usr/lib/sc0710/sc0710-firmware-lib.sh"
     install -Dm755 scripts/extract-firmware.sh "${pkgdir}/usr/lib/sc0710/extract-firmware.sh"
     install -Dm755 scripts/sc0710-dkms-lib.sh "${pkgdir}/usr/lib/sc0710/sc0710-dkms-lib.sh"

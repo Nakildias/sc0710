@@ -24,6 +24,7 @@
 
 #include <linux/vmalloc.h>
 #include <linux/module.h>
+#include <linux/idr.h>
 #include "sc0710.h"
 
 MODULE_DESCRIPTION("Elgato 4K60 Pro MK.2 / 4K Pro capture driver");
@@ -63,10 +64,6 @@ module_param(sc0710_debug_mode, int, 0644);
 MODULE_PARM_DESC(sc0710_debug_mode, "Enable debug logging (0=off, 1=on)");
 EXPORT_SYMBOL(sc0710_debug_mode);
 
-unsigned int msi_enable = 0;
-module_param_named(msi_enable, msi_enable, int, 0644);
-MODULE_PARM_DESC(msi_enable, "use msi interrupts (def: 1)");
-
 unsigned int scaler_mode = 0;
 module_param(scaler_mode, int, 0644);
 MODULE_PARM_DESC(scaler_mode, "Software scaler: 0=disabled, 1=upscale 4K, 2=downscale 1080P");
@@ -79,6 +76,13 @@ unsigned int procedural_timings = TIMING_MODE_MERGE;
 module_param(procedural_timings, int, 0644);
 MODULE_PARM_DESC(procedural_timings,
 	"Timing selection mode: 0=merge(static+procedural), 1=procedural-only, 2=static-only");
+
+char *sc0710_edid_profile = "";
+module_param_named(edid, sc0710_edid_profile, charp, 0444);
+MODULE_PARM_DESC(edid,
+	"EDID profile presented to the HDMI source, e.g. \"1440p\" (4K Pro only). Loads "
+	"/lib/firmware/sc0710/edid/<name>.bin, installed by scripts/extract-firmware.sh; "
+	"empty = factory default.");
 
 unsigned int dma_resync_validate_frames = 8;
 module_param(dma_resync_validate_frames, int, 0644);
@@ -114,9 +118,14 @@ MODULE_PARM_DESC(card, "card type");
 		printk(KERN_DEBUG "%s: " fmt, dev->name, ## arg);\
 	} while (0)
 
-static unsigned int sc0710_devcount;
 static DEFINE_MUTEX(devlist);
 LIST_HEAD(sc0710_devlist);
+
+/* dev->nr allocator.
+ * nr indexes the SC0710_MAXBOARDS-sized module-param arrays and must stay
+ * unique among live devices, so slots are reclaimed on remove and on every
+ * probe-failure path. */
+static DEFINE_IDA(sc0710_nr_ida);
 
 #define SC0710_DMA_WATCHDOG_TIMEOUT_MS 3000
 
@@ -173,6 +182,7 @@ static int get_resources(struct sc0710_dev *dev)
 	{
 		printk(KERN_ERR "%s: can't get bar[%d] memory @ 0x%llx\n",
 			dev->name, bar1_idx, (unsigned long long)pci_resource_start(dev->pci, bar1_idx));
+		release_mem_region(pci_resource_start(dev->pci, 0), pci_resource_len(dev->pci, 0));
 		return -EBUSY;
 	}
 
@@ -188,7 +198,12 @@ static int sc0710_dev_setup(struct sc0710_dev *dev)
 
 	atomic_inc(&dev->refcount);
 
-	dev->nr = sc0710_devcount++;
+	dev->nr = ida_alloc_max(&sc0710_nr_ida, SC0710_MAXBOARDS - 1, GFP_KERNEL);
+	if (dev->nr < 0) {
+		printk(KERN_ERR "sc0710: all %d board slots in use, refusing probe\n",
+			SC0710_MAXBOARDS);
+		return -ENODEV;
+	}
 	sprintf(dev->name, "sc0710[%d]", dev->nr);
 
 	/* board config */
@@ -214,7 +229,7 @@ static int sc0710_dev_setup(struct sc0710_dev *dev)
 		       dev->name, dev->pci->subsystem_vendor,
 		       dev->pci->subsystem_device);
 
-		sc0710_devcount--;
+		ida_free(&sc0710_nr_ida, dev->nr);
 		return -ENODEV;
 	}
 
@@ -226,6 +241,19 @@ static int sc0710_dev_setup(struct sc0710_dev *dev)
 	dev->bmmio[0] = (u8 __iomem *)dev->lmmio[0];
 	dev->lmmio[1] = ioremap(pci_resource_start(dev->pci, bar1_idx), dev->bar1_size);
 	dev->bmmio[1] = (u8 __iomem *)dev->lmmio[1];
+	if (!dev->lmmio[0] || !dev->lmmio[1]) {
+		printk(KERN_ERR "%s: ioremap failed, aborting probe\n", dev->name);
+		if (dev->lmmio[0])
+			iounmap(dev->lmmio[0]);
+		if (dev->lmmio[1])
+			iounmap(dev->lmmio[1]);
+		dev->lmmio[0] = NULL;
+		dev->lmmio[1] = NULL;
+		release_mem_region(pci_resource_start(dev->pci, 0), pci_resource_len(dev->pci, 0));
+		release_mem_region(pci_resource_start(dev->pci, bar1_idx), pci_resource_len(dev->pci, bar1_idx));
+		ida_free(&sc0710_nr_ida, dev->nr);
+		return -ENOMEM;
+	}
 
 	printk(KERN_INFO "%s: subsystem: %04x:%04x, board: %s [card=%d,%s]\n",
 	       dev->name, dev->pci->subsystem_vendor,
@@ -256,22 +284,10 @@ static void sc0710_dev_unregister(struct sc0710_dev *dev)
 
 	iounmap(dev->lmmio[0]);
 	iounmap(dev->lmmio[1]);
-}
 
-static irqreturn_t sc0710_irq(int irq, void *dev_id)
-{
-	//struct sc0710_dev *dev = dev_id;
-	u32 irq_mask = 0, irq_status = 0, irq_clear = 0;
-	int handled = 0;
-
-//	irq_mask = tm_read(INTR_MSK);
-//	irq_status = tm_read(INTR_STS);
-//	irq_clear = tm_read(INTR_CLR);
-
-	printk(KERN_ERR "irq: msk:%08x clr:%08x sts:%08x\n",
-		irq_mask, irq_clear, irq_status);
-
-	return IRQ_RETVAL(handled);
+	/* Single nr release point: probe failure and remove both land here
+	 * exactly once per device. */
+	ida_free(&sc0710_nr_ida, dev->nr);
 }
 
 #ifdef CONFIG_PROC_FS
@@ -282,23 +298,21 @@ static int sc0710_proc_state_show(struct seq_file *m, void *v)
 	struct list_head *list;
 	int i;
 
-	if (sc0710_devcount == 0)
-		return 0;
-
-	/* For each sc0710 in the system */
+	/* For each sc0710 in the system.
+	 * Hold the devlist mutex so a concurrent unbind/rmmod can't free a dev
+	 * under us. */
+	mutex_lock(&devlist);
 	list_for_each(list, &sc0710_devlist) {
 		dev = list_entry(list, struct sc0710_dev, devlist);
 
 		seq_printf(m, "%s\n", dev->name);
 		seq_printf(m, "  dma status: %d\n", dma_status);
 
-		/* Show channel metrics */
-		//sc0710_i2c_hdmi_status_dump(dev);
-		sc0710_i2c_read_hdmi_status(dev);
-		sc0710_i2c_read_status2(dev);
-		sc0710_i2c_read_status3(dev);
-		sc0710_i2c_read_procamp(dev);
-
+		/* Cached state only: this file is world-readable, so its read path
+		 * must not run I2C or trigger a DMA reconfig; the HDMI poll
+		 * thread keeps the cache fresh. signalMutex is held until after
+		 * the scaler block: everything up to there reads dev->fmt or
+		 * fields the HDMI thread rewrites. */
 		mutex_lock(&dev->signalMutex);
 		seq_printf(m, "         fmt: %p\n", dev->fmt);
 	        if (dev->locked) {
@@ -313,7 +327,6 @@ static int sc0710_proc_state_show(struct seq_file *m, void *v)
 		} else {
 			seq_printf(m, "        HDMI: no signal\n");
 		}
-		mutex_unlock(&dev->signalMutex);
 
 		seq_printf(m, " colorimetry: %s\n", sc0710_colorimetry_ascii(dev->colorimetry));
 		seq_printf(m, "  colorspace: %s\n", sc0710_colorspace_ascii(dev->colorspace));
@@ -356,9 +369,12 @@ static int sc0710_proc_state_show(struct seq_file *m, void *v)
 					dyn_active ? "ACTIVE" : "INACTIVE");
 			}
 		}
+		mutex_unlock(&dev->signalMutex);
 
 		for (i = 0; i < SC0710_MAX_CHANNELS; i++) {
 			ch = &dev->channel[i];
+			if (!ch->enabled)
+				continue;
 			seq_printf(m, "  ch[%d]\n", i);
 			seq_printf(m, "        type: %s\n",
 				ch->mediatype == CHTYPE_VIDEO ? "VIDEO" : "AUDIO");
@@ -376,6 +392,7 @@ static int sc0710_proc_state_show(struct seq_file *m, void *v)
 		}
 
 	}
+	mutex_unlock(&devlist);
 
 	return 0;
 }
@@ -387,17 +404,26 @@ static int sc0710_proc_show(struct seq_file *m, void *v)
 	int i;
 	u32 val;
 
-	if (sc0710_devcount == 0)
-		return 0;
-
-	/* For each sc0710 in the system */
+	/* For each sc0710 in the system (devlist mutex held so a concurrent
+	 * unbind/rmmod can't free a dev under us) */
+	mutex_lock(&devlist);
 	list_for_each(list, &sc0710_devlist) {
 		dev = list_entry(list, struct sc0710_dev, devlist);
 		seq_printf(m, "%s = %p\n", dev->name, dev);
 
 		if (procfs_verbosity & 0x02) {
+			/* sc_read() only bounds-checks BAR1, so clamp the
+			 * walk to the real BAR0 length. */
+			u32 end = min_t(u64, 0x100000,
+					pci_resource_len(dev->pci, 0));
+
 			seq_printf(m, "Full PCI Register Dump:\n");
-			for (i = 0; i < 0x100000; i += 4) {
+			for (i = 0; i < end; i += 4) {
+				/* Reading a FIFO data register pops a byte from
+				 * a possibly in-flight transfer: AXI IIC
+				 * RX_FIFO 0x310C, QSPI DRR 0x206C. */
+				if (i == 0x310c || i == 0x206c)
+					continue;
 				val = sc_read(dev, 0, i);
 				if (val) {
 					seq_printf(m, " 0x%04x = %08x\n", i, val);
@@ -406,6 +432,7 @@ static int sc0710_proc_show(struct seq_file *m, void *v)
 		}
 
 	}
+	mutex_unlock(&devlist);
 
 	return 0;
 }
@@ -454,13 +481,17 @@ static int sc0710_proc_create(void)
 {
 	struct proc_dir_entry *pe;
 
-	pe = proc_create("sc0710", S_IRUGO, NULL, &sc0710_proc_fops);
+	/* Root-only: the raw register dump has no business being world-readable.
+	 * sc0710-cli only reads sc0710-state, which stays 0444. */
+	pe = proc_create("sc0710", S_IRUSR, NULL, &sc0710_proc_fops);
 	if (!pe)
 		return -ENOMEM;
 
 	pe = proc_create("sc0710-state", S_IRUGO, NULL, &sc0710_proc_state_fops);
-	if (!pe)
+	if (!pe) {
+		remove_proc_entry("sc0710", NULL);
 		return -ENOMEM;
+	}
 
 	return 0;
 }
@@ -511,7 +542,9 @@ static int sc0710_thread_dma_function(void *data)
 	set_freezable();
 
 	while (1) {
-		msleep_interruptible(thread_dma_poll_interval_ms);
+		/* The param is root-writable at runtime; 0 would busy-loop this
+		 * thread. */
+		msleep_interruptible(max_t(unsigned int, thread_dma_poll_interval_ms, 1));
 
 		if (kthread_should_stop())
 			break;
@@ -550,7 +583,6 @@ static int sc0710_thread_dma_function(void *data)
 		}
 	}
 
-	thread_dma_active = 0;
 	dprintk(1, "%s() Stopped\n", __func__);
 	return 0;
 }
@@ -558,6 +590,7 @@ static int sc0710_thread_dma_function(void *data)
 static int sc0710_thread_hdmi_function(void *data)
 {
 	struct sc0710_dev *dev = data;
+	unsigned int tick = 0;
 
 	dprintk(1, "%s() Started\n", __func__);
 
@@ -566,7 +599,8 @@ static int sc0710_thread_hdmi_function(void *data)
 	set_freezable();
 
 	while (1) {
-		msleep_interruptible(thread_hdmi_poll_interval_ms);
+		/* Same busy-loop guard as the DMA thread. */
+		msleep_interruptible(max_t(unsigned int, thread_hdmi_poll_interval_ms, 1));
 
 		if (kthread_should_stop())
 			break;
@@ -587,6 +621,12 @@ static int sc0710_thread_hdmi_function(void *data)
 		}
 
 		sc0710_i2c_read_hdmi_status(dev);
+		/* Keep the procamp cache fresh: /proc/sc0710-state prints it but is
+		 * forbidden from running I2C itself. The values are user controls
+		 * that rarely change, so every 10th tick (~2 s at the default
+		 * interval) is plenty and spares the bus an MCU transaction. */
+		if (tick++ % 10 == 0)
+			sc0710_i2c_read_procamp(dev);
 		//sc0710_i2c_read_status2(dev);
 		//sc0710_i2c_read_status3(dev);
 
@@ -609,7 +649,6 @@ static int sc0710_thread_hdmi_function(void *data)
 		mutex_unlock(&dev->kthread_hdmi_lock);
 	}
 
-	thread_hdmi_active = 0;
 	dprintk(1, "%s() Stopped\n", __func__);
 	return 0;
 }
@@ -618,19 +657,23 @@ static int sc0710_initdev(struct pci_dev *pci_dev,
 	const struct pci_device_id *pci_id)
 {
 	struct sc0710_dev *dev;
-	int err;
+	int err, i;
 
 	dev = kzalloc(sizeof(*dev), GFP_KERNEL);
 	if (NULL == dev)
 		return -ENOMEM;
 
 	err = v4l2_device_register(&pci_dev->dev, &dev->v4l2_dev);
+	if (err < 0) {
+		printk(KERN_ERR "sc0710: v4l2_device_register failed (%d)\n", err);
+		goto fail_free;
+	}
 
 	/* pci init */
 	dev->pci = pci_dev;
 	if (pci_enable_device(pci_dev)) {
 		err = -EIO;
-		goto fail_unreg;
+		goto fail_v4l2;
 	}
 
 	/* print pci info */
@@ -655,46 +698,69 @@ static int sc0710_initdev(struct pci_dev *pci_dev,
 #endif
 		printk("%s/0: Oops: no 32bit PCI DMA ???\n", dev->name);
 		err = -EIO;
-		goto fail_irq;
+		goto fail_disable;
 	}
 
-	/* MAP the PCIe space, register i2c, program any PCIe quirks. */
+	/* MAP the PCIe space, register i2c, program any PCIe quirks.
+	 * Self-cleaning on failure: releases its own regions/mappings. */
 	if (sc0710_dev_setup(dev) < 0) {
 		err = -EINVAL;
-		goto fail_unreg;
+		goto fail_disable;
 	}
 
-	if ((msi_enable) && (!pci_enable_msi(pci_dev))) {
-		printk("%s() MSI interrupts enabled\n", __func__);
-		err = request_irq(pci_dev->irq, sc0710_irq,
-#if LINUX_VERSION_CODE <= KERNEL_VERSION(4,0,0)
-			IRQF_DISABLED,
-#else
-			0,
-#endif
-			dev->name, dev);
-	} else {
-		printk("%s() MSI interrupts disabled (driver default)\n", __func__);
-		err = request_irq(pci_dev->irq, sc0710_irq,
-			IRQF_SHARED, dev->name, dev);
-	}
+	/* The card's interrupt line is never requested: the vendor design is
+	 * pure polling (the XDMA interrupt-enable masks are never armed, and
+	 * no interrupt was ever observed on hardware), so a handler would
+	 * only invite the spurious-IRQ detector on a shared INTx line. */
+
+	/* Card specific tweaks with subsystems etc. On the 4K Pro this
+	 * includes programming the ECP5 video-frontend FPGA; if that fails,
+	 * fail the probe: binding is the driver's statement that the card can
+	 * capture. */
+	err = sc0710_card_setup(dev);
 	if (err < 0) {
-		printk(KERN_ERR "%s: can't get IRQ %d\n",
-		       dev->name, pci_dev->irq);
-		goto fail_irq;
+		printk(KERN_ERR "%s: card setup failed (%d), aborting probe\n",
+			dev->name, err);
+		goto fail_dev;
 	}
-
-	/* Card specific tweaks with subsystems etc */
-	sc0710_card_setup(dev);
 
 	pci_set_drvdata(pci_dev, dev);
 
 	printk(KERN_INFO "sc0710 device at %s\n", pci_name(pci_dev));
 	printk(KERN_INFO "sc0710 page-size %lu bytes\n", PAGE_SIZE);
 
-	sc0710_dma_channels_alloc(dev);
+	err = sc0710_dma_channels_alloc(dev);
+	if (err < 0) {
+		printk(KERN_ERR "%s: DMA channel allocation failed (%d), aborting probe\n",
+			dev->name, err);
+		goto fail_dev;
+	}
 
 	sc0710_i2c_initialize(dev);
+
+	/* Register the user-facing device nodes last: a registered node can be
+	 * held open (udev probes every new node), so nothing in probe may fail
+	 * after this point or an open fd outlives the kfree below. That is also
+	 * why audio registration and the kthread starts stay non-fatal. */
+	for (i = 0; i < SC0710_MAX_CHANNELS; i++) {
+		struct sc0710_dma_channel *ch = &dev->channel[i];
+
+		if (!ch->enabled)
+			continue;
+		if (ch->mediatype == CHTYPE_VIDEO) {
+			err = sc0710_video_register(ch);
+			if (err < 0) {
+				printk(KERN_ERR "%s: video registration failed (%d), aborting probe\n",
+					dev->name, err);
+				goto fail_dev;
+			}
+		} else if (ch->mediatype == CHTYPE_AUDIO) {
+			/* Audio is optional: video capture works without ALSA. */
+			if (sc0710_audio_register(dev) < 0)
+				printk(KERN_WARNING "%s: audio registration failed, continuing without audio\n",
+					dev->name);
+		}
+	}
 
 	/* Put this in a global list so we can track multiple boards */
 	mutex_lock(&devlist);
@@ -702,24 +768,30 @@ static int sc0710_initdev(struct pci_dev *pci_dev,
 	mutex_unlock(&devlist);
 
 	dev->kthread_hdmi = kthread_run(sc0710_thread_hdmi_function, dev, "sc0710 hdmi");
-	if (!dev->kthread_hdmi) {
+	if (IS_ERR(dev->kthread_hdmi)) {
 		printk(KERN_ERR "%s() Failed to create "
-			"hdmi kernel thread\n", __func__);
+			"hdmi kernel thread (%ld)\n", __func__, PTR_ERR(dev->kthread_hdmi));
+		dev->kthread_hdmi = NULL;
 	} else
 		dprintk(1, "%s() Created the HDMI thread\n", __func__);
 
 	dev->kthread_dma = kthread_run(sc0710_thread_dma_function, dev, "sc0710 dma");
-	if (!dev->kthread_dma) {
+	if (IS_ERR(dev->kthread_dma)) {
 		printk(KERN_ERR "%s() Failed to create "
-			"dma kernel thread\n", __func__);
+			"dma kernel thread (%ld)\n", __func__, PTR_ERR(dev->kthread_dma));
+		dev->kthread_dma = NULL;
 	} else
 		dprintk(1, "%s() Created the DMA thread\n", __func__);
 
 	return 0;
 
-fail_irq:
+fail_dev:
 	sc0710_dev_unregister(dev);
-fail_unreg:
+fail_disable:
+	pci_disable_device(pci_dev);
+fail_v4l2:
+	v4l2_device_unregister(&dev->v4l2_dev);
+fail_free:
 	kfree(dev);
 	return err;
 }
@@ -727,38 +799,24 @@ fail_unreg:
 static void sc0710_finidev(struct pci_dev *pci_dev)
 {
 	struct sc0710_dev *dev = pci_get_drvdata(pci_dev);
-	int i = 0;
 
 	if (dev->kthread_dma) {
 		kthread_stop(dev->kthread_dma);
 		dev->kthread_dma = NULL;
-
-		while (thread_dma_active) {
-			msleep(5);
-			if (i++ > 3)
-				break;
-		}
 	}
 
 	if (dev->kthread_hdmi) {
 		kthread_stop(dev->kthread_hdmi);
 		dev->kthread_hdmi = NULL;
-
-		while (thread_hdmi_active) {
-			msleep(500);
-			if (i++ > 8)
-				break;
-		}
 	}
 
 	sc0710_shutdown(dev);
 
-	pci_disable_device(pci_dev);
+	/* Stop the DMA engines explicitly rather than relying on
+	 * pci_disable_device clearing bus-master while they still run. */
+	sc0710_dma_channels_stop(dev);
 
-	/* unregister stuff */
-	free_irq(pci_dev->irq, dev);
-	if (msi_enable)
-		pci_disable_msi(pci_dev);
+	pci_disable_device(pci_dev);
 
 	mutex_lock(&devlist);
 	list_del(&dev->devlist);
@@ -809,6 +867,8 @@ static struct pci_driver sc0710_pci_driver = {
 
 static int __init sc0710_init(void)
 {
+	int ret;
+
 	printk(KERN_INFO "sc0710 driver version %s loaded\n",
 	       SC0710_DRV_VERSION);
 #ifdef SNAPSHOT
@@ -816,10 +876,21 @@ static int __init sc0710_init(void)
 	       SNAPSHOT/10000, (SNAPSHOT/100)%100, SNAPSHOT%100);
 #endif
 #ifdef CONFIG_PROC_FS
-	sc0710_proc_create();
+	ret = sc0710_proc_create();
+	if (ret < 0) {
+		printk(KERN_ERR "sc0710: failed to create /proc entries (%d)\n", ret);
+		return ret;
+	}
 #endif
 	sc0710_format_initialize();
-	return pci_register_driver(&sc0710_pci_driver);
+	ret = pci_register_driver(&sc0710_pci_driver);
+#ifdef CONFIG_PROC_FS
+	if (ret < 0) {
+		remove_proc_entry("sc0710", NULL);
+		remove_proc_entry("sc0710-state", NULL);
+	}
+#endif
+	return ret;
 }
 
 static void __exit sc0710_fini(void)
@@ -829,6 +900,7 @@ static void __exit sc0710_fini(void)
 	remove_proc_entry("sc0710-state", NULL);
 #endif
 	pci_unregister_driver(&sc0710_pci_driver);
+	sc0710_video_free_status_frames();
 	printk(KERN_INFO "sc0710 driver unloaded\n");
 }
 

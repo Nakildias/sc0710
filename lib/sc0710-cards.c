@@ -22,6 +22,7 @@
 #include <linux/firmware.h>
 #include <linux/vmalloc.h>
 #include <linux/fs.h>
+#include <linux/iopoll.h>
 #include "sc0710.h"
 
 struct sc0710_board sc0710_boards[] = {
@@ -121,18 +122,6 @@ void sc0710_gpio_setup(struct sc0710_dev *dev)
 #define FWI_XOR_FIRST    0x5A
 #define FWI_XOR_SECOND   0xA5
 
-/* Alternative firmware paths for atomic/immutable distros.
- * On these systems, /lib/firmware/ is read-only (part of the OSTree image).
- * The firmware service places the file in a writable location instead.
- * The driver tries request_firmware() first (standard path), then falls
- * back to loading directly from these paths.
- */
-static const char * const firmware_alt_paths[] = {
-	"/var/lib/sc0710/firmware/SC0710.FWI.HEX",
-	"/etc/firmware/sc0710/SC0710.FWI.HEX",
-	NULL
-};
-
 /* Load firmware from an explicit filesystem path.
  * Returns a vmalloc'd buffer and sets *out_size on success, or NULL on failure.
  * Caller must vfree() the returned buffer.
@@ -172,6 +161,52 @@ static void *sc0710_load_firmware_from_path(const char *path, size_t *out_size)
 	*out_size = file_size;
 	return buf;
 }
+
+/* Load a blob by its path relative to the sc0710 firmware directory:
+ * request_firmware("sc0710/<rel>") first, then the same path under each
+ * alternative root (atomic/immutable distros keep /lib/firmware read-only,
+ * so the install tooling drops files under these instead). Returns a
+ * vmalloc'd copy and sets *out_size, or NULL. Caller must vfree().
+ * Shared by the ECP5 and EDID-profile loaders so their search policy
+ * cannot drift apart. */
+void *sc0710_firmware_load(struct sc0710_dev *dev, const char *rel, size_t *out_size)
+{
+	static const char * const alt_roots[] = {
+		"/var/lib/sc0710/firmware",
+		"/etc/firmware/sc0710",
+		NULL
+	};
+	const struct firmware *fw = NULL;
+	char path[128];
+	void *buf;
+	int i;
+
+	*out_size = 0;
+
+	snprintf(path, sizeof(path), "sc0710/%s", rel);
+	if (request_firmware(&fw, path, &dev->pci->dev) == 0) {
+		buf = vmalloc(fw->size);
+		if (buf) {
+			memcpy(buf, fw->data, fw->size);
+			*out_size = fw->size;
+		}
+		release_firmware(fw);
+		return buf;
+	}
+
+	for (i = 0; alt_roots[i]; i++) {
+		snprintf(path, sizeof(path), "%s/%s", alt_roots[i], rel);
+		buf = sc0710_load_firmware_from_path(path, out_size);
+		if (buf) {
+			printk(KERN_INFO "%s: loaded %s (%zu bytes)\n",
+				dev->name, path, *out_size);
+			return buf;
+		}
+	}
+	return NULL;
+}
+
+MODULE_FIRMWARE("sc0710/SC0710.FWI.HEX");
 
 static void ecp5_spi_reset(struct sc0710_dev *dev)
 {
@@ -235,11 +270,32 @@ static int ecp5_spi_xfer(struct sc0710_dev *dev, const u8 *tx, int tx_len,
 	return 0;
 }
 
-/* Send BITSTREAM_BURST command + data
- * Protocol per byte: write DTR -> poll SPISR (TX empty) -> read DRR (drain RX).
- */
-static void ecp5_spi_burst_write(struct sc0710_dev *dev, const u8 *data, u32 len)
+/* Wait for SPI TX empty (SR bit 2). A healthy core drains within a few
+ * reads; the 10 ms budget only matters on a wedged SPI core, where it keeps
+ * this probe-context busy-poll from hard-locking the CPU. */
+static int ecp5_spi_wait_txe(struct sc0710_dev *dev)
 {
+	u32 sr;
+
+	return read_poll_timeout(sc_read, sr, sr & 0x04, 0, 10000, false,
+				 dev, 0, SPI_SR);
+}
+
+/* Push one byte: write DTR -> poll SPISR (TX empty) -> read DRR (drain RX). */
+static int ecp5_spi_push_byte(struct sc0710_dev *dev, u8 b)
+{
+	sc_write(dev, 0, SPI_DTR, b);
+	if (ecp5_spi_wait_txe(dev) < 0)
+		return -ETIMEDOUT;
+	sc_read(dev, 0, SPI_DRR);
+	return 0;
+}
+
+/* Send BITSTREAM_BURST command + data, byte by byte, in one CS cycle. */
+static int ecp5_spi_burst_write(struct sc0710_dev *dev, const u8 *data, u32 len)
+{
+	static const u8 cmd[4] = { ECP5_LSC_BITSTREAM_BURST, 0x00, 0x00, 0x00 };
+	int ret = 0;
 	u32 i;
 
 	/* Reset FIFOs, assert CS, enable master */
@@ -247,42 +303,30 @@ static void ecp5_spi_burst_write(struct sc0710_dev *dev, const u8 *data, u32 len
 	sc_write(dev, 0, SPI_SSR, 0xFFFFFFFE);
 	sc_write(dev, 0, SPI_CR, 0x86);
 
-	/* Send command: 7A 00 00 00 */
-	sc_write(dev, 0, SPI_DTR, ECP5_LSC_BITSTREAM_BURST);
-	while (!(sc_read(dev, 0, SPI_SR) & 0x04))
-		;
-	sc_read(dev, 0, SPI_DRR);
+	for (i = 0; i < sizeof(cmd) && ret == 0; i++)
+		ret = ecp5_spi_push_byte(dev, cmd[i]);
 
-	sc_write(dev, 0, SPI_DTR, 0x00);
-	while (!(sc_read(dev, 0, SPI_SR) & 0x04))
-		;
-	sc_read(dev, 0, SPI_DRR);
+	for (i = 0; i < len && ret == 0; i++) {
+		ret = ecp5_spi_push_byte(dev, data[i]);
 
-	sc_write(dev, 0, SPI_DTR, 0x00);
-	while (!(sc_read(dev, 0, SPI_SR) & 0x04))
-		;
-	sc_read(dev, 0, SPI_DRR);
-
-	sc_write(dev, 0, SPI_DTR, 0x00);
-	while (!(sc_read(dev, 0, SPI_SR) & 0x04))
-		;
-	sc_read(dev, 0, SPI_DRR);
-
-	/* Send data bytes */
-	for (i = 0; i < len; i++) {
-		sc_write(dev, 0, SPI_DTR, data[i]);
-		while (!(sc_read(dev, 0, SPI_SR) & 0x04))
-			;
-		sc_read(dev, 0, SPI_DRR);
+		/* ~356 KB of tight MMIO polling in probe context: give the
+		 * scheduler a chance every 4 KB. */
+		if ((i & 0xFFF) == 0 && i > 0)
+			cond_resched();
 
 		if ((i & 0x7FFF) == 0 && i > 0)
 			printk(KERN_INFO "%s: ECP5 programming %u/%u bytes\n",
 				dev->name, i, len);
 	}
 
+	if (ret < 0)
+		printk(KERN_ERR "%s: ECP5 SPI wedged (TX-empty timeout), aborting firmware burst\n",
+			dev->name);
+
 	/* Inhibit master, deassert CS */
 	sc_write(dev, 0, SPI_CR, 0x186);
 	sc_write(dev, 0, SPI_SSR, 0xFFFFFFFF);
+	return ret;
 }
 
 static u32 ecp5_read_idcode(struct sc0710_dev *dev)
@@ -378,7 +422,9 @@ static int ecp5_program_bitstream(struct sc0710_dev *dev, const u8 *data, u32 le
 	msleep(1);
 
 	/* BITSTREAM_BURST — command + data in one CS cycle */
-	ecp5_spi_burst_write(dev, data, len);
+	ret = ecp5_spi_burst_write(dev, data, len);
+	if (ret)
+		return ret;
 
 	/* Check status register before ISC_DISABLE (flow diagram step 7) */
 	ecp5_read_status(dev, &status);
@@ -414,10 +460,7 @@ static int ecp5_program_bitstream(struct sc0710_dev *dev, const u8 *data, u32 le
 /* Load and program ECP5 firmware if outdated */
 static int sc0710_ecp5_firmware_check(struct sc0710_dev *dev)
 {
-	const struct firmware *fw = NULL;
-	void *alt_buf = NULL;
-	size_t alt_size = 0;
-	const u8 *fw_data;
+	u8 *fw_data;
 	size_t fw_size;
 	u32 idcode, half_size, status;
 	u8 *decoded;
@@ -441,53 +484,22 @@ static int sc0710_ecp5_firmware_check(struct sc0710_dev *dev)
 	/* Cold boot: PCI/FPGA may need extra settle time before SPI programming. */
 	msleep(1500);
 
-	/* Try standard kernel firmware loader first (/lib/firmware/) */
-	ret = request_firmware(&fw, "sc0710/SC0710.FWI.HEX", &dev->pci->dev);
-	if (ret) {
-		/* Standard path failed. On atomic/immutable distros, /lib/firmware/
-		 * is read-only and the firmware is stored elsewhere. Try the
-		 * alternative paths that the firmware service uses.
-		 */
-		printk(KERN_INFO "%s: Firmware not found in /lib/firmware/, trying alternative paths\n",
+	fw_data = sc0710_firmware_load(dev, "SC0710.FWI.HEX", &fw_size);
+	if (!fw_data) {
+		printk(KERN_ERR "%s: Failed to load firmware sc0710/SC0710.FWI.HEX\n",
 			dev->name);
-
-		for (i = 0; firmware_alt_paths[i]; i++) {
-			alt_buf = sc0710_load_firmware_from_path(
-				firmware_alt_paths[i], &alt_size);
-			if (alt_buf) {
-				printk(KERN_INFO "%s: Loaded firmware from %s (%zu bytes)\n",
-					dev->name, firmware_alt_paths[i], alt_size);
-				break;
-			}
-		}
-
-		if (!alt_buf) {
-			printk(KERN_ERR "%s: Failed to load firmware sc0710/SC0710.FWI.HEX: %d\n",
-				dev->name, ret);
-			printk(KERN_ERR "%s: Place SC0710.FWI.HEX in /lib/firmware/sc0710/\n",
-				dev->name);
-			printk(KERN_ERR "%s: Or in /var/lib/sc0710/firmware/ for atomic distros\n",
-				dev->name);
-			return ret;
-		}
-	}
-
-	/* Point fw_data/fw_size to whichever source succeeded */
-	if (fw) {
-		fw_data = fw->data;
-		fw_size = fw->size;
-	} else {
-		fw_data = alt_buf;
-		fw_size = alt_size;
+		printk(KERN_ERR "%s: Place SC0710.FWI.HEX in /lib/firmware/sc0710/\n",
+			dev->name);
+		printk(KERN_ERR "%s: Or in /var/lib/sc0710/firmware/ for atomic distros\n",
+			dev->name);
+		return -ENOENT;
 	}
 
 	/* Validate header */
 	if (fw_size < FWI_HEADER_SIZE + 2 ||
 	    fw_data[0] != FWI_MAGIC_0 || fw_data[1] != FWI_MAGIC_1) {
 		printk(KERN_ERR "%s: Invalid firmware file header\n", dev->name);
-		if (fw)
-			release_firmware(fw);
-		vfree(alt_buf);
+		vfree(fw_data);
 		return -EINVAL;
 	}
 
@@ -499,9 +511,7 @@ static int sc0710_ecp5_firmware_check(struct sc0710_dev *dev)
 	 */
 	decoded = vmalloc(half_size * 2);
 	if (!decoded) {
-		if (fw)
-			release_firmware(fw);
-		vfree(alt_buf);
+		vfree(fw_data);
 		return -ENOMEM;
 	}
 
@@ -513,9 +523,7 @@ static int sc0710_ecp5_firmware_check(struct sc0710_dev *dev)
 	for (i = 0; i < half_size; i++)
 		decoded[half_size + i] = fw_data[FWI_HEADER_SIZE + i] ^ FWI_XOR_FIRST;
 
-	if (fw)
-		release_firmware(fw);
-	vfree(alt_buf);
+	vfree(fw_data);
 
 	for (i = 0; i < 3; i++) {
 		ret = ecp5_program_bitstream(dev, decoded, half_size * 2);
@@ -534,8 +542,10 @@ static int sc0710_ecp5_firmware_check(struct sc0710_dev *dev)
 	return ret;
 }
 
-void sc0710_card_setup(struct sc0710_dev *dev)
+int sc0710_card_setup(struct sc0710_dev *dev)
 {
+	int ret;
+
 	switch (dev->board) {
 	case SC0710_BOARD_ELGATEO_4KP60_MK2:
 		sc_write(dev, 0, BAR0_00C4, 0x000f0000);
@@ -559,8 +569,14 @@ void sc0710_card_setup(struct sc0710_dev *dev)
 		 * The 4KP has a Lattice ECP5 connected via AXI SPI at BAR0+0x2000.
 		 * Factory firmware (IDCODE 0x41112043) doesn't enable LT6911 TX.
 		 * The Windows driver uploads updated firmware on every boot.
-		 */
-		sc0710_ecp5_firmware_check(dev);
+		 *
+		 * An unprogrammed ECP5 means a dead video frontend, so a failure
+		 * here (firmware file missing, upload failed) fails the whole
+		 * probe rather than registering a capture device that can't
+		 * capture. Userspace installs the firmware and reloads/rebinds. */
+		ret = sc0710_ecp5_firmware_check(dev);
+		if (ret < 0)
+			return ret;
 
 		sc_write(dev, 0, BAR0_00C4, 0x000f0000);
 
@@ -615,4 +631,6 @@ void sc0710_card_setup(struct sc0710_dev *dev)
 		sc_write(dev, 0, 0xEC, 0x00000020);   /* scaler enable */
 		break;
 	}
+
+	return 0;
 }

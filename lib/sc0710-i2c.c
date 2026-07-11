@@ -23,94 +23,189 @@
 #include <linux/moduleparam.h>
 #include <linux/init.h>
 #include <linux/delay.h>
+#include <linux/firmware.h>
+#include <linux/vmalloc.h>
+#include <linux/ctype.h>
+#include <linux/iopoll.h>
 #include <asm/io.h>
 
 #include "sc0710.h"
 
 #define I2C_DEV__ARM_MCU (0x32 << 1)
-#define I2C_DEV__UNKNOWN (0x33 << 1)
+#define I2C_DEV__MCU_FN  (0x33 << 1) /* MCU function-call port */
+#define I2C_EDID_EEPROM  (0x50 << 1)
 
 #define SC0710_I2C_HDMI_RETRIES 3
 #define SC0710_I2C_HDMI_RETRY_DELAY_US 50000
 #define SC0710_LOCK_DROPOUT_MAX 5
 #define SC0710_NO_TIMING_THRESHOLD 6
 
-#if 1 /* Enable I2C write for tone mapping control */
-static int didack(struct sc0710_dev *dev)
+/* Recover the AXI IIC after an interrupted or failed transaction.
+ * The RX FIFO has no reset bit, so an aborted read can leave stale bytes
+ * that would offset every subsequent read. SOFTR clears the state machine
+ * and both FIFOs. Caller holds signalMutex.
+ */
+static void sc0710_i2c_bus_reset(struct sc0710_dev *dev)
 {
-	u32 v;
-	int cnt = 16;
-
-	while (cnt-- > 0) {
-		v = sc_read(dev, 0, BAR0_3104);
-		/* TX_FIFO_Empty (bit 7) = data consumed/sent.
-		 * BB (bit 2) = bus busy, slave ACK'd.
-		 * Either condition indicates successful transmission.
-		 * Known values: 0x44 (MK2), 0xC0, 0xC4 (4K Pro after soft reset).
-		 */
-		if ((v & 0x80) || (v & 0x04))
-			return 1; /* device Ack'd */
-		udelay(64);
-	}
-
-	return 0; /* No Ack */
+	sc_write(dev, 0, BAR0_3040, 0x0000000a); /* SOFTR: reset state machine + FIFOs */
+	udelay(10);
+	sc_write(dev, 0, BAR0_3100, 0x00000002); /* TX_FIFO Reset */
+	sc_write(dev, 0, BAR0_3100, 0x00000001); /* AXI IIC Enable */
 }
-#endif
 
-static u8 busread(struct sc0710_dev *dev)
+/* Wait until the TX FIFO has fully drained (SR bit 7 set), so the caller's
+ * whole transaction, STOP-flagged byte included, is on the wire before the
+ * next transaction's TX-FIFO reset can flush it. A flushed STOP truncates
+ * the transaction: observed on the real card, where a truncated EDID page
+ * write wedged the MCU's EEPROM parser until power-off.
+ * The timeout is generous to tolerate MCU clock stretching.
+ */
+static int sc0710_i2c_wait_tx_drained(struct sc0710_dev *dev)
 {
 	u32 v;
-	int cnt = 32;
-	unsigned long timeout = jiffies + msecs_to_jiffies(100); /* 100ms max */
 
-	while (cnt-- > 0) {
-		/* Check for global timeout to prevent infinite loop */
+	return read_poll_timeout(sc_read, v, v & 0x80, 20, 20000, false,
+				 dev, 0, BAR0_3104);
+}
+
+/* Wait for the bus to go idle (SR bit 2, BB, clear). TX-FIFO-empty only means
+ * the STOP byte entered the shifter; the STOP condition itself is still on
+ * the wire, and a transaction started before it completes chops it off. The
+ * vendor polls for idle (SR = 0xc0) before every page write in traced
+ * sessions. */
+static int sc0710_i2c_wait_bus_idle(struct sc0710_dev *dev)
+{
+	u32 v;
+
+	return read_poll_timeout(sc_read, v, !(v & 0x04), 20, 20000, false,
+				 dev, 0, BAR0_3104);
+}
+
+/* Read one byte from the RX FIFO, waiting up to ~3.2 ms for it to arrive.
+ * Returns the byte (0..255) or -ETIMEDOUT: never a byte read from an
+ * empty FIFO, which the controller answers with meaningless filler. */
+static int busread(struct sc0710_dev *dev)
+{
+	u32 v;
+	int ret;
+
+	/* RX_FIFO_Empty (bit 6) clear means data available.
+	 * MK2 sees 0x8C/0xAC; 4K Pro may differ in bus-busy/SRW bits. */
+	ret = read_poll_timeout(sc_read, v, !(v & 0x40), 100, 3200, false,
+				dev, 0, BAR0_3104);
+	if (ret < 0)
+		return -ETIMEDOUT;
+	return sc_read(dev, 0, BAR0_310C) & 0xFF;
+}
+
+/* Standalone I2C read: its own START, a STOP-flagged read length, no write
+ * phase. Also serves as the read phase of the writeread transaction, which
+ * enters here mid-transaction after its repeated START, so this must not
+ * wait for bus idle itself. Caller holds signalMutex. */
+static int __sc0710_i2c_read_once(struct sc0710_dev *dev, u8 devaddr8bit, u8 *rbuf, int rlen)
+{
+	u32 v;
+	int cnt;
+	unsigned long timeout = jiffies + msecs_to_jiffies(500);
+
+	sc_write(dev, 0, BAR0_3120, 0x0000000f);
+	sc_write(dev, 0, BAR0_3100, 0x00000002); /* TX_FIFO Reset */
+	sc_write(dev, 0, BAR0_3100, 0x00000000);
+	sc_write(dev, 0, BAR0_3108, 0x00000000 | (1 << 8) /* Start Bit */ | (devaddr8bit | 1));
+	sc_write(dev, 0, BAR0_3108, 0x00000000 | (1 << 9) /* Stop Bit */ | rlen);
+	sc_write(dev, 0, BAR0_3100, 0x00000001);
+
+	/* Read the reply. Fail the whole transaction unless every byte actually
+	 * arrived: never hand fabricated bytes to callers with rc 0. */
+	cnt = 0;
+	while (cnt < rlen) {
+		int b;
 		if (time_after(jiffies, timeout)) {
-			printk(KERN_ERR "%s: busread timeout\n", __func__);
-			return 0xFF; /* Return error value */
+			printk(KERN_ERR "%s: I2C timeout reading data\n", __func__);
+			return -ETIMEDOUT;
 		}
-
-		v = sc_read(dev, 0, BAR0_3104);
-//printk("readbus %08x\n", v);
-		/* Wait for RX data: RX_FIFO_Empty (bit 6) clear means data available.
-		 * MK2 sees 0x8C/0xAC; 4K Pro may differ in bus-busy/SRW bits.
-		 */
-		if (!(v & 0x40)) /* RX_FIFO not empty — data ready */
-			break;
-		udelay(100);
+		b = busread(dev);
+		if (b < 0) {
+			printk_ratelimited(KERN_WARNING "%s: RX byte %d/%d never arrived\n",
+				__func__, cnt, rlen);
+			return -ETIMEDOUT;
+		}
+		*(rbuf + cnt) = b;
+		cnt++;
+	}
+	v = sc_read(dev, 0, BAR0_3104);
+	/* Completion: TX_FIFO_Empty (bit 7) + RX_FIFO_Empty (bit 6) = all done.
+	 * MK2 sees 0xC8/0xCC; 4K Pro may differ in SRW/BB bits.
+	 */
+	if ((v & 0xC0) != 0xC0) {
+		printk_ratelimited(KERN_WARNING "%s: I2C completion check failed (SR 0x%08x)\n",
+			__func__, v);
+		return -EIO;
 	}
 
-	v = sc_read(dev, 0, BAR0_310C);
-//printk("readbus ret 0x%02x\n", v);
-	return v;
+	return 0; /* Success */
+}
+
+/* Standalone-read wrapper: enter with the bus idle, reset the engine on
+ * failure so stale RX bytes can't offset the next read. */
+static int __sc0710_i2c_read(struct sc0710_dev *dev, u8 devaddr8bit, u8 *rbuf, int rlen)
+{
+	int ret;
+
+	if (sc0710_i2c_wait_bus_idle(dev) < 0)
+		ret = -EIO;
+	else
+		ret = __sc0710_i2c_read_once(dev, devaddr8bit, rbuf, rlen);
+	if (ret < 0)
+		sc0710_i2c_bus_reset(dev);
+	return ret;
 }
 
 #if 1 /* Enable I2C write for MCU commands */
-/* Assumes 8 bit device address and 8 bit sub address. */
-static int sc0710_i2c_write(struct sc0710_dev *dev, u8 devaddr8bit, u8 *wbuf, int wlen)
+/* Assumes 8 bit device address; every byte of wbuf goes on the wire.
+ * One byte in flight at a time: drain the FIFO before each push and after
+ * the STOP-flagged one, so the transaction is fully on the wire when we
+ * return and the next transaction's FIFO reset can't truncate it. */
+static int __sc0710_i2c_write_once(struct sc0710_dev *dev, u8 devaddr8bit, u8 *wbuf, int wlen)
 {
 	int i;
 	u32 v;
+
+	/* Enter and leave with the bus idle, like the vendor's traced writes:
+	 * a transaction started while the previous STOP is still shifting out
+	 * gets that STOP chopped by the TX-FIFO reset below. */
+	if (sc0710_i2c_wait_bus_idle(dev) < 0)
+		return -EIO;
 
 	/* Write out to the i2c bus master a reset, then write length and device address */
 	sc_write(dev, 0, BAR0_3100, 0x00000002); /* TX_FIFO Reset */
 	sc_write(dev, 0, BAR0_3100, 0x00000001); /* AXI IIC Enable */
 	sc_write(dev, 0, BAR0_3108, 0x00000000 | (1 << 8) /* Start Bit */ | devaddr8bit);
 
-	/* Wait for the device ack */
-	if (didack(dev) == 0)
-		return -EIO;
-
-	for (i = 1; i < wlen; i++) {
+	for (i = 0; i < wlen; i++) {
+		if (sc0710_i2c_wait_tx_drained(dev) < 0)
+			return -EIO;
 		v = 0x00000000 | *(wbuf + i);
 		if (i == (wlen - 1))
 			v |= (1 << 9); /* Stop Bit */
 		sc_write(dev, 0, BAR0_3108, v);
-		if (didack(dev) == 0)
-			return -EIO;
 	}
+	if (sc0710_i2c_wait_tx_drained(dev) < 0)
+		return -EIO;
+	if (sc0710_i2c_wait_bus_idle(dev) < 0)
+		return -EIO;
 
 	return 0; /* Success */
+}
+
+/* A failed write can leave the IIC engine mid-transaction; reset it so the
+ * next transaction starts clean instead of reading the wreckage. */
+static int sc0710_i2c_write(struct sc0710_dev *dev, u8 devaddr8bit, u8 *wbuf, int wlen)
+{
+	int ret = __sc0710_i2c_write_once(dev, devaddr8bit, wbuf, wlen);
+	if (ret < 0)
+		sc0710_i2c_bus_reset(dev);
+	return ret;
 }
 #endif
 
@@ -133,11 +228,10 @@ int sc0710_i2c_write_mcu(struct sc0710_dev *dev, u8 subaddr, u8 *data, int len)
 	return ret;
 }
 
-static int __sc0710_i2c_writeread(struct sc0710_dev *dev, u8 devaddr8bit, u8 *wbuf, int wlen, u8 *rbuf, int rlen)
+static int __sc0710_i2c_writeread_once(struct sc0710_dev *dev, u8 devaddr8bit, u8 *wbuf, int wlen, u8 *rbuf, int rlen)
 {
 	u32 v;
 	u8 i2c_devaddr = devaddr8bit; /* From dev 64, read 0x1a bytes from subaddress 0 */
-	u8 i2c_readlen = rlen;
 	u8 i2c_subaddr = wbuf[0];
 	int cnt = 16;
 	unsigned long timeout = jiffies + msecs_to_jiffies(500); /* 500ms global timeout */
@@ -196,35 +290,17 @@ static int __sc0710_i2c_writeread(struct sc0710_dev *dev, u8 devaddr8bit, u8 *wb
 	//dprintk(0, "Read 3104 %08x at cnt %d -- c4?\n", v, cnt);
 
 	msleep(1); // pkt 15162
-	sc_write(dev, 0, BAR0_3120, 0x0000000f);
-	sc_write(dev, 0, BAR0_3100, 0x00000002); /* TX_FIFO Reset */
-	sc_write(dev, 0, BAR0_3100, 0x00000000);
-	sc_write(dev, 0, BAR0_3108, 0x00000000 | (1 << 8) /* Start Bit */ | (i2c_devaddr | 1)); /* Read from 0x65 */
-	sc_write(dev, 0, BAR0_3108, 0x00000000 | (1 << 9) /* Stop Bit */ | i2c_readlen);
-	sc_write(dev, 0, BAR0_3100, 0x00000001);
+	return __sc0710_i2c_read_once(dev, i2c_devaddr, rbuf, rlen);
+}
 
-	/* Read the reply */
-	cnt = 0;
-	while (cnt < i2c_readlen) {
-		if (time_after(jiffies, timeout)) {
-			printk(KERN_ERR "%s: I2C timeout reading data\n", __func__);
-			return -ETIMEDOUT;
-		}
-		*(rbuf + cnt) = busread(dev);
-		//printk("dat[0x%02x] %02x\n", cnt, *(rbuf + cnt)); 
-		cnt++;
-	}
-	v = sc_read(dev, 0, BAR0_3104);
-	/* Completion: TX_FIFO_Empty (bit 7) + RX_FIFO_Empty (bit 6) = all done.
-	 * MK2 sees 0xC8/0xCC; 4K Pro may differ in SRW/BB bits.
-	 */
-	if ((v & 0xC0) != 0xC0) {
-		printk("3104 %08x --- completion?\n", v);
-		printk("  ac %08x --- 0?\n", sc_read(dev, 0, BAR0_00AC));
-		return -1;
-	}
-
-	return 0; /* Success */
+/* A timed-out or incomplete read leaves stale bytes in the RX FIFO that
+ * would offset every subsequent read; reset the engine on any failure. */
+static int __sc0710_i2c_writeread(struct sc0710_dev *dev, u8 devaddr8bit, u8 *wbuf, int wlen, u8 *rbuf, int rlen)
+{
+	int ret = __sc0710_i2c_writeread_once(dev, devaddr8bit, wbuf, wlen, rbuf, rlen);
+	if (ret < 0)
+		sc0710_i2c_bus_reset(dev);
+	return ret;
 }
 
 static int sc0710_i2c_writeread(struct sc0710_dev *dev, u8 devaddr8bit, u8 *wbuf, int wlen, u8 *rbuf, int rlen)
@@ -250,9 +326,19 @@ void sc0710_reset_dma_frame_sync(struct sc0710_dev *dev)
 	int dma_was_running = 0;
 	int has_streaming_clients = 0;
 
+	/* Hold the DMA service lock for the entire sequence, including the
+	 * fmt/state/refcount snapshot: STREAMON and STREAMOFF take the same
+	 * lock for their DMA transitions, so a client can't appear or vanish
+	 * between the snapshot and the restart below (a stale snapshot could
+	 * leave DMA running with zero clients).  The DMA thread checks
+	 * reconfig_in_progress under the same lock, so service cannot run
+	 * while we reconfigure.
+	 */
+	mutex_lock(&dev->kthread_dma_lock);
+
 	if (!dev->fmt) {
 		printk(KERN_INFO "%s: No format detected, skipping DMA reset\n", dev->name);
-		return;
+		goto out_unlock;
 	}
 
 	for (ch_idx = 0; ch_idx < SC0710_MAX_CHANNELS; ch_idx++) {
@@ -270,17 +356,12 @@ void sc0710_reset_dma_frame_sync(struct sc0710_dev *dev)
 
 	if (!has_streaming_clients) {
 		printk(KERN_INFO "%s: No streaming clients, skipping DMA start\n", dev->name);
-		return;
+		goto out_unlock;
 	}
 
 	printk(KERN_INFO "%s: Signal restoration - DMA was %s, have streaming clients\n",
 		dev->name, dma_was_running ? "running" : "stopped");
 
-	/* Hold the DMA service lock for the entire stop/resize/start
-	 * sequence.  The DMA thread checks reconfig_in_progress under
-	 * the same lock, so service cannot run while we reconfigure.
-	 */
-	mutex_lock(&dev->kthread_dma_lock);
 	dev->reconfig_in_progress = 1;
 
 	/* Phase 1: Stop video DMA channels */
@@ -327,8 +408,36 @@ void sc0710_reset_dma_frame_sync(struct sc0710_dev *dev)
 		}
 	}
 
-	/* Phase 2: Resize DMA buffers for the new resolution */
-	sc0710_dma_channels_resize(dev);
+	/* Phase 2: Resize DMA buffers for the new resolution.
+	 * On failure leave the channels stopped: restarting over a missing ring
+	 * would hand the engine a NULL descriptor pointer. The next timing
+	 * change or STREAMON retries the resize. */
+	if (sc0710_dma_channels_resize(dev) < 0) {
+		printk(KERN_ERR "%s: DMA resize failed during resync; leaving channels stopped\n",
+			dev->name);
+
+		/* Phase 1 stopped the video XDMA engines; clear GO to match
+		 * (mirrors sc0710_dma_channels_stop). */
+		sc_clr(dev, 0, BAR0_00D0, 0x0001);
+
+		/* Phase 1 deleted the frame timers; re-arm them so streaming
+		 * clients get placeholder frames instead of blocking in DQBUF.
+		 * Audio has no timer (only video registration sets one up). */
+		for (ch_idx = 0; ch_idx < SC0710_MAX_CHANNELS; ch_idx++) {
+			ch = &dev->channel[ch_idx];
+			if (!ch->enabled || ch->mediatype != CHTYPE_VIDEO)
+				continue;
+			if (atomic_read(&ch->streaming_refcount) <= 0)
+				continue;
+			mutex_lock(&ch->lock);
+			mod_timer(&ch->timeout, jiffies + VBUF_TIMEOUT);
+			mutex_unlock(&ch->lock);
+		}
+
+		dev->reconfig_in_progress = 0;
+		mutex_unlock(&dev->kthread_dma_lock);
+		return;
+	}
 
 	/* Phase 3: Drop first frames after restart — the FPGA may
 	 * begin capturing mid-frame, producing a torn image.
@@ -396,6 +505,10 @@ void sc0710_reset_dma_frame_sync(struct sc0710_dev *dev)
 	mutex_unlock(&dev->kthread_dma_lock);
 
 	printk(KERN_INFO "%s: DMA restarted after signal restoration\n", dev->name);
+	return;
+
+out_unlock:
+	mutex_unlock(&dev->kthread_dma_lock);
 }
 
 
@@ -714,11 +827,23 @@ confirmed_timing_change:
 			dev->fmt = NULL;
 		}
 
+		/* Upper bounds: a glitched read can hand back 0xFF filler
+		 * with rc 0, and 0xFFFF-ish dims would u32-overflow framesize
+		 * (w*2*h) into a tiny value handed to DMA sizing. 4096 covers
+		 * everything the card can emit (DCI 4K), interlace-doubling
+		 * included, and keeps w*2*h far below overflow. */
 		if (!dev->fmt &&
 		    procedural_timings != TIMING_MODE_STATIC_ONLY &&
-		    dev->width >= 320 && dev->height >= 200) {
-			struct sc0710_format *dyn = &dev->dynamic_fmt;
+		    dev->width >= 320 && dev->height >= 200 &&
+		    dev->width <= 4096 && dev->height <= 4096) {
+			struct sc0710_format *dyn;
 			u32 fps_est = fps_target ? fps_target : 60;
+
+			/* Build into the slot dev->fmt does NOT point at, publish
+			 * last: a holder of the previous dynamic fmt sees stable
+			 * (possibly stale) data, never a torn rewrite. */
+			dev->dynamic_fmt_idx ^= 1;
+			dyn = &dev->dynamic_fmt[dev->dynamic_fmt_idx];
 
 			dyn->timingH    = dev->pixelLineH;
 			dyn->timingV    = dev->pixelLineV;
@@ -730,13 +855,13 @@ confirmed_timing_change:
 			dyn->fpsden     = 1000;
 			dyn->depth      = 8;
 			dyn->framesize  = dev->width * 2 * dev->height;
-			snprintf(dev->dynamic_fmt_name,
-				 sizeof(dev->dynamic_fmt_name),
+			snprintf(dev->dynamic_fmt_name[dev->dynamic_fmt_idx],
+				 sizeof(dev->dynamic_fmt_name[0]),
 				 "%ux%u%s%u(dynamic)",
 				 dev->width, dev->height,
 				 dev->interlaced ? "i" : "p",
 				 fps_est);
-			dyn->name = dev->dynamic_fmt_name;
+			dyn->name = dev->dynamic_fmt_name[dev->dynamic_fmt_idx];
 
 			memset(&dyn->dv_timings, 0, sizeof(dyn->dv_timings));
 			dyn->dv_timings.type = V4L2_DV_BT_656_1120;
@@ -848,7 +973,8 @@ int sc0710_i2c_read_procamp(struct sc0710_dev *dev)
 
 	ret = sc0710_i2c_writeread(dev, I2C_DEV__ARM_MCU, &wbuf[0], sizeof(wbuf), &rbuf[0], sizeof(rbuf));
 	if (ret < 0) {
-		printk("%s ret = %d\n", __func__, ret);
+		/* Called every HDMI-poll tick; don't flood the log on a sick bus. */
+		printk_ratelimited("%s ret = %d\n", __func__, ret);
 		return -1;
 	}
 
@@ -874,10 +1000,10 @@ int sc0710_i2c_read_procamp(struct sc0710_dev *dev)
 	return 0; /* Success */
 }
 
-/* Factory EDID base block bytes 0x00-0x5F.
- * These bytes are volatile and lost on cold boot (read as 0xFF).
- * Bytes 0x60-0xFF persist across power cycles.
- * The Windows driver writes these on every load.
+/* Factory EDID base block bytes 0x00-0x5F, matching the stock EDID that
+ * Elgato Studio programs. Written only when the EEPROM header is missing or
+ * corrupt (e.g. after an interrupted page write); the EEPROM itself is
+ * non-volatile, persisting across AC power loss in traced sessions.
  */
 static const u8 factory_edid_base[96] = {
 	/* 00 */ 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00,
@@ -894,37 +1020,236 @@ static const u8 factory_edid_base[96] = {
 	/* 58 */ 0x00, 0x1E, 0x6F, 0xC2, 0x00, 0xA0, 0xA0, 0xA0,
 };
 
+/* An EDID block (base or extension) is valid when its 128 bytes sum to 0 mod 256. */
+static bool sc0710_edid_block_checksum(const u8 *block)
+{
+	u8 sum = 0;
+	int i;
+	for (i = 0; i < 128; i++)
+		sum += block[i];
+	return sum == 0;
+}
+
+/* The 8-byte EDID base-block header magic (needs p[0..7] readable). */
+bool sc0710_edid_header_valid(const u8 *p)
+{
+	return p[0] == 0x00 && p[1] == 0xFF && p[2] == 0xFF && p[3] == 0xFF &&
+	       p[4] == 0xFF && p[5] == 0xFF && p[6] == 0xFF && p[7] == 0x00;
+}
+
+/* The 4K Pro "EEPROM" is a 512-byte space emulated by the MCU, addressed in
+ * 16-byte pages by a single offset byte that carries the HIGH address bits in
+ * its LOW nibble (decoded from a traced Windows-driver EDID-switch session):
+ *     addr = ((offset & 0x0f) << 8) | (offset & 0xf0)
+ * so linear offsets land in the wrong page: offset byte 0x01 is byte 0x100,
+ * not byte 1. Every traced transaction moves exactly 16 data bytes. */
+static u8 sc0710_edid_offset_byte(int addr)
+{
+	return ((addr >> 8) & 0x0f) | (addr & 0xf0);
+}
+
+/* A full EDID image is valid when it carries the header magic, is whole
+ * 128-byte blocks within the 512-byte EEPROM, declares exactly its own
+ * extension blocks in byte 126 (a truncated image would otherwise be
+ * zero-padded into "valid" all-zero extensions the source then reads),
+ * and every block checksums. */
+static bool sc0710_edid_image_valid(const u8 *edid, size_t len)
+{
+	size_t i;
+	bool valid = len >= 128 && len <= 512 && (len % 128) == 0 &&
+		sc0710_edid_header_valid(edid) &&
+		edid[126] == len / 128 - 1;
+
+	for (i = 0; valid && i < len; i += 128)
+		valid = sc0710_edid_block_checksum(edid + i);
+	return valid;
+}
+
+/* Write `len` EDID bytes from address 0, 16 bytes per I2C transaction as the
+ * Windows driver does, zero-filling up to `total` so a shorter profile clears
+ * stale extension blocks (Elgato Studio pads to 512 the same way). No delay or
+ * ACK-polling between pages: the traced writes have none (no real EEPROM
+ * write cycle behind the MCU). On-wire bytes are [offset][16 data].
+ * Caller holds signalMutex.
+ *
+ * 4K Pro ONLY: the single wire-level writer under the whole EDID stack
+ * (factory restore and edid= profiles both land here). The nibble-paged
+ * offset encoding is the 4KP MCU's; on an MK2's real, linearly-addressed
+ * EEPROM these offsets would scribble garbage. */
+static int sc0710_write_edid_bytes(struct sc0710_dev *dev, const u8 *edid, int len, int total)
+{
+	int addr, j, ret;
+
+	if (WARN_ON_ONCE(dev->board != SC0710_BOARD_ELGATEO_4KP))
+		return -ENODEV;
+
+	for (addr = 0; addr < total; addr += 16) {
+		u8 wr[17];
+		wr[0] = sc0710_edid_offset_byte(addr);
+		for (j = 0; j < 16; j++)
+			wr[j + 1] = (addr + j < len) ? edid[addr + j] : 0x00;
+		ret = sc0710_i2c_write(dev, I2C_EDID_EEPROM, wr, 17);
+		if (ret < 0)
+			return ret;
+	}
+	return 0;
+}
+
+/* Read one 16-byte EEPROM page at addr (the offset-then-read shape of the
+ * Windows driver's verify sweeps). Caller holds signalMutex. 4K Pro only
+ * (nibble-paged offsets), but read-only; misuse can't damage anything. */
+static int sc0710_read_edid_page(struct sc0710_dev *dev, int addr, u8 *rd)
+{
+	u8 off = sc0710_edid_offset_byte(addr);
+
+	return __sc0710_i2c_writeread(dev, I2C_EDID_EEPROM, &off, 1, rd, 16);
+}
+
+/* Compare the EEPROM against this (zero-padded to `total`) image.
+ * Returns 1 if identical, 0 on any difference, negative on read error.
+ * `logerror` reports the first mismatch at KERN_ERR.
+ * Caller holds signalMutex. */
+static int sc0710_edid_pages_match(struct sc0710_dev *dev, const u8 *edid, int len, int total, bool logerror)
+{
+	int addr, j, ret;
+
+	for (addr = 0; addr < total; addr += 16) {
+		u8 rd[16];
+
+		ret = sc0710_read_edid_page(dev, addr, rd);
+		if (ret < 0)
+			return ret;
+		for (j = 0; j < 16; j++) {
+			u8 want = (addr + j < len) ? edid[addr + j] : 0x00;
+			if (rd[j] != want) {
+				if (logerror)
+					printk(KERN_ERR "%s: EDID verify mismatch at 0x%03x: wrote %02x, read %02x\n",
+						dev->name, addr + j, want, rd[j]);
+				return 0;
+			}
+		}
+	}
+	return 1;
+}
+
+/* Read the EEPROM back and compare against what sc0710_write_edid_bytes(dev,
+ * edid, len, total) wrote. Returns 0 on match, -EIO on mismatch (loudly).
+ * Caller holds signalMutex. */
+static int sc0710_verify_edid_bytes(struct sc0710_dev *dev, const u8 *edid, int len, int total)
+{
+	int ret = sc0710_edid_pages_match(dev, edid, len, total, true);
+
+	if (ret < 0)
+		return ret;
+	return ret == 1 ? 0 : -EIO;
+}
+
+/* Program the EEPROM with this EDID image, zero-padded to the full 512 bytes.
+ * Skips the write (and the MCU's HPD bounce) when the image is already current;
+ * a failed compare read aborts rather than writing through a bus that just
+ * failed. Shared by the edid= path and VIDIOC_S_EDID.
+ * Caller holds signalMutex. 4K Pro only (enforced by the page writer). */
+static int sc0710_edid_program(struct sc0710_dev *dev, const u8 *edid, int len)
+{
+	int ret;
+
+	ret = sc0710_edid_pages_match(dev, edid, len, 512, false);
+	if (ret < 0)
+		return ret;
+	if (ret == 1) {
+		printk(KERN_INFO "%s: EDID already current, skipping write\n", dev->name);
+		return 0;
+	}
+
+	printk(KERN_INFO "%s: writing EDID (%d bytes) to EEPROM\n", dev->name, len);
+	ret = sc0710_write_edid_bytes(dev, edid, len, 512);
+	if (ret == 0)
+		ret = sc0710_verify_edid_bytes(dev, edid, len, 512);
+	if (ret == 0)
+		printk(KERN_INFO "%s: EDID verified; the MCU re-raises HPD so the "
+			"source re-reads it\n", dev->name);
+	return ret;
+}
+
 static void sc0710_write_factory_edid(struct sc0710_dev *dev)
 {
-	#define I2C_EDID_EEPROM (0x50 << 1)
 	u8 w[1] = { 0x00 };
 	u8 r[8] = { 0 };
-	int i, ret;
 
-	__sc0710_i2c_writeread(dev, I2C_EDID_EEPROM, w, sizeof(w), r, sizeof(r));
+	/* A failed read means the bus is sick, not that the EDID is missing;
+	 * writing through it would only dig deeper. */
+	if (__sc0710_i2c_writeread(dev, I2C_EDID_EEPROM, w, sizeof(w), r, sizeof(r)) < 0) {
+		printk(KERN_WARNING "%s: EDID header read failed, skipping factory-EDID check\n",
+			dev->name);
+		return;
+	}
 
-	if (r[0] != 0x00 || r[1] != 0xFF) {
-		printk(KERN_INFO "%s: EDID header invalid (%02x %02x), writing factory data\n",
+	if (!sc0710_edid_header_valid(r)) {
+		printk(KERN_INFO "%s: EDID header invalid (%02x %02x ...), writing factory data\n",
 			dev->name, r[0], r[1]);
-
-		for (i = 0; i < 96; i += 8) {
-			u8 wr[10];
-			int j;
-			wr[0] = 0x00;
-			wr[1] = i;
-			for (j = 0; j < 8; j++)
-				wr[j + 2] = factory_edid_base[i + j];
-			ret = sc0710_i2c_write(dev, I2C_EDID_EEPROM, wr, 10);
-			if (ret < 0)
-				break;
-			msleep(10);
-		}
+		/* No zero-fill past the 96 bytes: 0x60-0xFF persist and complete the block. */
+		sc0710_write_edid_bytes(dev, factory_edid_base, sizeof(factory_edid_base),
+			sizeof(factory_edid_base));
 	}
 }
 
-/* Wait for 4KP FPGA pipeline to become active before DMA start.
- * Pipeline registers are configured early in card_setup().
- * Caller must hold signalMutex.
+/* Present a specific EDID to the HDMI source: load /lib/firmware/sc0710/edid/<name>.bin
+ * (installed from the Elgato Studio package by scripts/extract-firmware.sh) and
+ * write it to the EEPROM, overriding whatever is there. Selected by the edid=
+ * module param. Returns 0 on success or negative on error (caller then falls back
+ * to the factory EDID). Caller holds signalMutex.
+ *
+ * No HPD kick is needed: the MCU drops and re-raises HPD toward the source by
+ * itself after an EEPROM write. In the traced Windows-driver EDID switch the
+ * source re-locked at the new mode within ~1 s of the last page, with no MCU
+ * command in between. */
+static int sc0710_write_edid_profile(struct sc0710_dev *dev, const char *name)
+{
+	u8 *edid;
+	size_t len = 0;
+	char rel[64];
+	int i, ret;
+
+	/* Profile names are plain tokens (extract-firmware.sh generates them);
+	 * refuse anything that could escape the firmware directory. */
+	for (i = 0; name[i]; i++) {
+		if (!isalnum(name[i]) && name[i] != '-') {
+			printk(KERN_ERR "%s: invalid EDID profile name '%s'\n",
+				dev->name, name);
+			return -EINVAL;
+		}
+	}
+
+	snprintf(rel, sizeof(rel), "edid/%s.bin", name);
+	edid = sc0710_firmware_load(dev, rel, &len);
+	if (!edid) {
+		printk(KERN_ERR "%s: EDID profile '%s' not found "
+			"(/lib/firmware/sc0710/edid/%s.bin); install the profiles "
+			"with scripts/extract-firmware.sh\n", dev->name, name, name);
+		return -ENOENT;
+	}
+
+	if (!sc0710_edid_image_valid(edid, len)) {
+		printk(KERN_ERR "%s: EDID profile '%s' is not a valid EDID (%zu bytes)\n",
+			dev->name, name, len);
+		ret = -EINVAL;
+	} else {
+		printk(KERN_INFO "%s: EDID profile '%s' (%zu bytes)\n",
+			dev->name, name, len);
+		ret = sc0710_edid_program(dev, edid, (int)len);
+	}
+
+	vfree(edid);
+	return ret;
+}
+
+/* Wait for the 4KP FPGA pipeline to report active (A8 != 0) after GO.
+ * Runs after the engines are started and GO is set; with GO-last ordering the
+ * pipeline can't be active any earlier. Diagnostic-grade: the vendor driver
+ * never reads A8 in traced sessions, so a timeout here is
+ * a warning, not a failure. The MCU diagnostic read serializes itself on
+ * signalMutex; no caller of the channels_start path holds it, but the
+ * HDMI poll thread's I2C runs concurrently on the same AXI IIC engine.
  */
 int sc0710_4kp_wait_pipeline(struct sc0710_dev *dev)
 {
@@ -939,16 +1264,21 @@ int sc0710_4kp_wait_pipeline(struct sc0710_dev *dev)
 		return 0;
 	}
 
-	/* MCU TX status for diagnostics */
+	/* MCU TX status for diagnostics. On failure rbuf holds nothing useful. */
 	wbuf[0] = 0x10;
-	__sc0710_i2c_writeread(dev, I2C_DEV__ARM_MCU, wbuf, 1, rbuf, 16);
-	printk(KERN_INFO "%s: MCU status [13-15]: %02x %02x %02x\n",
-		dev->name, rbuf[3], rbuf[4], rbuf[5]);
+	if (sc0710_i2c_writeread(dev, I2C_DEV__ARM_MCU, wbuf, 1, rbuf, 16) == 0)
+		printk(KERN_INFO "%s: MCU status [13-15]: %02x %02x %02x\n",
+			dev->name, rbuf[3], rbuf[4], rbuf[5]);
+	else
+		printk(KERN_INFO "%s: MCU status read failed\n", dev->name);
 
-	/* Poll A8 — 4KP FPGA pipeline may need time to become active
-	 * after D0/EC register writes. Typically activates within 100ms.
+	/* Poll A8: the 4KP FPGA pipeline may need time to become active after
+	 * the D0/EC register writes. Typically activates within 100ms. The
+	 * budget is short because this runs under kthread_dma_lock, where it
+	 * stalls STREAMON/STREAMOFF; the run-bit verify in the resync path is
+	 * the functional check, this poll is diagnostic only.
 	 */
-	for (i = 0; i < 20; i++) {
+	for (i = 0; i < 5; i++) {
 		msleep(100);
 		a8 = sc_read(dev, 0, 0xa8);
 		if (a8 != 0) {
@@ -958,12 +1288,183 @@ int sc0710_4kp_wait_pipeline(struct sc0710_dev *dev)
 		}
 	}
 
-	printk(KERN_WARNING "%s: A8 still 0 after 2s — DMA may stall\n", dev->name);
+	printk(KERN_WARNING "%s: A8 still 0 after 500ms, DMA may stall\n", dev->name);
 	return 0;
+}
+
+/* MCU function call: a STOP-terminated command write, then the MCU's fixed
+ * 3-byte ack read as a standalone transaction, polled over a bounded window
+ * because the ack arrival time is not known precisely.
+ * On an ack mismatch do not re-read: whether the ack survives a second read
+ * is unobserved in traced vendor-driver sessions.
+ * Caller holds signalMutex so the HDMI keepalive cannot interleave.
+ */
+static int sc0710_4kp_mcu_call(struct sc0710_dev *dev, u8 fn, const u8 *expected_ack)
+{
+	u8 cmd[5] = { 0xab, 0x03, 0x12, 0x34, fn };
+	u8 ack[3];
+	int attempt, ret;
+
+	ret = sc0710_i2c_write(dev, I2C_DEV__MCU_FN, cmd, sizeof(cmd));
+	if (ret < 0)
+		return ret;
+
+	msleep(20);
+	for (attempt = 0; attempt < 5; attempt++) {
+		if (attempt)
+			msleep(50);
+		ret = __sc0710_i2c_read(dev, I2C_DEV__MCU_FN, ack, sizeof(ack));
+		if (ret == 0)
+			break;
+	}
+	if (ret < 0) {
+		printk(KERN_ERR "%s: MCU function 0x%02x: no ack (%d)\n",
+			dev->name, fn, ret);
+		return ret;
+	}
+	if (memcmp(ack, expected_ack, sizeof(ack))) {
+		printk(KERN_ERR "%s: MCU function 0x%02x: ack %02x %02x %02x, expected %02x %02x %02x\n",
+			dev->name, fn, ack[0], ack[1], ack[2],
+			expected_ack[0], expected_ack[1], expected_ack[2]);
+		sc0710_i2c_bus_reset(dev);
+		return -EIO;
+	}
+	return 0;
+}
+
+/* EDID source selectors, indexed by enum sc0710_edid_source.
+ * One call switches the source; the MCU bounces HPD toward the source by
+ * itself and the source renegotiates within ~10 s.
+ * The MCU offers no readback for the current selection.
+ * 4K Pro only: the protocol is unobserved on the MK2.
+ */
+static const struct {
+	u8 fn;
+	u8 ack[3];
+	const char *name;
+} sc0710_4kp_edid_sources[] = {
+	[SC0710_EDID_SOURCE_INTERNAL] = { 0x5f, { 0x11, 0x22, 0x66 }, "internal" },
+	[SC0710_EDID_SOURCE_DISPLAY]  = { 0x60, { 0x11, 0x22, 0x77 }, "display" },
+	[SC0710_EDID_SOURCE_MERGED]   = { 0x61, { 0x11, 0x22, 0x88 }, "merged" },
+};
+
+/* Caller holds signalMutex. */
+static int __sc0710_4kp_set_edid_source(struct sc0710_dev *dev, u32 src)
+{
+	int ret;
+
+	if (src >= ARRAY_SIZE(sc0710_4kp_edid_sources))
+		return -EINVAL;
+
+	ret = sc0710_4kp_mcu_call(dev, sc0710_4kp_edid_sources[src].fn,
+				  sc0710_4kp_edid_sources[src].ack);
+	if (ret == 0)
+		printk(KERN_INFO "%s: EDID source set to %s\n",
+			dev->name, sc0710_4kp_edid_sources[src].name);
+	return ret;
+}
+
+int sc0710_4kp_set_edid_source(struct sc0710_dev *dev, u32 src)
+{
+	int ret;
+
+	if (dev->board != SC0710_BOARD_ELGATEO_4KP)
+		return -ENODEV;
+
+	mutex_lock(&dev->signalMutex);
+	ret = __sc0710_4kp_set_edid_source(dev, src);
+	mutex_unlock(&dev->signalMutex);
+	return ret;
+}
+
+/* Sanity-check the MCU before any EEPROM work. Against a deaf MCU (wedge
+ * state: it NAKs every address until power-off) the read path fabricates
+ * constant NONZERO filler from the empty RX FIFO while reporting success
+ * (constant 0x80 observed on the real card), and writing through that
+ * state is pointless. An all-zero blob is NOT a wedge: a freshly
+ * cold-booted card with the HDMI source off legitimately reports zeros,
+ * and edid= with no source is a valid use. Transient first-read hiccups
+ * get retried. Caller holds signalMutex. */
+static bool sc0710_mcu_sane(struct sc0710_dev *dev)
+{
+	u8 w[1] = { 0x00 };
+	u8 blob[16];
+	int attempt, i, rc = -EIO;
+
+	for (attempt = 0; attempt < 3; attempt++) {
+		if (attempt)
+			msleep(100);
+		memset(blob, 0, sizeof(blob));
+		rc = __sc0710_i2c_writeread(dev, I2C_DEV__ARM_MCU, w, sizeof(w),
+			blob, sizeof(blob));
+		if (rc < 0)
+			continue;
+		for (i = 1; i < (int)sizeof(blob); i++) {
+			if (blob[i] != blob[0])
+				return true;
+		}
+		if (blob[0] == 0x00)
+			return true;
+		printk(KERN_ERR "%s: MCU status reads constant 0x%02x filler (wedge signature)\n",
+			dev->name, blob[0]);
+		return false;
+	}
+	printk(KERN_ERR "%s: MCU status read failed (%d) after 3 attempts\n", dev->name, rc);
+	return false;
+}
+
+/* Runtime EDID read for VIDIOC_G_EDID. Fills `len` bytes of the EEPROM
+ * image from `start` (both multiples of 16, start+len <= 512). 4K Pro only:
+ * the ioctls are disabled at registration on other boards. */
+int sc0710_i2c_get_edid(struct sc0710_dev *dev, u8 *buf, int start, int len)
+{
+	int addr, ret = 0;
+
+	mutex_lock(&dev->signalMutex);
+	for (addr = start; addr + 16 <= start + len; addr += 16) {
+		ret = sc0710_read_edid_page(dev, addr, buf + (addr - start));
+		if (ret < 0)
+			break;
+	}
+	mutex_unlock(&dev->signalMutex);
+	return ret;
+}
+
+/* Runtime EDID write for VIDIOC_S_EDID: validate, refuse a sick MCU, skip
+ * if already current (no needless HPD bounce), else write and verify, the
+ * same protections as the probe-time edid= path. The EEPROM is the
+ * internal-mode slot, so the internal EDID source is forced first to make
+ * the written EDID visible even if the card was left in another mode.
+ * The MCU re-raises HPD itself, so the source re-reads the new EDID within
+ * ~10 s. 4K Pro only: the ioctl is disabled at registration on other
+ * boards, and the page writer refuses other boards outright. */
+int sc0710_i2c_set_edid(struct sc0710_dev *dev, const u8 *edid, int len)
+{
+	int ret;
+
+	if (!sc0710_edid_image_valid(edid, len))
+		return -EINVAL;
+
+	mutex_lock(&dev->signalMutex);
+
+	if (!sc0710_mcu_sane(dev)) {
+		printk(KERN_ERR "%s: refusing EDID write, bus/MCU unhealthy\n", dev->name);
+		ret = -EIO;
+	} else {
+		if (__sc0710_4kp_set_edid_source(dev, SC0710_EDID_SOURCE_INTERNAL) < 0)
+			printk(KERN_WARNING "%s: could not force the internal EDID source, writing anyway\n",
+				dev->name);
+		ret = sc0710_edid_program(dev, edid, len);
+	}
+
+	mutex_unlock(&dev->signalMutex);
+	return ret;
 }
 
 int sc0710_i2c_initialize(struct sc0710_dev *dev)
 {
+	int ret;
+
 	if (dev->board != SC0710_BOARD_ELGATEO_4KP)
 		return 0;
 
@@ -971,8 +1472,38 @@ int sc0710_i2c_initialize(struct sc0710_dev *dev)
 
 	mutex_lock(&dev->signalMutex);
 
-	/* Write factory EDID if missing (lost on cold boot) */
-	sc0710_write_factory_edid(dev);
+	/* A previous driver instance (rmmod mid-poll) may have left the IIC
+	 * engine mid-transaction with stale bytes in the RX FIFO; start clean. */
+	sc0710_i2c_bus_reset(dev);
+
+	if (!sc0710_mcu_sane(dev)) {
+		printk(KERN_ERR "%s: MCU status read failed or returned constant filler; "
+			"bus/MCU unhealthy, skipping all EDID/EEPROM writes "
+			"(power the card off at the wall if this persists)\n", dev->name);
+		mutex_unlock(&dev->signalMutex);
+		return 0;
+	}
+
+	if (sc0710_edid_profile && sc0710_edid_profile[0]) {
+		/* A specific profile was requested (edid=): write that full EDID.
+		 * Fall back to the factory EDID only when the profile never made it
+		 * to the wire (missing file, invalid name or image).
+		 * After a wire failure the EEPROM may hold a partial image and the
+		 * bus is sick, so report instead of writing more through it. */
+		ret = sc0710_write_edid_profile(dev, sc0710_edid_profile);
+		if (ret == -ENOENT || ret == -EINVAL) {
+			printk(KERN_WARNING "%s: EDID profile '%s' unavailable, using factory EDID\n",
+				dev->name, sc0710_edid_profile);
+			sc0710_write_factory_edid(dev);
+		} else if (ret < 0) {
+			printk(KERN_ERR "%s: EDID write failed (%d); the EEPROM may hold a "
+				"partial EDID. Reload with edid= once the bus is healthy, or "
+				"power the card off at the wall\n", dev->name, ret);
+		}
+	} else {
+		/* Write factory EDID if the EEPROM header is missing/corrupt */
+		sc0710_write_factory_edid(dev);
+	}
 
 	mutex_unlock(&dev->signalMutex);
 

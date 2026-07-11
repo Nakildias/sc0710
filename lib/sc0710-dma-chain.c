@@ -139,18 +139,21 @@ int sc0710_dma_chain_alloc(struct sc0710_dma_channel *ch, int nr, int total_tran
 		else
 			size = rem;
 
+		/* We can't fit the transfer in our statically allocated structs. */
+		if (chain->numAllocations == SC0710_MAX_CHAIN_DESCRIPTORS)
+			return -ENOMEM;
+
 		dca->enabled = 1;
 		dca->buf_size = size;
-		dca->buf_cpu = dma_alloc_coherent(&dev->pci->dev, dca->buf_size, &dca->buf_dma, GFP_ATOMIC);
+		/* GFP_KERNEL: every caller (probe, STREAMON, the kthreads) is
+		 * sleepable process context. */
+		dca->buf_cpu = dma_alloc_coherent(&dev->pci->dev, dca->buf_size, &dca->buf_dma, GFP_KERNEL);
 		if (dca->buf_cpu == 0)
 			return -ENOMEM;
 
 		memset(dca->buf_cpu, 0, dca->buf_size);
 
-		if (++chain->numAllocations == SC0710_MAX_CHAIN_DESCRIPTORS) {
-			/* We can't fit the transfer in our statically allocated structs. */
-			return -ENOMEM;
-		}
+		chain->numAllocations++;
 		dca++;
 		rem -= size;
 	}

@@ -76,14 +76,12 @@ print_next_steps() {
         source "$fw_lib"
         if sc0710_is_4k_pro; then
             cat <<'EOF'
-4K Pro — ECP5 firmware services (installed on package install/upgrade):
-  sc0710-firmware.service
-  sc0710-firmware-verify.service
+4K Pro — the driver programs the ECP5 FPGA at module load and refuses to
+bind the card if it can't (missing firmware file, upload failure).
 
 Next steps:
   sc0710-cli --status
-  systemctl status sc0710-firmware.service sc0710-firmware-verify.service
-  sudo sc0710-cli --restart    # if video is black after cold boot
+  sudo sc0710-cli --restart    # if the card didn't bind (no /dev/video*)
   sudo sc0710-cli --remove     # uninstall via yay/paru
 EOF
             return
@@ -138,7 +136,7 @@ overlay_working_tree() {
     [[ -d "$src/scripts" ]] || die "expected source tree at $src/scripts (run makepkg -od first)"
 
     msg "Overlaying local scripts from ${REPO_ROOT}/scripts/"
-    for f in sc0710-firmware-lib.sh sc0710-cli.sh sc0710-firmware.sh extract-firmware.sh; do
+    for f in sc0710-firmware-lib.sh sc0710-cli.sh extract-firmware.sh; do
         [[ -f "$REPO_ROOT/scripts/$f" ]] || die "missing $REPO_ROOT/scripts/$f"
         cp "$REPO_ROOT/scripts/$f" "$src/scripts/$f"
     done
@@ -211,7 +209,7 @@ if [[ "$DO_VERIFY" -eq 1 ]]; then
       dkms status sc0710 2>/dev/null || true
       sc0710-cli -s || sudo sc0710-cli -s
       if source /usr/lib/sc0710/sc0710-firmware-lib.sh 2>/dev/null && sc0710_is_4k_pro; then
-          systemctl is-enabled sc0710-firmware.service sc0710-firmware-verify.service 2>&1 || true
+          sc0710_card_bound && msg "Card bound — ECP5 FPGA programmed" || msg "Card not bound — check dmesg (sudo dmesg | grep sc0710)"
       fi
   else
       msg "Skipping runtime checks (--no-install)"

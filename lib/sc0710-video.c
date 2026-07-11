@@ -162,6 +162,9 @@ static enum v4l2_quantization sc0710_get_v4l2_quantization(struct sc0710_dev *de
 static unsigned char *nosignal_frame_buffer = NULL;
 static unsigned char *nodevice_frame_buffer = NULL;
 static int status_frames_generated = 0;
+/* Guards generation: two clients' first STREAMONs run under distinct vb2
+ * locks, so nothing else serializes the lazy init. */
+static DEFINE_MUTEX(status_frames_lock);
 
 /* 75% IRE colorbars */
 static unsigned char colorbars[7][4] =
@@ -268,32 +271,49 @@ static void generate_status_frame(unsigned char *dest, const struct overlay_spri
 static void generate_status_frames_if_needed(void)
 {
 	unsigned int frame_size = STATUS_IMAGE_WIDTH * STATUS_IMAGE_HEIGHT * 2;
-	
-	if (status_frames_generated)
-		return;
-	
-	/* Allocate buffers for generated frames */
-	nosignal_frame_buffer = vmalloc(frame_size);
-	nodevice_frame_buffer = vmalloc(frame_size);
-	
-	if (!nosignal_frame_buffer || !nodevice_frame_buffer) {
-		if (nosignal_frame_buffer)
-			vfree(nosignal_frame_buffer);
-		if (nodevice_frame_buffer)
-			vfree(nodevice_frame_buffer);
-		nosignal_frame_buffer = NULL;
-		nodevice_frame_buffer = NULL;
-		printk(KERN_WARNING "sc0710: Failed to allocate status frame buffers\n");
+	unsigned char *nosignal, *nodevice;
+
+	mutex_lock(&status_frames_lock);
+	if (status_frames_generated) {
+		mutex_unlock(&status_frames_lock);
 		return;
 	}
-	
-	/* Generate frames from overlays */
-	generate_status_frame(nosignal_frame_buffer, &no_signal_sprite);
 
-	generate_status_frame(nodevice_frame_buffer, &no_device_sprite);
-	
+	/* Build both frames completely before publishing the pointers: the
+	 * timer path reads them without the lock, so a half-drawn frame or an
+	 * error-path vfree must never be visible through them. */
+	nosignal = vmalloc(frame_size);
+	nodevice = vmalloc(frame_size);
+	if (!nosignal || !nodevice) {
+		vfree(nosignal);
+		vfree(nodevice);
+		printk(KERN_WARNING "sc0710: Failed to allocate status frame buffers\n");
+		mutex_unlock(&status_frames_lock);
+		return;
+	}
+
+	/* Generate frames from overlays */
+	generate_status_frame(nosignal, &no_signal_sprite);
+	generate_status_frame(nodevice, &no_device_sprite);
+
+	nosignal_frame_buffer = nosignal;
+	nodevice_frame_buffer = nodevice;
 	status_frames_generated = 1;
 	printk(KERN_INFO "sc0710: Generated status frames from hybrid-optimized data\n");
+	mutex_unlock(&status_frames_lock);
+}
+
+/* Called at module exit, after every device (and so every timer that could
+ * read these) is gone. */
+void sc0710_video_free_status_frames(void)
+{
+	mutex_lock(&status_frames_lock);
+	vfree(nosignal_frame_buffer);
+	nosignal_frame_buffer = NULL;
+	vfree(nodevice_frame_buffer);
+	nodevice_frame_buffer = NULL;
+	status_frames_generated = 0;
+	mutex_unlock(&status_frames_lock);
 }
 
 /* Compute the effective output dimensions, accounting for the software scaler.
@@ -556,10 +576,48 @@ void sc0710_format_initialize(void)
 	struct sc0710_format *fmt;
 	unsigned int i;
 	for (i = 0; i < ARRAY_SIZE(formats); i++) {
+		struct v4l2_bt_timings *bt;
+		u64 pixelclock, clk_delta;
+
 		fmt = &formats[i];
 
 		/* Assuming YUV 8-bit */
 		fmt->framesize = fmt->width * 2 * fmt->height;
+
+		/* Entries with no matching kernel timing macro carry a
+		 * nearest-neighbour placeholder in the static table (the
+		 * 2560x1440 modes point at the 1080p60 macro), which
+		 * QUERY/G/ENUM_DV_TIMINGS must not report. Where the macro
+		 * disagrees with the entry's own numbers, synthesize the
+		 * timing from those numbers; the blanking split is unknown,
+		 * so it lands in the back porches (clients consume
+		 * width/height/totals/pixelclock).
+		 *
+		 * The pixelclock comparison is 1%-tolerant: several table
+		 * entries round the field rate (60 for DMT/CVT 59.94/60.317,
+		 * 59.94 stored as 60000/1001 against a nominal CEA clock), and
+		 * an exact compare would discard their correct macros with all
+		 * the standards flags. Real placeholders differ by dims or by
+		 * 2x+ clock (the >60Hz rows carry a 60Hz macro), far past 1%.
+		 */
+		if (fmt->interlaced)
+			continue; /* both interlaced entries carry their exact CEA macro */
+		bt = &fmt->dv_timings.bt;
+		pixelclock = div_u64((u64)fmt->timingH * fmt->timingV * fmt->fpsnum,
+			fmt->fpsden);
+		clk_delta = bt->pixelclock > pixelclock ?
+			bt->pixelclock - pixelclock : pixelclock - bt->pixelclock;
+		if (bt->width == fmt->width && bt->height == fmt->height &&
+		    V4L2_DV_BT_FRAME_WIDTH(bt) == fmt->timingH &&
+		    V4L2_DV_BT_FRAME_HEIGHT(bt) == fmt->timingV &&
+		    clk_delta * 100 <= pixelclock)
+			continue;
+		memset(bt, 0, sizeof(*bt));
+		bt->width = fmt->width;
+		bt->height = fmt->height;
+		bt->pixelclock = pixelclock;
+		bt->hbackporch = fmt->timingH - fmt->width;
+		bt->vbackporch = fmt->timingV - fmt->height;
 	}
 }
 
@@ -1045,7 +1103,7 @@ static int sc0710_start_streaming(struct vb2_queue *q, unsigned int count)
 	int refcount;
 	int ret;
 
-	dprintk(1, "%s(ch#%d)\\n", __func__, ch->nr);
+	dprintk(1, "%s(ch#%d)\n", __func__, ch->nr);
 
 	/* Ensure status images are generated (safe process context here) */
 	if (use_status_images)
@@ -1074,13 +1132,19 @@ static int sc0710_start_streaming(struct vb2_queue *q, unsigned int count)
 
 	/* Increment streaming reference count */
 	refcount = atomic_inc_return(&ch->streaming_refcount);
-	dprintk(1, "%s() streaming refcount now %d\\n", __func__, refcount);
+	dprintk(1, "%s() streaming refcount now %d\n", __func__, refcount);
 
-	/* Only start DMA if we're the first streaming client AND have signal */
+	/* Only start DMA if we're the first streaming client AND have signal.
+	 * kthread_dma_lock serializes this against the HDMI thread's resync:
+	 * without it a resync between the refcount increment and the resize
+	 * could start the channel first, and the resize would then skip a
+	 * running channel and stream from a stale ring. */
 	if (refcount == 1 && dev->fmt != NULL) {
-		sc0710_dma_channels_resize(dev);
-
-		ret = sc0710_dma_channels_start(dev);
+		mutex_lock(&dev->kthread_dma_lock);
+		ret = sc0710_dma_channels_resize(dev);
+		if (ret == 0)
+			ret = sc0710_dma_channels_start(dev);
+		mutex_unlock(&dev->kthread_dma_lock);
 		if (ret < 0) {
 			struct sc0710_buffer *buf, *tmp;
 			unsigned long flags;
@@ -1097,7 +1161,7 @@ static int sc0710_start_streaming(struct vb2_queue *q, unsigned int count)
 			return ret;
 		}
 	} else if (dev->fmt == NULL) {
-		dprintk(1, "%s() No signal - will deliver placeholder frames\\n", __func__);
+		dprintk(1, "%s() No signal - will deliver placeholder frames\n", __func__);
 	}
 
 	/* Start timer for delivering frames (real or placeholder) */
@@ -1124,11 +1188,18 @@ static void sc0710_stop_streaming(struct vb2_queue *q)
 	refcount = atomic_dec_return(&ch->streaming_refcount);
 	dprintk(1, "%s() streaming refcount now %d\n", __func__, refcount);
 
-	/* Only stop DMA if we're the last streaming client */
+	/* Only stop DMA if we're the last streaming client.
+	 * kthread_dma_lock serializes against an in-flight resync, whose
+	 * client snapshot would otherwise go stale here and restart DMA with
+	 * no clients left.  Stop the channels first (serialized against the
+	 * service thread via ch->lock), then delete the timer, so a service
+	 * pass can't re-arm the timer after timer_delete_sync(). */
 	if (refcount <= 0) {
+		mutex_lock(&dev->kthread_dma_lock);
 		atomic_set(&ch->streaming_refcount, 0); /* Clamp to 0 */
-		timer_delete_sync(&ch->timeout);
 		sc0710_dma_channels_stop(dev);
+		timer_delete_sync(&ch->timeout);
+		mutex_unlock(&dev->kthread_dma_lock);
 	}
 
 	/* Release all active buffers for this client */
@@ -1378,12 +1449,84 @@ static const struct v4l2_file_operations video_fops = {
 	.unlocked_ioctl = video_ioctl2,
 };
 
+/* VIDIOC_G/S_EDID: expose the card's source-facing EDID (the EEPROM image
+ * the MCU presents to the HDMI source in Internal mode) through the standard
+ * V4L2 ioctls, complementing the load-time edid= param. The v4l2 core copies
+ * the edid->edid payload for us. 4K Pro only. */
+static int vidioc_g_edid(struct file *file, void *_fh, struct v4l2_edid *edid)
+{
+	struct sc0710_dma_channel *ch = video_drvdata(file);
+	struct sc0710_dev *dev = ch->dev;
+	u8 buf[512];
+	u32 total_blocks;
+	int ret;
+
+	if (edid->pad)
+		return -EINVAL;
+
+	/* The base block declares how much else there is; each 16-byte page is
+	 * a full I2C transaction, so read only the blocks actually needed. */
+	ret = sc0710_i2c_get_edid(dev, buf, 0, 128);
+	if (ret < 0)
+		return ret;
+
+	/* Actual image length: base block plus its declared extensions,
+	 * bounded by the 512-byte EEPROM. No header magic (blank or
+	 * never-programmed EEPROM) = no EDID. */
+	if (sc0710_edid_header_valid(buf))
+		total_blocks = min_t(u32, (u32)buf[126] + 1, 4);
+	else
+		total_blocks = 0;
+
+	if (edid->start_block == 0 && edid->blocks == 0) {
+		edid->blocks = total_blocks;
+		return 0;
+	}
+	if (total_blocks == 0)
+		return -ENODATA;
+	if (edid->start_block >= total_blocks)
+		return -EINVAL;
+	if (edid->blocks > total_blocks - edid->start_block)
+		edid->blocks = total_blocks - edid->start_block;
+
+	if (edid->start_block + edid->blocks > 1) {
+		ret = sc0710_i2c_get_edid(dev, buf + 128, 128,
+			(edid->start_block + edid->blocks - 1) * 128);
+		if (ret < 0)
+			return ret;
+	}
+
+	memcpy(edid->edid, buf + edid->start_block * 128, edid->blocks * 128);
+	return 0;
+}
+
+static int vidioc_s_edid(struct file *file, void *_fh, struct v4l2_edid *edid)
+{
+	struct sc0710_dma_channel *ch = video_drvdata(file);
+	struct sc0710_dev *dev = ch->dev;
+
+	if (edid->pad)
+		return -EINVAL;
+	/* blocks == 0 ("erase the EDID") isn't supported: the MCU always
+	 * presents something in Internal mode; set a real profile instead. */
+	if (edid->blocks == 0)
+		return -EINVAL;
+	if (edid->blocks > 4) {
+		edid->blocks = 4;
+		return -E2BIG;
+	}
+
+	return sc0710_i2c_set_edid(dev, edid->edid, edid->blocks * 128);
+}
+
 static const struct v4l2_ioctl_ops video_ioctl_ops =
 {
 	.vidioc_querycap         = vidioc_querycap,
 
 	.vidioc_s_dv_timings     = vidioc_s_dv_timings,
 	.vidioc_g_dv_timings     = vidioc_g_dv_timings,
+	.vidioc_g_edid           = vidioc_g_edid,
+	.vidioc_s_edid           = vidioc_s_edid,
 	.vidioc_query_dv_timings = vidioc_query_dv_timings,
 	.vidioc_enum_dv_timings  = vidioc_enum_dv_timings,
 	.vidioc_dv_timings_cap   = vidioc_dv_timings_cap,
@@ -1417,6 +1560,45 @@ static struct video_device sc0710_video_template =
 	.name      = "sc0710-video",
 	.fops      = &video_fops,
 	.ioctl_ops = &video_ioctl_ops,
+};
+
+static int sc0710_s_ctrl(struct v4l2_ctrl *ctrl)
+{
+	struct sc0710_dev *dev =
+		container_of(ctrl->handler, struct sc0710_dev, ctrl_handler);
+
+	switch (ctrl->id) {
+	case SC0710_CID_EDID_SOURCE:
+		return sc0710_4kp_set_edid_source(dev, ctrl->val);
+	}
+	return -EINVAL;
+}
+
+static const struct v4l2_ctrl_ops sc0710_ctrl_ops = {
+	.s_ctrl = sc0710_s_ctrl,
+};
+
+static const char * const sc0710_edid_source_menu[] = {
+	"Internal",
+	"Display",
+	"Merged",
+	NULL
+};
+
+/* The MCU offers no readback for the EDID source, so the reported value is
+ * the last one set through this control.
+ * EXECUTE_ON_WRITE lets a rewrite of the current value resend the call to
+ * force a known state. */
+static const struct v4l2_ctrl_config sc0710_4kp_edid_source_ctrl = {
+	.ops   = &sc0710_ctrl_ops,
+	.id    = SC0710_CID_EDID_SOURCE,
+	.name  = "EDID Source",
+	.type  = V4L2_CTRL_TYPE_MENU,
+	.min   = SC0710_EDID_SOURCE_INTERNAL,
+	.max   = SC0710_EDID_SOURCE_MERGED,
+	.def   = SC0710_EDID_SOURCE_INTERNAL,
+	.qmenu = sc0710_edid_source_menu,
+	.flags = V4L2_CTRL_FLAG_EXECUTE_ON_WRITE,
 };
 
 static const struct v4l2_file_operations cobalt_empty_fops = {
@@ -1455,8 +1637,12 @@ static void sc0710_vid_timeout(struct timer_list *t)
 	/* Compute effective (possibly scaled) output dimensions */
 	sc0710_get_effective_size(dev, fmt, &eff_w, &eff_h, &eff_fs);
 
-	/* If we have real signal, DMA is handling frame delivery, just reschedule */
-	if (dev->fmt != NULL && dev->locked) {
+	/* If we have real signal and the channel is running, DMA is handling
+	 * frame delivery, just reschedule.
+	 * The state check keeps a stopped channel (failed DMA reconfigure with
+	 * signal still locked) on the placeholder path below.
+	 * ch->state is read unlocked; staleness costs one placeholder frame. */
+	if (dev->fmt != NULL && dev->locked && ch->state == STATE_RUNNING) {
 		/* Re-set the buffer timeout for DMA monitoring */
 		if (atomic_read(&ch->streaming_refcount) > 0)
 			mod_timer(&ch->timeout, jiffies + VBUF_TIMEOUT);
@@ -1504,9 +1690,12 @@ static void sc0710_vid_timeout(struct timer_list *t)
 					fill_fs = fill_w * 2 * fill_h;
 				}
 				if (fill_fs > buf_sz) {
+					/* Last resort: the largest 1920-wide strip
+					 * that fits. Never write a hardcoded
+					 * geometry past the client's buffer. */
 					fill_w = 1920;
-					fill_h = 1080;
-					fill_fs = 1920 * 2 * 1080;
+					fill_h = min_t(u32, 1080, buf_sz / (1920 * 2));
+					fill_fs = fill_w * 2 * fill_h;
 				}
 
 				{
@@ -1564,6 +1753,9 @@ void sc0710_video_unregister(struct sc0710_dma_channel *ch)
 
 	if (video_is_registered(&ch->vdev))
 		video_unregister_device(&ch->vdev);
+
+	/* No-op unless the handler was initialized (4K Pro only). */
+	v4l2_ctrl_handler_free(&dev->ctrl_handler);
 }
 
 int sc0710_video_register(struct sc0710_dma_channel *ch)
@@ -1614,6 +1806,24 @@ int sc0710_video_register(struct sc0710_dma_channel *ch)
 	ch->vdev.dev_parent = &dev->pci->dev;
 #endif
 	strscpy(ch->vdev.name, "sc0710 video", sizeof(ch->vdev.name));
+
+	/* The EDID EEPROM protocol and the EDID source selector are 4K Pro-specific.
+	 * This branch is the single board-scope gate for the whole EDID surface
+	 * (the page writer additionally refuses other boards outright). */
+	if (dev->board == SC0710_BOARD_ELGATEO_4KP) {
+		v4l2_ctrl_handler_init(&dev->ctrl_handler, 1);
+		v4l2_ctrl_new_custom(&dev->ctrl_handler, &sc0710_4kp_edid_source_ctrl, NULL);
+		if (dev->ctrl_handler.error) {
+			err = dev->ctrl_handler.error;
+			printk(KERN_ERR "%s: can't register the EDID source control\n", dev->name);
+			v4l2_ctrl_handler_free(&dev->ctrl_handler);
+			return err;
+		}
+		ch->vdev.ctrl_handler = &dev->ctrl_handler;
+	} else {
+		v4l2_disable_ioctl(&ch->vdev, VIDIOC_G_EDID);
+		v4l2_disable_ioctl(&ch->vdev, VIDIOC_S_EDID);
+	}
 
 	video_set_drvdata(&ch->vdev, ch);
 

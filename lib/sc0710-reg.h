@@ -98,6 +98,14 @@
  *
  * 
  */
+/* AXI IIC soft reset (SOFTR, IIC base 0x3000 + 0x40): writing 0xA resets the
+ * bus state machine and clears both FIFOs. Never observed written in traced
+ * vendor-driver sessions; we use it to recover a controller left dirty by an
+ * interrupted or timed-out transaction, since the RX FIFO has no reset bit
+ * and stale bytes otherwise offset every later read.
+ */
+#define BAR0_3040 0x3040
+
 #define BAR0_3100 0x3100
 
 /* I2C bus status
