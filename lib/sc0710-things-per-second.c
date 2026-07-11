@@ -49,7 +49,7 @@ void sc0710_things_per_second_update(struct sc0710_things_per_second *tps, s64 v
 #else
 	u64 now;
 	now = ktime_get_ns();
-	if (now - tps->lastTime > 1000000) {
+	if (now - tps->lastTime > NSEC_PER_SEC) {
 		tps->lastTime = now;
 		tps->persecond = tps->accumulator;
 		tps->accumulator = 0;

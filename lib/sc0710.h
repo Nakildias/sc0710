@@ -549,6 +549,7 @@ s64  sc0710_things_per_second_query(struct sc0710_things_per_second *tps);
 /* video.c */
 void sc0710_video_unregister(struct sc0710_dma_channel *ch);
 int  sc0710_video_register(struct sc0710_dma_channel *ch);
+void sc0710_video_free_status_frames(void);
 void sc0710_video_notify_source_change(struct sc0710_dev *dev);
 bool sc0710_guess_dims_from_framesize(u32 frame_bytes, u32 *w, u32 *h);
 const char *sc0710_colorimetry_ascii(enum sc0710_colorimetry_e val);

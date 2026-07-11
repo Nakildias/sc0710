@@ -162,6 +162,9 @@ static enum v4l2_quantization sc0710_get_v4l2_quantization(struct sc0710_dev *de
 static unsigned char *nosignal_frame_buffer = NULL;
 static unsigned char *nodevice_frame_buffer = NULL;
 static int status_frames_generated = 0;
+/* Guards generation: two clients' first STREAMONs run under distinct vb2
+ * locks, so nothing else serializes the lazy init. */
+static DEFINE_MUTEX(status_frames_lock);
 
 /* 75% IRE colorbars */
 static unsigned char colorbars[7][4] =
@@ -268,32 +271,49 @@ static void generate_status_frame(unsigned char *dest, const struct overlay_spri
 static void generate_status_frames_if_needed(void)
 {
 	unsigned int frame_size = STATUS_IMAGE_WIDTH * STATUS_IMAGE_HEIGHT * 2;
-	
-	if (status_frames_generated)
-		return;
-	
-	/* Allocate buffers for generated frames */
-	nosignal_frame_buffer = vmalloc(frame_size);
-	nodevice_frame_buffer = vmalloc(frame_size);
-	
-	if (!nosignal_frame_buffer || !nodevice_frame_buffer) {
-		if (nosignal_frame_buffer)
-			vfree(nosignal_frame_buffer);
-		if (nodevice_frame_buffer)
-			vfree(nodevice_frame_buffer);
-		nosignal_frame_buffer = NULL;
-		nodevice_frame_buffer = NULL;
-		printk(KERN_WARNING "sc0710: Failed to allocate status frame buffers\n");
+	unsigned char *nosignal, *nodevice;
+
+	mutex_lock(&status_frames_lock);
+	if (status_frames_generated) {
+		mutex_unlock(&status_frames_lock);
 		return;
 	}
-	
-	/* Generate frames from overlays */
-	generate_status_frame(nosignal_frame_buffer, &no_signal_sprite);
 
-	generate_status_frame(nodevice_frame_buffer, &no_device_sprite);
-	
+	/* Build both frames completely before publishing the pointers: the
+	 * timer path reads them without the lock, so a half-drawn frame or an
+	 * error-path vfree must never be visible through them. */
+	nosignal = vmalloc(frame_size);
+	nodevice = vmalloc(frame_size);
+	if (!nosignal || !nodevice) {
+		vfree(nosignal);
+		vfree(nodevice);
+		printk(KERN_WARNING "sc0710: Failed to allocate status frame buffers\n");
+		mutex_unlock(&status_frames_lock);
+		return;
+	}
+
+	/* Generate frames from overlays */
+	generate_status_frame(nosignal, &no_signal_sprite);
+	generate_status_frame(nodevice, &no_device_sprite);
+
+	nosignal_frame_buffer = nosignal;
+	nodevice_frame_buffer = nodevice;
 	status_frames_generated = 1;
 	printk(KERN_INFO "sc0710: Generated status frames from hybrid-optimized data\n");
+	mutex_unlock(&status_frames_lock);
+}
+
+/* Called at module exit, after every device (and so every timer that could
+ * read these) is gone. */
+void sc0710_video_free_status_frames(void)
+{
+	mutex_lock(&status_frames_lock);
+	vfree(nosignal_frame_buffer);
+	nosignal_frame_buffer = NULL;
+	vfree(nodevice_frame_buffer);
+	nodevice_frame_buffer = NULL;
+	status_frames_generated = 0;
+	mutex_unlock(&status_frames_lock);
 }
 
 /* Compute the effective output dimensions, accounting for the software scaler.

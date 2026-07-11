@@ -257,7 +257,7 @@ static bool sc0710_detect_horizontal_tear(const u8 *buf, u32 width, u32 height, 
  * Insteaf of writing descriptor tables that constaintly run, when complete
  * restarting at the beginning (and incrementing the writeback metdata), I
  * will have the descriptor processing stop. An interrupt should be triggered.
- * The interupt handler (sc0710_irq) which in polled mode does nothing,
+ * A new interrupt handler (the driver currently never requests the IRQ)
  * will then take ownership of determining which descriptor just stopped,
  * immediately starting a different descriptor, then deferring service
  * of the completeed descriptor chain into a worker thread.
@@ -267,7 +267,7 @@ static bool sc0710_detect_horizontal_tear(const u8 *buf, u32 width, u32 height, 
  * b. in sc0710_dma_channel_chains_link() instead of having the last descriptor
  *    loop back to the first, terminate the descriptor chain and raise
  *    an interrupt.
- * c. in sc0710_irq(), using a variation of dma_channels_service(),
+ * c. in the new irq handler, using a variation of dma_channels_service(),
  *    - look at every descriptor, find the first free descriptor not
  *      being used and put that back on the hardware for the next transfer.
  *    - Find the decriptor chain just completed, schedule this for
@@ -932,13 +932,8 @@ int sc0710_dma_channel_alloc(struct sc0710_dev *dev, u32 nr, enum sc0710_channel
 		sc0710_dma_chains_dump(ch);
 	}
 
-	/* Register and create various linux4linux and audio subsystem devices. */
-	if (ch->mediatype == CHTYPE_VIDEO) {
-		ret = sc0710_video_register(ch); /* TODO: Check result */
-	}
-	if (ch->mediatype == CHTYPE_AUDIO) {
-		sc0710_audio_register(dev); /* TODO: Check result */
-	}
+	/* The V4L2/ALSA device nodes are registered by the probe once nothing
+	 * else can fail; an open node must never outlive its dev. */
 
 	return 0; /* Success */
 };

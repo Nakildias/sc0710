@@ -398,10 +398,9 @@ void sc0710_audio_unregister(struct sc0710_dev *dev)
 	dprintk(1, "%s()\n", __func__);
 	dprintk(0, "Unregistered ALSA audio device %p\n", chip);
 
-	if (!chip) {
-		printk(KERN_ERR "%s() no chip!\n", __func__);
+	/* Normal when audio registration failed or never ran. */
+	if (!chip)
 		return;
-	}
 
 	sc0710_audio_stop_silence(chip);
 	snd_card_free(chip->card);
@@ -442,8 +441,10 @@ int sc0710_audio_register(struct sc0710_dev *dev)
 	err = snd_card_new(&dev->pci->dev, SNDRV_DEFAULT_IDX1, SNDRV_DEFAULT_STR1,
 			      THIS_MODULE, sizeof(struct sc0710_audio_dev),
 			      &card);
-	if (err < 0)
-		goto error;
+	if (err < 0) {
+		printk(KERN_ERR "%s(): snd_card_new failed (%d)\n", __func__, err);
+		return err;
+	}
 
 	chip = (struct sc0710_audio_dev *)card->private_data;
 	chip->card = card;
@@ -478,7 +479,7 @@ int sc0710_audio_register(struct sc0710_dev *dev)
 error:
 	snd_card_free(card);
 	printk(KERN_ERR "%s(): Failed to register analog "
-	       "audio adapter\n", __func__);
+	       "audio adapter (%d)\n", __func__, err);
 
-	return 0;
+	return err;
 }
