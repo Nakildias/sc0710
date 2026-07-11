@@ -77,6 +77,13 @@ module_param(procedural_timings, int, 0644);
 MODULE_PARM_DESC(procedural_timings,
 	"Timing selection mode: 0=merge(static+procedural), 1=procedural-only, 2=static-only");
 
+char *sc0710_edid_profile = "";
+module_param_named(edid, sc0710_edid_profile, charp, 0444);
+MODULE_PARM_DESC(edid,
+	"EDID profile presented to the HDMI source, e.g. \"1440p\" (4K Pro only). Loads "
+	"/lib/firmware/sc0710/edid/<name>.bin, installed by scripts/extract-firmware.sh; "
+	"empty = factory default.");
+
 unsigned int dma_resync_validate_frames = 8;
 module_param(dma_resync_validate_frames, int, 0644);
 MODULE_PARM_DESC(dma_resync_validate_frames,

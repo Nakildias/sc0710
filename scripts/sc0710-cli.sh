@@ -357,15 +357,17 @@ EOF
 
 sc0710_remove_firmware_files() {
     rm -f /lib/firmware/sc0710/SC0710.FWI.HEX 2>/dev/null || true
+    rm -rf /lib/firmware/sc0710/edid 2>/dev/null || true
     rmdir /lib/firmware/sc0710 2>/dev/null || true
 
-    rm -f /etc/firmware/sc0710/SC0710.FWI.HEX 2>/dev/null || true
+    rm -f /etc/firmware/sc0710/SC0710.FWI.HEX /etc/firmware/sc0710/edid 2>/dev/null || true
     if [[ -L /etc/firmware/sc0710 ]]; then
         rm -f /etc/firmware/sc0710 2>/dev/null || true
     fi
     rmdir /etc/firmware/sc0710 2>/dev/null || true
 
     rm -f /var/lib/sc0710/firmware/SC0710.FWI.HEX 2>/dev/null || true
+    rm -rf /var/lib/sc0710/firmware/edid 2>/dev/null || true
     rmdir /var/lib/sc0710/firmware 2>/dev/null || true
 
     rm -f /usr/local/libexec/sc0710-firmware-lib.sh 2>/dev/null || true

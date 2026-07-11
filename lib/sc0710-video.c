@@ -1449,12 +1449,84 @@ static const struct v4l2_file_operations video_fops = {
 	.unlocked_ioctl = video_ioctl2,
 };
 
+/* VIDIOC_G/S_EDID: expose the card's source-facing EDID (the EEPROM image
+ * the MCU presents to the HDMI source in Internal mode) through the standard
+ * V4L2 ioctls, complementing the load-time edid= param. The v4l2 core copies
+ * the edid->edid payload for us. 4K Pro only. */
+static int vidioc_g_edid(struct file *file, void *_fh, struct v4l2_edid *edid)
+{
+	struct sc0710_dma_channel *ch = video_drvdata(file);
+	struct sc0710_dev *dev = ch->dev;
+	u8 buf[512];
+	u32 total_blocks;
+	int ret;
+
+	if (edid->pad)
+		return -EINVAL;
+
+	/* The base block declares how much else there is; each 16-byte page is
+	 * a full I2C transaction, so read only the blocks actually needed. */
+	ret = sc0710_i2c_get_edid(dev, buf, 0, 128);
+	if (ret < 0)
+		return ret;
+
+	/* Actual image length: base block plus its declared extensions,
+	 * bounded by the 512-byte EEPROM. No header magic (blank or
+	 * never-programmed EEPROM) = no EDID. */
+	if (sc0710_edid_header_valid(buf))
+		total_blocks = min_t(u32, (u32)buf[126] + 1, 4);
+	else
+		total_blocks = 0;
+
+	if (edid->start_block == 0 && edid->blocks == 0) {
+		edid->blocks = total_blocks;
+		return 0;
+	}
+	if (total_blocks == 0)
+		return -ENODATA;
+	if (edid->start_block >= total_blocks)
+		return -EINVAL;
+	if (edid->blocks > total_blocks - edid->start_block)
+		edid->blocks = total_blocks - edid->start_block;
+
+	if (edid->start_block + edid->blocks > 1) {
+		ret = sc0710_i2c_get_edid(dev, buf + 128, 128,
+			(edid->start_block + edid->blocks - 1) * 128);
+		if (ret < 0)
+			return ret;
+	}
+
+	memcpy(edid->edid, buf + edid->start_block * 128, edid->blocks * 128);
+	return 0;
+}
+
+static int vidioc_s_edid(struct file *file, void *_fh, struct v4l2_edid *edid)
+{
+	struct sc0710_dma_channel *ch = video_drvdata(file);
+	struct sc0710_dev *dev = ch->dev;
+
+	if (edid->pad)
+		return -EINVAL;
+	/* blocks == 0 ("erase the EDID") isn't supported: the MCU always
+	 * presents something in Internal mode; set a real profile instead. */
+	if (edid->blocks == 0)
+		return -EINVAL;
+	if (edid->blocks > 4) {
+		edid->blocks = 4;
+		return -E2BIG;
+	}
+
+	return sc0710_i2c_set_edid(dev, edid->edid, edid->blocks * 128);
+}
+
 static const struct v4l2_ioctl_ops video_ioctl_ops =
 {
 	.vidioc_querycap         = vidioc_querycap,
 
 	.vidioc_s_dv_timings     = vidioc_s_dv_timings,
 	.vidioc_g_dv_timings     = vidioc_g_dv_timings,
+	.vidioc_g_edid           = vidioc_g_edid,
+	.vidioc_s_edid           = vidioc_s_edid,
 	.vidioc_query_dv_timings = vidioc_query_dv_timings,
 	.vidioc_enum_dv_timings  = vidioc_enum_dv_timings,
 	.vidioc_dv_timings_cap   = vidioc_dv_timings_cap,
@@ -1488,6 +1560,45 @@ static struct video_device sc0710_video_template =
 	.name      = "sc0710-video",
 	.fops      = &video_fops,
 	.ioctl_ops = &video_ioctl_ops,
+};
+
+static int sc0710_s_ctrl(struct v4l2_ctrl *ctrl)
+{
+	struct sc0710_dev *dev =
+		container_of(ctrl->handler, struct sc0710_dev, ctrl_handler);
+
+	switch (ctrl->id) {
+	case SC0710_CID_EDID_SOURCE:
+		return sc0710_4kp_set_edid_source(dev, ctrl->val);
+	}
+	return -EINVAL;
+}
+
+static const struct v4l2_ctrl_ops sc0710_ctrl_ops = {
+	.s_ctrl = sc0710_s_ctrl,
+};
+
+static const char * const sc0710_edid_source_menu[] = {
+	"Internal",
+	"Display",
+	"Merged",
+	NULL
+};
+
+/* The MCU offers no readback for the EDID source, so the reported value is
+ * the last one set through this control.
+ * EXECUTE_ON_WRITE lets a rewrite of the current value resend the call to
+ * force a known state. */
+static const struct v4l2_ctrl_config sc0710_4kp_edid_source_ctrl = {
+	.ops   = &sc0710_ctrl_ops,
+	.id    = SC0710_CID_EDID_SOURCE,
+	.name  = "EDID Source",
+	.type  = V4L2_CTRL_TYPE_MENU,
+	.min   = SC0710_EDID_SOURCE_INTERNAL,
+	.max   = SC0710_EDID_SOURCE_MERGED,
+	.def   = SC0710_EDID_SOURCE_INTERNAL,
+	.qmenu = sc0710_edid_source_menu,
+	.flags = V4L2_CTRL_FLAG_EXECUTE_ON_WRITE,
 };
 
 static const struct v4l2_file_operations cobalt_empty_fops = {
@@ -1642,6 +1753,9 @@ void sc0710_video_unregister(struct sc0710_dma_channel *ch)
 
 	if (video_is_registered(&ch->vdev))
 		video_unregister_device(&ch->vdev);
+
+	/* No-op unless the handler was initialized (4K Pro only). */
+	v4l2_ctrl_handler_free(&dev->ctrl_handler);
 }
 
 int sc0710_video_register(struct sc0710_dma_channel *ch)
@@ -1692,6 +1806,24 @@ int sc0710_video_register(struct sc0710_dma_channel *ch)
 	ch->vdev.dev_parent = &dev->pci->dev;
 #endif
 	strscpy(ch->vdev.name, "sc0710 video", sizeof(ch->vdev.name));
+
+	/* The EDID EEPROM protocol and the EDID source selector are 4K Pro-specific.
+	 * This branch is the single board-scope gate for the whole EDID surface
+	 * (the page writer additionally refuses other boards outright). */
+	if (dev->board == SC0710_BOARD_ELGATEO_4KP) {
+		v4l2_ctrl_handler_init(&dev->ctrl_handler, 1);
+		v4l2_ctrl_new_custom(&dev->ctrl_handler, &sc0710_4kp_edid_source_ctrl, NULL);
+		if (dev->ctrl_handler.error) {
+			err = dev->ctrl_handler.error;
+			printk(KERN_ERR "%s: can't register the EDID source control\n", dev->name);
+			v4l2_ctrl_handler_free(&dev->ctrl_handler);
+			return err;
+		}
+		ch->vdev.ctrl_handler = &dev->ctrl_handler;
+	} else {
+		v4l2_disable_ioctl(&ch->vdev, VIDIOC_G_EDID);
+		v4l2_disable_ioctl(&ch->vdev, VIDIOC_S_EDID);
+	}
 
 	video_set_drvdata(&ch->vdev, ch);
 

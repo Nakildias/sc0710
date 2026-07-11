@@ -84,6 +84,9 @@ extern unsigned int dma_resync_max_tear_retries;
 extern unsigned int refresh_rate_resync_passes;
 extern unsigned int refresh_rate_resync_delay_ms;
 
+/* EDID profile to present to the HDMI source (edid= module param); empty = factory default. */
+extern char *sc0710_edid_profile;
+
 #define SC0710_MAX_CHANNELS 2
 
 /* A chain contains 1..SC0710_MAX_CHAIN_DESCRIPTORS descriptors,
@@ -120,6 +123,18 @@ enum sc0710_timing_mode {
 	TIMING_MODE_PROCEDURAL_ONLY = 1, /* Dynamic/procedural fallback only */
 	TIMING_MODE_STATIC_ONLY = 2,     /* Static timing table only */
 };
+
+/* EDID source presented to the HDMI input (4K Pro MCU state; the EEPROM
+ * holds the internal slot) */
+enum sc0710_edid_source {
+	SC0710_EDID_SOURCE_INTERNAL = 0, /* The on-card EEPROM EDID */
+	SC0710_EDID_SOURCE_DISPLAY  = 1, /* Pass the OUT monitor's EDID through */
+	SC0710_EDID_SOURCE_MERGED   = 2, /* MCU-merged card + monitor capabilities */
+};
+
+/* Driver-specific V4L2 control; high offset to stay clear of upstream
+ * per-driver CID allocations */
+#define SC0710_CID_EDID_SOURCE (V4L2_CID_USER_BASE + 0x9000)
 
 struct sc0710_board {
 	char *name;
@@ -453,6 +468,7 @@ struct sc0710_dev {
 
 	/* V4L2 */
 	struct v4l2_device         v4l2_dev;
+	struct v4l2_ctrl_handler   ctrl_handler;
 	/* I2C Hint tracking for change detection */
 	u8 last_hint_interval;
 	u8 last_hint_flags;
@@ -501,12 +517,16 @@ void sc_clr(struct sc0710_dev *dev, int bar, u32 reg, u32 bit);
 /* -i2c.c */
 int sc0710_i2c_initialize(struct sc0710_dev *dev);
 int sc0710_i2c_hdmi_status_dump(struct sc0710_dev *dev);
+int sc0710_i2c_get_edid(struct sc0710_dev *dev, u8 *buf, int start, int len);
+int sc0710_i2c_set_edid(struct sc0710_dev *dev, const u8 *edid, int len);
+bool sc0710_edid_header_valid(const u8 *p);
 int sc0710_i2c_read_hdmi_status(struct sc0710_dev *dev);
 int sc0710_i2c_read_status2(struct sc0710_dev *dev);
 int sc0710_i2c_read_status3(struct sc0710_dev *dev);
 int sc0710_i2c_read_procamp(struct sc0710_dev *dev);
 int sc0710_i2c_write_mcu(struct sc0710_dev *dev, u8 subaddr, u8 *data, int len);
 int sc0710_4kp_wait_pipeline(struct sc0710_dev *dev);
+int sc0710_4kp_set_edid_source(struct sc0710_dev *dev, u32 src);
 void sc0710_reset_dma_frame_sync(struct sc0710_dev *dev);
 
 /* -formats.c */

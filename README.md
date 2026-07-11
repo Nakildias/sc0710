@@ -197,7 +197,7 @@ Same command as above — checks module, DKMS, CLI, systemd units, config files,
 * **4K Pro ECP5 auto-programming** — firmware extraction at install time; the driver programs the FPGA at load and refuses to bind if it can't
 * **Status images** — storage-efficient No Signal / No Device screens
 * **Connection sensing** — distinguishes unplugged cables from signal loss (not 100% reliable)
-* **Video formats** — 4K60, 1440p144, 1080p240 (EDID changes require Windows)
+* **Video formats** — 4K60, 1440p144, 1080p240 (EDID switching without Windows: `edid=` module param or standard `VIDIOC_S_EDID` ioctls, profiles from `scripts/extract-firmware.sh`)
 * **Mode-switch stability** — DMA resync, restart validation, and watchdog recovery during resolution/refresh changes
 * **Safety scaling** — auto-scaler and dynamic-resolution paths reduce crash-prone transitions
 * **Timing controls** — runtime modes (`merge`, `procedural-only`, `static-only`) via CLI
@@ -220,7 +220,6 @@ For GitHub issues, attach output from `sc0710-cli --dump`.
 * **4K60 DMA tearing** — horizontal tears or frame shifts at 4K60 (~995 MB/s) under heavy load; **under active investigation**
 * **HDR tonemapping (on hold)** — requires opaque I2C commands to the onboard ARM MCU
 * **10-bit pixel format (on hold)** — P010/P016 register map unknown
-* **EDID switching (on hold)** — EEPROM write protocol unknown; set EDID in Windows first
 
 ## Help wanted
 

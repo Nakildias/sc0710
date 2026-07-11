@@ -225,6 +225,16 @@ for fw in \
     fi
 done
 
+for edid in \
+    "/lib/firmware/sc0710/edid" \
+    "/var/lib/sc0710/firmware/edid" \
+    "/etc/firmware/sc0710/edid"; do
+    if [[ -d "$edid" || -L "$edid" ]]; then
+        firmware_any=true
+        trace_found "EDID profile directory or symlink still present" "$edid"
+    fi
+done
+
 if [[ -L "/etc/firmware/sc0710" ]]; then
     firmware_any=true
     trace_found "Firmware symlink still present" "/etc/firmware/sc0710 -> $(readlink -f /etc/firmware/sc0710 2>/dev/null || readlink /etc/firmware/sc0710)"

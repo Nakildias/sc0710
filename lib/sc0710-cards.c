@@ -166,7 +166,9 @@ static void *sc0710_load_firmware_from_path(const char *path, size_t *out_size)
  * request_firmware("sc0710/<rel>") first, then the same path under each
  * alternative root (atomic/immutable distros keep /lib/firmware read-only,
  * so the install tooling drops files under these instead). Returns a
- * vmalloc'd copy and sets *out_size, or NULL. Caller must vfree(). */
+ * vmalloc'd copy and sets *out_size, or NULL. Caller must vfree().
+ * Shared by the ECP5 and EDID-profile loaders so their search policy
+ * cannot drift apart. */
 void *sc0710_firmware_load(struct sc0710_dev *dev, const char *rel, size_t *out_size)
 {
 	static const char * const alt_roots[] = {
