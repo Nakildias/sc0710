@@ -23,6 +23,7 @@
 #include <linux/moduleparam.h>
 #include <linux/init.h>
 #include <linux/delay.h>
+#include <linux/iopoll.h>
 #include <asm/io.h>
 
 #include "sc0710.h"
@@ -35,82 +36,157 @@
 #define SC0710_LOCK_DROPOUT_MAX 5
 #define SC0710_NO_TIMING_THRESHOLD 6
 
-#if 1 /* Enable I2C write for tone mapping control */
-static int didack(struct sc0710_dev *dev)
+/* Recover the AXI IIC after an interrupted or failed transaction.
+ * The RX FIFO has no reset bit, so an aborted read can leave stale bytes
+ * that would offset every subsequent read. SOFTR clears the state machine
+ * and both FIFOs. Caller holds signalMutex.
+ */
+static void sc0710_i2c_bus_reset(struct sc0710_dev *dev)
 {
-	u32 v;
-	int cnt = 16;
-
-	while (cnt-- > 0) {
-		v = sc_read(dev, 0, BAR0_3104);
-		/* TX_FIFO_Empty (bit 7) = data consumed/sent.
-		 * BB (bit 2) = bus busy, slave ACK'd.
-		 * Either condition indicates successful transmission.
-		 * Known values: 0x44 (MK2), 0xC0, 0xC4 (4K Pro after soft reset).
-		 */
-		if ((v & 0x80) || (v & 0x04))
-			return 1; /* device Ack'd */
-		udelay(64);
-	}
-
-	return 0; /* No Ack */
+	sc_write(dev, 0, BAR0_3040, 0x0000000a); /* SOFTR: reset state machine + FIFOs */
+	udelay(10);
+	sc_write(dev, 0, BAR0_3100, 0x00000002); /* TX_FIFO Reset */
+	sc_write(dev, 0, BAR0_3100, 0x00000001); /* AXI IIC Enable */
 }
-#endif
 
-static u8 busread(struct sc0710_dev *dev)
+/* Wait until the TX FIFO has fully drained (SR bit 7 set), so the caller's
+ * whole transaction, STOP-flagged byte included, is on the wire before the
+ * next transaction's TX-FIFO reset can flush it. A flushed STOP truncates
+ * the transaction: observed on the real card, where a truncated EDID page
+ * write wedged the MCU's EEPROM parser until power-off.
+ * The timeout is generous to tolerate MCU clock stretching.
+ */
+static int sc0710_i2c_wait_tx_drained(struct sc0710_dev *dev)
 {
 	u32 v;
-	int cnt = 32;
-	unsigned long timeout = jiffies + msecs_to_jiffies(100); /* 100ms max */
 
-	while (cnt-- > 0) {
-		/* Check for global timeout to prevent infinite loop */
+	return read_poll_timeout(sc_read, v, v & 0x80, 20, 20000, false,
+				 dev, 0, BAR0_3104);
+}
+
+/* Wait for the bus to go idle (SR bit 2, BB, clear). TX-FIFO-empty only means
+ * the STOP byte entered the shifter; the STOP condition itself is still on
+ * the wire, and a transaction started before it completes chops it off. The
+ * vendor polls for idle (SR = 0xc0) before every page write in traced
+ * sessions. */
+static int sc0710_i2c_wait_bus_idle(struct sc0710_dev *dev)
+{
+	u32 v;
+
+	return read_poll_timeout(sc_read, v, !(v & 0x04), 20, 20000, false,
+				 dev, 0, BAR0_3104);
+}
+
+/* Read one byte from the RX FIFO, waiting up to ~3.2 ms for it to arrive.
+ * Returns the byte (0..255) or -ETIMEDOUT: never a byte read from an
+ * empty FIFO, which the controller answers with meaningless filler. */
+static int busread(struct sc0710_dev *dev)
+{
+	u32 v;
+	int ret;
+
+	/* RX_FIFO_Empty (bit 6) clear means data available.
+	 * MK2 sees 0x8C/0xAC; 4K Pro may differ in bus-busy/SRW bits. */
+	ret = read_poll_timeout(sc_read, v, !(v & 0x40), 100, 3200, false,
+				dev, 0, BAR0_3104);
+	if (ret < 0)
+		return -ETIMEDOUT;
+	return sc_read(dev, 0, BAR0_310C) & 0xFF;
+}
+
+/* Standalone I2C read: its own START, a STOP-flagged read length, no write
+ * phase. Also serves as the read phase of the writeread transaction, which
+ * enters here mid-transaction after its repeated START, so this must not
+ * wait for bus idle itself. Caller holds signalMutex. */
+static int __sc0710_i2c_read_once(struct sc0710_dev *dev, u8 devaddr8bit, u8 *rbuf, int rlen)
+{
+	u32 v;
+	int cnt;
+	unsigned long timeout = jiffies + msecs_to_jiffies(500);
+
+	sc_write(dev, 0, BAR0_3120, 0x0000000f);
+	sc_write(dev, 0, BAR0_3100, 0x00000002); /* TX_FIFO Reset */
+	sc_write(dev, 0, BAR0_3100, 0x00000000);
+	sc_write(dev, 0, BAR0_3108, 0x00000000 | (1 << 8) /* Start Bit */ | (devaddr8bit | 1));
+	sc_write(dev, 0, BAR0_3108, 0x00000000 | (1 << 9) /* Stop Bit */ | rlen);
+	sc_write(dev, 0, BAR0_3100, 0x00000001);
+
+	/* Read the reply. Fail the whole transaction unless every byte actually
+	 * arrived: never hand fabricated bytes to callers with rc 0. */
+	cnt = 0;
+	while (cnt < rlen) {
+		int b;
 		if (time_after(jiffies, timeout)) {
-			printk(KERN_ERR "%s: busread timeout\n", __func__);
-			return 0xFF; /* Return error value */
+			printk(KERN_ERR "%s: I2C timeout reading data\n", __func__);
+			return -ETIMEDOUT;
 		}
-
-		v = sc_read(dev, 0, BAR0_3104);
-//printk("readbus %08x\n", v);
-		/* Wait for RX data: RX_FIFO_Empty (bit 6) clear means data available.
-		 * MK2 sees 0x8C/0xAC; 4K Pro may differ in bus-busy/SRW bits.
-		 */
-		if (!(v & 0x40)) /* RX_FIFO not empty — data ready */
-			break;
-		udelay(100);
+		b = busread(dev);
+		if (b < 0) {
+			printk_ratelimited(KERN_WARNING "%s: RX byte %d/%d never arrived\n",
+				__func__, cnt, rlen);
+			return -ETIMEDOUT;
+		}
+		*(rbuf + cnt) = b;
+		cnt++;
+	}
+	v = sc_read(dev, 0, BAR0_3104);
+	/* Completion: TX_FIFO_Empty (bit 7) + RX_FIFO_Empty (bit 6) = all done.
+	 * MK2 sees 0xC8/0xCC; 4K Pro may differ in SRW/BB bits.
+	 */
+	if ((v & 0xC0) != 0xC0) {
+		printk_ratelimited(KERN_WARNING "%s: I2C completion check failed (SR 0x%08x)\n",
+			__func__, v);
+		return -EIO;
 	}
 
-	v = sc_read(dev, 0, BAR0_310C);
-//printk("readbus ret 0x%02x\n", v);
-	return v;
+	return 0; /* Success */
 }
 
 #if 1 /* Enable I2C write for MCU commands */
-/* Assumes 8 bit device address and 8 bit sub address. */
-static int sc0710_i2c_write(struct sc0710_dev *dev, u8 devaddr8bit, u8 *wbuf, int wlen)
+/* Assumes 8 bit device address; every byte of wbuf goes on the wire.
+ * One byte in flight at a time: drain the FIFO before each push and after
+ * the STOP-flagged one, so the transaction is fully on the wire when we
+ * return and the next transaction's FIFO reset can't truncate it. */
+static int __sc0710_i2c_write_once(struct sc0710_dev *dev, u8 devaddr8bit, u8 *wbuf, int wlen)
 {
 	int i;
 	u32 v;
+
+	/* Enter and leave with the bus idle, like the vendor's traced writes:
+	 * a transaction started while the previous STOP is still shifting out
+	 * gets that STOP chopped by the TX-FIFO reset below. */
+	if (sc0710_i2c_wait_bus_idle(dev) < 0)
+		return -EIO;
 
 	/* Write out to the i2c bus master a reset, then write length and device address */
 	sc_write(dev, 0, BAR0_3100, 0x00000002); /* TX_FIFO Reset */
 	sc_write(dev, 0, BAR0_3100, 0x00000001); /* AXI IIC Enable */
 	sc_write(dev, 0, BAR0_3108, 0x00000000 | (1 << 8) /* Start Bit */ | devaddr8bit);
 
-	/* Wait for the device ack */
-	if (didack(dev) == 0)
-		return -EIO;
-
-	for (i = 1; i < wlen; i++) {
+	for (i = 0; i < wlen; i++) {
+		if (sc0710_i2c_wait_tx_drained(dev) < 0)
+			return -EIO;
 		v = 0x00000000 | *(wbuf + i);
 		if (i == (wlen - 1))
 			v |= (1 << 9); /* Stop Bit */
 		sc_write(dev, 0, BAR0_3108, v);
-		if (didack(dev) == 0)
-			return -EIO;
 	}
+	if (sc0710_i2c_wait_tx_drained(dev) < 0)
+		return -EIO;
+	if (sc0710_i2c_wait_bus_idle(dev) < 0)
+		return -EIO;
 
 	return 0; /* Success */
+}
+
+/* A failed write can leave the IIC engine mid-transaction; reset it so the
+ * next transaction starts clean instead of reading the wreckage. */
+static int sc0710_i2c_write(struct sc0710_dev *dev, u8 devaddr8bit, u8 *wbuf, int wlen)
+{
+	int ret = __sc0710_i2c_write_once(dev, devaddr8bit, wbuf, wlen);
+	if (ret < 0)
+		sc0710_i2c_bus_reset(dev);
+	return ret;
 }
 #endif
 
@@ -133,11 +209,10 @@ int sc0710_i2c_write_mcu(struct sc0710_dev *dev, u8 subaddr, u8 *data, int len)
 	return ret;
 }
 
-static int __sc0710_i2c_writeread(struct sc0710_dev *dev, u8 devaddr8bit, u8 *wbuf, int wlen, u8 *rbuf, int rlen)
+static int __sc0710_i2c_writeread_once(struct sc0710_dev *dev, u8 devaddr8bit, u8 *wbuf, int wlen, u8 *rbuf, int rlen)
 {
 	u32 v;
 	u8 i2c_devaddr = devaddr8bit; /* From dev 64, read 0x1a bytes from subaddress 0 */
-	u8 i2c_readlen = rlen;
 	u8 i2c_subaddr = wbuf[0];
 	int cnt = 16;
 	unsigned long timeout = jiffies + msecs_to_jiffies(500); /* 500ms global timeout */
@@ -196,35 +271,17 @@ static int __sc0710_i2c_writeread(struct sc0710_dev *dev, u8 devaddr8bit, u8 *wb
 	//dprintk(0, "Read 3104 %08x at cnt %d -- c4?\n", v, cnt);
 
 	msleep(1); // pkt 15162
-	sc_write(dev, 0, BAR0_3120, 0x0000000f);
-	sc_write(dev, 0, BAR0_3100, 0x00000002); /* TX_FIFO Reset */
-	sc_write(dev, 0, BAR0_3100, 0x00000000);
-	sc_write(dev, 0, BAR0_3108, 0x00000000 | (1 << 8) /* Start Bit */ | (i2c_devaddr | 1)); /* Read from 0x65 */
-	sc_write(dev, 0, BAR0_3108, 0x00000000 | (1 << 9) /* Stop Bit */ | i2c_readlen);
-	sc_write(dev, 0, BAR0_3100, 0x00000001);
+	return __sc0710_i2c_read_once(dev, i2c_devaddr, rbuf, rlen);
+}
 
-	/* Read the reply */
-	cnt = 0;
-	while (cnt < i2c_readlen) {
-		if (time_after(jiffies, timeout)) {
-			printk(KERN_ERR "%s: I2C timeout reading data\n", __func__);
-			return -ETIMEDOUT;
-		}
-		*(rbuf + cnt) = busread(dev);
-		//printk("dat[0x%02x] %02x\n", cnt, *(rbuf + cnt)); 
-		cnt++;
-	}
-	v = sc_read(dev, 0, BAR0_3104);
-	/* Completion: TX_FIFO_Empty (bit 7) + RX_FIFO_Empty (bit 6) = all done.
-	 * MK2 sees 0xC8/0xCC; 4K Pro may differ in SRW/BB bits.
-	 */
-	if ((v & 0xC0) != 0xC0) {
-		printk("3104 %08x --- completion?\n", v);
-		printk("  ac %08x --- 0?\n", sc_read(dev, 0, BAR0_00AC));
-		return -1;
-	}
-
-	return 0; /* Success */
+/* A timed-out or incomplete read leaves stale bytes in the RX FIFO that
+ * would offset every subsequent read; reset the engine on any failure. */
+static int __sc0710_i2c_writeread(struct sc0710_dev *dev, u8 devaddr8bit, u8 *wbuf, int wlen, u8 *rbuf, int rlen)
+{
+	int ret = __sc0710_i2c_writeread_once(dev, devaddr8bit, wbuf, wlen, rbuf, rlen);
+	if (ret < 0)
+		sc0710_i2c_bus_reset(dev);
+	return ret;
 }
 
 static int sc0710_i2c_writeread(struct sc0710_dev *dev, u8 devaddr8bit, u8 *wbuf, int wlen, u8 *rbuf, int rlen)
@@ -897,7 +954,8 @@ int sc0710_i2c_read_procamp(struct sc0710_dev *dev)
 
 	ret = sc0710_i2c_writeread(dev, I2C_DEV__ARM_MCU, &wbuf[0], sizeof(wbuf), &rbuf[0], sizeof(rbuf));
 	if (ret < 0) {
-		printk("%s ret = %d\n", __func__, ret);
+		/* Called every HDMI-poll tick; don't flood the log on a sick bus. */
+		printk_ratelimited("%s ret = %d\n", __func__, ret);
 		return -1;
 	}
 
@@ -956,14 +1014,15 @@ static void sc0710_write_factory_edid(struct sc0710_dev *dev)
 		printk(KERN_INFO "%s: EDID header invalid (%02x %02x), writing factory data\n",
 			dev->name, r[0], r[1]);
 
+		/* On-wire bytes are [offset][8 data]; every wbuf byte is
+		 * transmitted now that the write path no longer skips wbuf[0]. */
 		for (i = 0; i < 96; i += 8) {
-			u8 wr[10];
+			u8 wr[9];
 			int j;
-			wr[0] = 0x00;
-			wr[1] = i;
+			wr[0] = i;
 			for (j = 0; j < 8; j++)
-				wr[j + 2] = factory_edid_base[i + j];
-			ret = sc0710_i2c_write(dev, I2C_EDID_EEPROM, wr, 10);
+				wr[j + 1] = factory_edid_base[i + j];
+			ret = sc0710_i2c_write(dev, I2C_EDID_EEPROM, wr, 9);
 			if (ret < 0)
 				break;
 			msleep(10);
@@ -1028,6 +1087,10 @@ int sc0710_i2c_initialize(struct sc0710_dev *dev)
 	msleep(500);
 
 	mutex_lock(&dev->signalMutex);
+
+	/* A previous driver instance (rmmod mid-poll) may have left the IIC
+	 * engine mid-transaction with stale bytes in the RX FIFO; start clean. */
+	sc0710_i2c_bus_reset(dev);
 
 	/* Write factory EDID if missing (lost on cold boot) */
 	sc0710_write_factory_edid(dev);
