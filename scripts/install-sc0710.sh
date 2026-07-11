@@ -234,8 +234,10 @@ confirm() {
     local prompt_text="$1"
     local default_ans="$2"
 
+    # --noconfirm accepts the prompt default (Y or N), not an unconditional yes.
     if [[ "$NOCONFIRM" == "true" ]]; then
-        return 0
+        [[ "$default_ans" =~ ^[yY]$ ]]
+        return $?
     fi
 
     local brackets
@@ -247,6 +249,71 @@ confirm() {
 
     if [[ -z "$response" ]]; then response="$default_ans"; fi
     if [[ ! "$response" =~ ^[yY]$ ]]; then return 1; fi
+    return 0
+}
+
+# Unload $DRV_NAME if loaded. Plain rmmod first, then PipeWire/WirePlumber-aware
+# unload. Restarts PipeWire when it was stopped. Returns 0 on success, 1 if still loaded.
+try_unload_module() {
+    local pw_uids=()
+    local uid pid
+
+    lsmod | grep -q "$DRV_NAME" || return 0
+
+    if rmmod "$DRV_NAME" 2>/dev/null; then
+        msg2 "Module unloaded."
+        log "Module unloaded normally"
+        return 0
+    fi
+
+    msg2 "Module is in use. Stopping PipeWire and consumers..."
+    log "Module in use, attempting PipeWire-aware unload"
+
+    while read -r pid; do
+        uid=$(stat -c %u "/proc/$pid" 2>/dev/null) || continue
+        pw_uids+=("$uid")
+    done < <(pgrep -x pipewire 2>/dev/null || true)
+
+    for uid in $(printf '%s\n' "${pw_uids[@]}" | sort -u); do
+        sudo -u "#$uid" XDG_RUNTIME_DIR="/run/user/$uid" \
+            systemctl --user stop pipewire.socket pipewire.service wireplumber.service 2>/dev/null || true
+    done
+
+    for vdev in /dev/video*; do
+        [[ -e "$vdev" ]] && fuser -k "$vdev" >/dev/null 2>&1 || true
+    done
+    for sdev in /dev/snd/*; do
+        [[ -e "$sdev" ]] && fuser -k "$sdev" >/dev/null 2>&1 || true
+    done
+    sleep 1
+
+    if rmmod "$DRV_NAME" 2>/dev/null; then
+        msg2 "Module unloaded successfully."
+        log "Module unloaded after stopping PipeWire"
+    else
+        sleep 2
+        if rmmod "$DRV_NAME" 2>/dev/null; then
+            msg2 "Module unloaded successfully."
+            log "Module unloaded on third attempt"
+        else
+            error "Could not unload the module."
+            echo -e "  Current reference count: $(awk '/sc0710/{print $3}' /proc/modules 2>/dev/null || echo unknown)"
+            lsof /dev/video* /dev/snd/* 2>/dev/null | grep -v "^COMMAND" | sed 's/^/  /' || true
+            for uid in $(printf '%s\n' "${pw_uids[@]}" | sort -u); do
+                sudo -u "#$uid" XDG_RUNTIME_DIR="/run/user/$uid" \
+                    systemctl --user start pipewire.socket 2>/dev/null || true
+            done
+            return 1
+        fi
+    fi
+
+    if [[ ${#pw_uids[@]} -gt 0 ]]; then
+        msg2 "Restarting PipeWire..."
+        for uid in $(printf '%s\n' "${pw_uids[@]}" | sort -u); do
+            sudo -u "#$uid" XDG_RUNTIME_DIR="/run/user/$uid" \
+                systemctl --user start pipewire.socket 2>/dev/null || true
+        done
+    fi
     return 0
 }
 
@@ -489,66 +556,8 @@ fi
 # --- 4. Unload existing module if loaded ---
 if lsmod | grep -q "$DRV_NAME"; then
     warning "Module $DRV_NAME is currently loaded."
-
-    # Attempt 1: Simple unload
-    if rmmod "$DRV_NAME" 2>/dev/null; then
-        msg2 "Module unloaded."
-        log "Module unloaded normally"
-    else
-        msg2 "Module is in use. Stopping PipeWire and consumers..."
-        log "Module in use, attempting PipeWire-aware unload"
-
-        # Collect UIDs of users running PipeWire (save before stopping)
-        PW_UIDS=()
-        while read -r pid; do
-            uid=$(stat -c %u "/proc/$pid" 2>/dev/null) || continue
-            PW_UIDS+=("$uid")
-        done < <(pgrep -x pipewire 2>/dev/null || true)
-
-        # Stop PipeWire SOCKET first (prevents socket-activation respawn)
-        for uid in $(printf '%s\n' "${PW_UIDS[@]}" | sort -u); do
-            sudo -u "#$uid" XDG_RUNTIME_DIR="/run/user/$uid" \
-                systemctl --user stop pipewire.socket pipewire.service wireplumber.service 2>/dev/null || true
-        done
-
-        # Kill any remaining processes holding capture device files open
-        for vdev in /dev/video*; do
-            [[ -e "$vdev" ]] && fuser -k "$vdev" >/dev/null 2>&1 || true
-        done
-        for sdev in /dev/snd/*; do
-            [[ -e "$sdev" ]] && fuser -k "$sdev" >/dev/null 2>&1 || true
-        done
-        sleep 1
-
-        # Attempt 2: Unload now that PipeWire is properly stopped
-        if rmmod "$DRV_NAME" 2>/dev/null; then
-            msg2 "Module unloaded successfully."
-            log "Module unloaded after stopping PipeWire"
-        else
-            sleep 2
-            # Attempt 3: Final try
-            if rmmod "$DRV_NAME" 2>/dev/null; then
-                msg2 "Module unloaded successfully."
-                log "Module unloaded on third attempt"
-            else
-                error "Could not unload the module."
-                echo -e "  Current reference count: $(awk '/sc0710/{print $3}' /proc/modules 2>/dev/null || echo unknown)"
-                lsof /dev/video* /dev/snd/* 2>/dev/null | grep -v "^COMMAND" | sed 's/^/  /' || true
-                # Restart PipeWire since we stopped it but couldn't unload
-                for uid in $(printf '%s\n' "${PW_UIDS[@]}" | sort -u); do
-                    sudo -u "#$uid" XDG_RUNTIME_DIR="/run/user/$uid" \
-                        systemctl --user start pipewire.socket 2>/dev/null || true
-                done
-                die "A reboot may be required. Alternatively, close all applications and try again."
-            fi
-        fi
-
-        # Restart PipeWire for all users
-        msg2 "Restarting PipeWire..."
-        for uid in $(printf '%s\n' "${PW_UIDS[@]}" | sort -u); do
-            sudo -u "#$uid" XDG_RUNTIME_DIR="/run/user/$uid" \
-                systemctl --user start pipewire.socket 2>/dev/null || true
-        done
+    if ! try_unload_module; then
+        die "A reboot may be required. Alternatively, close all applications and try again."
     fi
 fi
 
@@ -884,7 +893,7 @@ check_kernel_consistency
 
 if lsmod | grep -q "$DRV_NAME"; then
     warning "Module $DRV_NAME is currently loaded."
-    if ! rmmod "$DRV_NAME" 2>/dev/null; then
+    if ! try_unload_module; then
         if confirm "Force unload now?" "N"; then
             rmmod -f "$DRV_NAME" 2>/dev/null || { error "Force unload failed."; exit 1; }
         else
