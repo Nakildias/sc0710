@@ -51,8 +51,12 @@ void sc0710_dma_chains_free(struct sc0710_dma_channel *ch)
 {
 	int i;
 
-	/* Free up the SG table */
-	dma_free_coherent(&ch->dev->pci->dev, ch->pt_size, ch->pt_cpu, ch->pt_dma);
+	/* Free up the SG table. */
+	if (ch->pt_cpu) {
+		dma_free_coherent(&ch->dev->pci->dev, ch->pt_size, ch->pt_cpu, ch->pt_dma);
+		ch->pt_cpu = NULL;
+		ch->pt_dma = 0;
+	}
 
 	for (i = 0; i < ch->numDescriptorChains; i++) {
 		sc0710_dma_chain_free(ch, i);
@@ -61,12 +65,19 @@ void sc0710_dma_chains_free(struct sc0710_dma_channel *ch)
 
 int sc0710_dma_chains_alloc(struct sc0710_dma_channel *ch, int total_transfer_size)
 {
-	int i, ret = 0;
+	int i, ret;
 
 	for (i = 0; i < ch->numDescriptorChains; i++) {
-		ret |= sc0710_dma_chain_alloc(ch, i, total_transfer_size);
+		ret = sc0710_dma_chain_alloc(ch, i, total_transfer_size);
+		if (ret < 0) {
+			/* Free every chain built so far (including the partial
+			 * one): a half-built ring must never reach the hardware. */
+			for (; i >= 0; i--)
+				sc0710_dma_chain_free(ch, i);
+			return ret;
+		}
 	}
 
-	return ret;
+	return 0;
 }
 

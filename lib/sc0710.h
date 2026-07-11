@@ -423,8 +423,13 @@ struct sc0710_dev {
 	u32                        interlaced;
 	const struct sc0710_format *fmt;
 	const struct sc0710_format *last_fmt;  /* Last active format for placeholders */
-	struct sc0710_format        dynamic_fmt;      /* Fallback for unlisted timings */
-	char                        dynamic_fmt_name[64];
+	/* Fallback for unlisted timings: two slots, alternated on each timing
+	 * change, so holders of the previous dynamic fmt (dev->fmt/last_fmt
+	 * readers) keep a stable object instead of having it rewritten in
+	 * place under them. */
+	struct sc0710_format        dynamic_fmt[2];
+	char                        dynamic_fmt_name[2][64];
+	int                         dynamic_fmt_idx;
 	enum sc0710_colorimetry_e  colorimetry;
 	enum sc0710_colorspace_e   colorspace;
 	enum sc0710_eotf_e         eotf;       /* Detected/forced EOTF for HDR */

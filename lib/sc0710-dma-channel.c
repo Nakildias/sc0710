@@ -278,6 +278,18 @@ static bool sc0710_detect_horizontal_tear(const u8 *buf, u32 width, u32 height, 
  *    to perform transfers.
  */
 
+/* Shared bounds check for the scaler branches, which write a full output
+ * frame with no truncation; `what` tags the log line per branch. */
+static bool sc0710_vb_fits(struct sc0710_dev *dev, const char *what,
+	u32 need, unsigned long have)
+{
+	if (need <= have)
+		return true;
+	printk_ratelimited(KERN_ERR "%s: V4L2 buffer %lu too small for %s frame %u\n",
+		dev->name, have, what, need);
+	return false;
+}
+
 /* Copy the contains of the video chain into a video4linux buffer.
  * Return < 0 on error
  * Return number of buffers we copyinto from dma into user buffers.
@@ -500,16 +512,13 @@ static void sc0710_dma_dequeue_video(struct sc0710_dma_channel *ch,
 
 		if (scaler_active) {
 			const u8 *scale_src = woven_frame ? woven_frame : dev->scaler_staging_buf;
-			if (scaled_framesize <= buffer_size) {
-				sc0710_scaler_scale_frame(scale_src,
-					src_w, src_h, dst, dst_w, dst_h);
-				vb2_set_plane_payload(&vb_buf->vb.vb2_buf, 0, scaled_framesize);
-			} else {
-				printk_ratelimited(KERN_ERR "%s: V4L2 buffer %lu too small for scaled frame %u\n",
-					dev->name, buffer_size, scaled_framesize);
+			if (!sc0710_vb_fits(dev, "scaled", scaled_framesize, buffer_size)) {
 				spin_unlock_irqrestore(&client->buffer_lock, buf_flags);
 				continue;
 			}
+			sc0710_scaler_scale_frame(scale_src,
+				src_w, src_h, dst, dst_w, dst_h);
+			vb2_set_plane_payload(&vb_buf->vb.vb2_buf, 0, scaled_framesize);
 		} else if (auto_scaler &&
 			   source_w && source_h &&
 			   client->stream_width && client->stream_height &&
@@ -521,6 +530,10 @@ static void sc0710_dma_dequeue_video(struct sc0710_dma_channel *ch,
 			u32 adapt_fs = adapt_dst_w * 2 * adapt_dst_h;
 			const u8 *scale_src;
 
+			if (!sc0710_vb_fits(dev, "adapted", adapt_fs, buffer_size)) {
+				spin_unlock_irqrestore(&client->buffer_lock, buf_flags);
+				continue;
+			}
 			if (!dev->scaler_staging_buf) {
 				spin_unlock_irqrestore(&client->buffer_lock, buf_flags);
 				continue;
@@ -548,6 +561,10 @@ static void sc0710_dma_dequeue_video(struct sc0710_dma_channel *ch,
 			u32 dyn_fs = dyn_dst_w * 2 * dyn_dst_h;
 			const u8 *scale_src;
 
+			if (!sc0710_vb_fits(dev, "dynamic-res", dyn_fs, buffer_size)) {
+				spin_unlock_irqrestore(&client->buffer_lock, buf_flags);
+				continue;
+			}
 			if (!dev->scaler_staging_buf) {
 				spin_unlock_irqrestore(&client->buffer_lock, buf_flags);
 				continue;
@@ -686,6 +703,12 @@ int sc0710_dma_channel_service(struct sc0710_dma_channel *ch)
 
 	for (i = 0; i < ch->numDescriptorChains; i++) {
 		chain = &ch->chains[i];
+
+		/* An empty chain (failed or partial allocation) has no last buffer;
+		 * numAllocations is u32, so [numAllocations - 1] would wrap to a
+		 * wild index. */
+		if (chain->numAllocations == 0)
+			continue;
 
 		/* Last allocated SG buffer in the chain. */
 		dca = &chain->allocations[ chain->numAllocations - 1 ];
@@ -854,9 +877,11 @@ int sc0710_dma_channel_alloc(struct sc0710_dev *dev, u32 nr, enum sc0710_channel
 	/* allocate the descriptor table, its contigious. */
 	ch->pt_size = PAGE_SIZE * 2;
 
-	ch->pt_cpu = dma_alloc_coherent(&dev->pci->dev, ch->pt_size, &ch->pt_dma, GFP_ATOMIC);
-	if (ch->pt_cpu == 0)
+	ch->pt_cpu = dma_alloc_coherent(&dev->pci->dev, ch->pt_size, &ch->pt_dma, GFP_KERNEL);
+	if (ch->pt_cpu == 0) {
+		ch->enabled = 0;
 		return -ENOMEM;
+	}
 
 	memset(ch->pt_cpu, 0, ch->pt_size);
 
@@ -889,7 +914,14 @@ int sc0710_dma_channel_alloc(struct sc0710_dev *dev, u32 nr, enum sc0710_channel
         ch->reg_sg_credits = ch->register_sg_base + 0x8c;
 
 	/* Allocate all the DMA buffers for this channel. */
-	sc0710_dma_chains_alloc(ch, ch->buf_size);
+	ret = sc0710_dma_chains_alloc(ch, ch->buf_size);
+	if (ret < 0) {
+		sc0710_dma_chains_free(ch);
+		ch->enabled = 0;
+		printk(KERN_ERR "%s: channel %d DMA allocation failed (%d)\n",
+			dev->name, nr, ret);
+		return ret;
+	}
 
 	/* Adjust the descriptor chains to correctly reference each other */
 	sc0710_dma_channel_chains_link(ch);
@@ -922,6 +954,7 @@ int sc0710_dma_channel_resize(struct sc0710_dev *dev, u32 nr, enum sc0710_channe
 	enum sc0710_channel_type_e mediatype)
 {
 	struct sc0710_dma_channel *ch = &dev->channel[nr];
+	int ret;
 	if (nr >= SC0710_MAX_CHANNELS)
 		return -EINVAL;
 
@@ -963,14 +996,23 @@ int sc0710_dma_channel_resize(struct sc0710_dev *dev, u32 nr, enum sc0710_channe
 	/* allocate the descriptor table, its contigious. */
 	ch->pt_size = PAGE_SIZE * 2;
 
-	ch->pt_cpu = dma_alloc_coherent(&dev->pci->dev, ch->pt_size, &ch->pt_dma, GFP_ATOMIC);
-	if (ch->pt_cpu == 0)
+	ch->pt_cpu = dma_alloc_coherent(&dev->pci->dev, ch->pt_size, &ch->pt_dma, GFP_KERNEL);
+	if (ch->pt_cpu == 0) {
+		printk(KERN_ERR "%s: channel %d DMA resize failed (page table)\n",
+			dev->name, nr);
 		return -ENOMEM;
+	}
 
 	memset(ch->pt_cpu, 0, ch->pt_size);
 
 	/* allocate DMA based on ch->buf_size */
-	sc0710_dma_chains_alloc(ch, ch->buf_size);
+	ret = sc0710_dma_chains_alloc(ch, ch->buf_size);
+	if (ret < 0) {
+		sc0710_dma_chains_free(ch);
+		printk(KERN_ERR "%s: channel %d DMA resize failed (%d); channel unusable until the next resize\n",
+			dev->name, nr, ret);
+		return ret;
+	}
 
 	sc0710_dma_channel_chains_link(ch);
 
@@ -1019,6 +1061,11 @@ int sc0710_dma_channel_start_prep(struct sc0710_dma_channel *ch)
 	if (ch->state == STATE_RUNNING)
 		return 0;
 
+	/* A channel whose ring failed to (re)allocate must never reach the
+	 * hardware; pt_dma would be 0. */
+	if (!ch->pt_cpu)
+		return -ENOMEM;
+
 	/* Stop engine first */
 	sc_write(ch->dev, 1, ch->reg_dma_control_w1c, 0x00000001);
 
@@ -1051,11 +1098,17 @@ int sc0710_dma_channel_start_prep(struct sc0710_dma_channel *ch)
 /* Stop the hardware, stop all DMA activity. */
 int sc0710_dma_channel_stop(struct sc0710_dma_channel *ch)
 {
+	/* Serialize against the service thread: a service pass that
+	 * already passed the state check must finish (and do its last
+	 * mod_timer) before we flip to STOPPED, so the caller's subsequent
+	 * timer_delete_sync() is final. */
+	mutex_lock(&ch->lock);
 	sc_write(ch->dev, 1, ch->reg_dma_control_w1c, 0x00000001);
 	sc0710_things_per_second_reset(&ch->bitsPerSecond);
 	sc0710_things_per_second_reset(&ch->descPerSecond);
 	ch->state = STATE_STOPPED;
 	ch->dma_last_completion_jiffies = 0;
+	mutex_unlock(&ch->lock);
 	return 0;
 }
 

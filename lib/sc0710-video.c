@@ -556,10 +556,48 @@ void sc0710_format_initialize(void)
 	struct sc0710_format *fmt;
 	unsigned int i;
 	for (i = 0; i < ARRAY_SIZE(formats); i++) {
+		struct v4l2_bt_timings *bt;
+		u64 pixelclock, clk_delta;
+
 		fmt = &formats[i];
 
 		/* Assuming YUV 8-bit */
 		fmt->framesize = fmt->width * 2 * fmt->height;
+
+		/* Entries with no matching kernel timing macro carry a
+		 * nearest-neighbour placeholder in the static table (the
+		 * 2560x1440 modes point at the 1080p60 macro), which
+		 * QUERY/G/ENUM_DV_TIMINGS must not report. Where the macro
+		 * disagrees with the entry's own numbers, synthesize the
+		 * timing from those numbers; the blanking split is unknown,
+		 * so it lands in the back porches (clients consume
+		 * width/height/totals/pixelclock).
+		 *
+		 * The pixelclock comparison is 1%-tolerant: several table
+		 * entries round the field rate (60 for DMT/CVT 59.94/60.317,
+		 * 59.94 stored as 60000/1001 against a nominal CEA clock), and
+		 * an exact compare would discard their correct macros with all
+		 * the standards flags. Real placeholders differ by dims or by
+		 * 2x+ clock (the >60Hz rows carry a 60Hz macro), far past 1%.
+		 */
+		if (fmt->interlaced)
+			continue; /* both interlaced entries carry their exact CEA macro */
+		bt = &fmt->dv_timings.bt;
+		pixelclock = div_u64((u64)fmt->timingH * fmt->timingV * fmt->fpsnum,
+			fmt->fpsden);
+		clk_delta = bt->pixelclock > pixelclock ?
+			bt->pixelclock - pixelclock : pixelclock - bt->pixelclock;
+		if (bt->width == fmt->width && bt->height == fmt->height &&
+		    V4L2_DV_BT_FRAME_WIDTH(bt) == fmt->timingH &&
+		    V4L2_DV_BT_FRAME_HEIGHT(bt) == fmt->timingV &&
+		    clk_delta * 100 <= pixelclock)
+			continue;
+		memset(bt, 0, sizeof(*bt));
+		bt->width = fmt->width;
+		bt->height = fmt->height;
+		bt->pixelclock = pixelclock;
+		bt->hbackporch = fmt->timingH - fmt->width;
+		bt->vbackporch = fmt->timingV - fmt->height;
 	}
 }
 
@@ -1045,7 +1083,7 @@ static int sc0710_start_streaming(struct vb2_queue *q, unsigned int count)
 	int refcount;
 	int ret;
 
-	dprintk(1, "%s(ch#%d)\\n", __func__, ch->nr);
+	dprintk(1, "%s(ch#%d)\n", __func__, ch->nr);
 
 	/* Ensure status images are generated (safe process context here) */
 	if (use_status_images)
@@ -1074,13 +1112,19 @@ static int sc0710_start_streaming(struct vb2_queue *q, unsigned int count)
 
 	/* Increment streaming reference count */
 	refcount = atomic_inc_return(&ch->streaming_refcount);
-	dprintk(1, "%s() streaming refcount now %d\\n", __func__, refcount);
+	dprintk(1, "%s() streaming refcount now %d\n", __func__, refcount);
 
-	/* Only start DMA if we're the first streaming client AND have signal */
+	/* Only start DMA if we're the first streaming client AND have signal.
+	 * kthread_dma_lock serializes this against the HDMI thread's resync:
+	 * without it a resync between the refcount increment and the resize
+	 * could start the channel first, and the resize would then skip a
+	 * running channel and stream from a stale ring. */
 	if (refcount == 1 && dev->fmt != NULL) {
-		sc0710_dma_channels_resize(dev);
-
-		ret = sc0710_dma_channels_start(dev);
+		mutex_lock(&dev->kthread_dma_lock);
+		ret = sc0710_dma_channels_resize(dev);
+		if (ret == 0)
+			ret = sc0710_dma_channels_start(dev);
+		mutex_unlock(&dev->kthread_dma_lock);
 		if (ret < 0) {
 			struct sc0710_buffer *buf, *tmp;
 			unsigned long flags;
@@ -1097,7 +1141,7 @@ static int sc0710_start_streaming(struct vb2_queue *q, unsigned int count)
 			return ret;
 		}
 	} else if (dev->fmt == NULL) {
-		dprintk(1, "%s() No signal - will deliver placeholder frames\\n", __func__);
+		dprintk(1, "%s() No signal - will deliver placeholder frames\n", __func__);
 	}
 
 	/* Start timer for delivering frames (real or placeholder) */
@@ -1124,11 +1168,18 @@ static void sc0710_stop_streaming(struct vb2_queue *q)
 	refcount = atomic_dec_return(&ch->streaming_refcount);
 	dprintk(1, "%s() streaming refcount now %d\n", __func__, refcount);
 
-	/* Only stop DMA if we're the last streaming client */
+	/* Only stop DMA if we're the last streaming client.
+	 * kthread_dma_lock serializes against an in-flight resync, whose
+	 * client snapshot would otherwise go stale here and restart DMA with
+	 * no clients left.  Stop the channels first (serialized against the
+	 * service thread via ch->lock), then delete the timer, so a service
+	 * pass can't re-arm the timer after timer_delete_sync(). */
 	if (refcount <= 0) {
+		mutex_lock(&dev->kthread_dma_lock);
 		atomic_set(&ch->streaming_refcount, 0); /* Clamp to 0 */
-		timer_delete_sync(&ch->timeout);
 		sc0710_dma_channels_stop(dev);
+		timer_delete_sync(&ch->timeout);
+		mutex_unlock(&dev->kthread_dma_lock);
 	}
 
 	/* Release all active buffers for this client */
@@ -1455,8 +1506,12 @@ static void sc0710_vid_timeout(struct timer_list *t)
 	/* Compute effective (possibly scaled) output dimensions */
 	sc0710_get_effective_size(dev, fmt, &eff_w, &eff_h, &eff_fs);
 
-	/* If we have real signal, DMA is handling frame delivery, just reschedule */
-	if (dev->fmt != NULL && dev->locked) {
+	/* If we have real signal and the channel is running, DMA is handling
+	 * frame delivery, just reschedule.
+	 * The state check keeps a stopped channel (failed DMA reconfigure with
+	 * signal still locked) on the placeholder path below.
+	 * ch->state is read unlocked; staleness costs one placeholder frame. */
+	if (dev->fmt != NULL && dev->locked && ch->state == STATE_RUNNING) {
 		/* Re-set the buffer timeout for DMA monitoring */
 		if (atomic_read(&ch->streaming_refcount) > 0)
 			mod_timer(&ch->timeout, jiffies + VBUF_TIMEOUT);
@@ -1504,9 +1559,12 @@ static void sc0710_vid_timeout(struct timer_list *t)
 					fill_fs = fill_w * 2 * fill_h;
 				}
 				if (fill_fs > buf_sz) {
+					/* Last resort: the largest 1920-wide strip
+					 * that fits. Never write a hardcoded
+					 * geometry past the client's buffer. */
 					fill_w = 1920;
-					fill_h = 1080;
-					fill_fs = 1920 * 2 * 1080;
+					fill_h = min_t(u32, 1080, buf_sz / (1920 * 2));
+					fill_fs = fill_w * 2 * fill_h;
 				}
 
 				{

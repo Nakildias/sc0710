@@ -250,9 +250,19 @@ void sc0710_reset_dma_frame_sync(struct sc0710_dev *dev)
 	int dma_was_running = 0;
 	int has_streaming_clients = 0;
 
+	/* Hold the DMA service lock for the entire sequence, including the
+	 * fmt/state/refcount snapshot: STREAMON and STREAMOFF take the same
+	 * lock for their DMA transitions, so a client can't appear or vanish
+	 * between the snapshot and the restart below (a stale snapshot could
+	 * leave DMA running with zero clients).  The DMA thread checks
+	 * reconfig_in_progress under the same lock, so service cannot run
+	 * while we reconfigure.
+	 */
+	mutex_lock(&dev->kthread_dma_lock);
+
 	if (!dev->fmt) {
 		printk(KERN_INFO "%s: No format detected, skipping DMA reset\n", dev->name);
-		return;
+		goto out_unlock;
 	}
 
 	for (ch_idx = 0; ch_idx < SC0710_MAX_CHANNELS; ch_idx++) {
@@ -270,17 +280,12 @@ void sc0710_reset_dma_frame_sync(struct sc0710_dev *dev)
 
 	if (!has_streaming_clients) {
 		printk(KERN_INFO "%s: No streaming clients, skipping DMA start\n", dev->name);
-		return;
+		goto out_unlock;
 	}
 
 	printk(KERN_INFO "%s: Signal restoration - DMA was %s, have streaming clients\n",
 		dev->name, dma_was_running ? "running" : "stopped");
 
-	/* Hold the DMA service lock for the entire stop/resize/start
-	 * sequence.  The DMA thread checks reconfig_in_progress under
-	 * the same lock, so service cannot run while we reconfigure.
-	 */
-	mutex_lock(&dev->kthread_dma_lock);
 	dev->reconfig_in_progress = 1;
 
 	/* Phase 1: Stop video DMA channels */
@@ -327,8 +332,36 @@ void sc0710_reset_dma_frame_sync(struct sc0710_dev *dev)
 		}
 	}
 
-	/* Phase 2: Resize DMA buffers for the new resolution */
-	sc0710_dma_channels_resize(dev);
+	/* Phase 2: Resize DMA buffers for the new resolution.
+	 * On failure leave the channels stopped: restarting over a missing ring
+	 * would hand the engine a NULL descriptor pointer. The next timing
+	 * change or STREAMON retries the resize. */
+	if (sc0710_dma_channels_resize(dev) < 0) {
+		printk(KERN_ERR "%s: DMA resize failed during resync; leaving channels stopped\n",
+			dev->name);
+
+		/* Phase 1 stopped the video XDMA engines; clear GO to match
+		 * (mirrors sc0710_dma_channels_stop). */
+		sc_clr(dev, 0, BAR0_00D0, 0x0001);
+
+		/* Phase 1 deleted the frame timers; re-arm them so streaming
+		 * clients get placeholder frames instead of blocking in DQBUF.
+		 * Audio has no timer (only video registration sets one up). */
+		for (ch_idx = 0; ch_idx < SC0710_MAX_CHANNELS; ch_idx++) {
+			ch = &dev->channel[ch_idx];
+			if (!ch->enabled || ch->mediatype != CHTYPE_VIDEO)
+				continue;
+			if (atomic_read(&ch->streaming_refcount) <= 0)
+				continue;
+			mutex_lock(&ch->lock);
+			mod_timer(&ch->timeout, jiffies + VBUF_TIMEOUT);
+			mutex_unlock(&ch->lock);
+		}
+
+		dev->reconfig_in_progress = 0;
+		mutex_unlock(&dev->kthread_dma_lock);
+		return;
+	}
 
 	/* Phase 3: Drop first frames after restart — the FPGA may
 	 * begin capturing mid-frame, producing a torn image.
@@ -396,6 +429,10 @@ void sc0710_reset_dma_frame_sync(struct sc0710_dev *dev)
 	mutex_unlock(&dev->kthread_dma_lock);
 
 	printk(KERN_INFO "%s: DMA restarted after signal restoration\n", dev->name);
+	return;
+
+out_unlock:
+	mutex_unlock(&dev->kthread_dma_lock);
 }
 
 
@@ -714,11 +751,23 @@ confirmed_timing_change:
 			dev->fmt = NULL;
 		}
 
+		/* Upper bounds: a glitched read can hand back 0xFF filler
+		 * with rc 0, and 0xFFFF-ish dims would u32-overflow framesize
+		 * (w*2*h) into a tiny value handed to DMA sizing. 4096 covers
+		 * everything the card can emit (DCI 4K), interlace-doubling
+		 * included, and keeps w*2*h far below overflow. */
 		if (!dev->fmt &&
 		    procedural_timings != TIMING_MODE_STATIC_ONLY &&
-		    dev->width >= 320 && dev->height >= 200) {
-			struct sc0710_format *dyn = &dev->dynamic_fmt;
+		    dev->width >= 320 && dev->height >= 200 &&
+		    dev->width <= 4096 && dev->height <= 4096) {
+			struct sc0710_format *dyn;
 			u32 fps_est = fps_target ? fps_target : 60;
+
+			/* Build into the slot dev->fmt does NOT point at, publish
+			 * last: a holder of the previous dynamic fmt sees stable
+			 * (possibly stale) data, never a torn rewrite. */
+			dev->dynamic_fmt_idx ^= 1;
+			dyn = &dev->dynamic_fmt[dev->dynamic_fmt_idx];
 
 			dyn->timingH    = dev->pixelLineH;
 			dyn->timingV    = dev->pixelLineV;
@@ -730,13 +779,13 @@ confirmed_timing_change:
 			dyn->fpsden     = 1000;
 			dyn->depth      = 8;
 			dyn->framesize  = dev->width * 2 * dev->height;
-			snprintf(dev->dynamic_fmt_name,
-				 sizeof(dev->dynamic_fmt_name),
+			snprintf(dev->dynamic_fmt_name[dev->dynamic_fmt_idx],
+				 sizeof(dev->dynamic_fmt_name[0]),
 				 "%ux%u%s%u(dynamic)",
 				 dev->width, dev->height,
 				 dev->interlaced ? "i" : "p",
 				 fps_est);
-			dyn->name = dev->dynamic_fmt_name;
+			dyn->name = dev->dynamic_fmt_name[dev->dynamic_fmt_idx];
 
 			memset(&dyn->dv_timings, 0, sizeof(dyn->dv_timings));
 			dyn->dv_timings.type = V4L2_DV_BT_656_1120;
@@ -922,9 +971,13 @@ static void sc0710_write_factory_edid(struct sc0710_dev *dev)
 	}
 }
 
-/* Wait for 4KP FPGA pipeline to become active before DMA start.
- * Pipeline registers are configured early in card_setup().
- * Caller must hold signalMutex.
+/* Wait for the 4KP FPGA pipeline to report active (A8 != 0) after GO.
+ * Runs after the engines are started and GO is set; with GO-last ordering the
+ * pipeline can't be active any earlier. Diagnostic-grade: the vendor driver
+ * never reads A8 in traced sessions, so a timeout here is
+ * a warning, not a failure. The MCU diagnostic read serializes itself on
+ * signalMutex; no caller of the channels_start path holds it, but the
+ * HDMI poll thread's I2C runs concurrently on the same AXI IIC engine.
  */
 int sc0710_4kp_wait_pipeline(struct sc0710_dev *dev)
 {
@@ -939,16 +992,21 @@ int sc0710_4kp_wait_pipeline(struct sc0710_dev *dev)
 		return 0;
 	}
 
-	/* MCU TX status for diagnostics */
+	/* MCU TX status for diagnostics. On failure rbuf holds nothing useful. */
 	wbuf[0] = 0x10;
-	__sc0710_i2c_writeread(dev, I2C_DEV__ARM_MCU, wbuf, 1, rbuf, 16);
-	printk(KERN_INFO "%s: MCU status [13-15]: %02x %02x %02x\n",
-		dev->name, rbuf[3], rbuf[4], rbuf[5]);
+	if (sc0710_i2c_writeread(dev, I2C_DEV__ARM_MCU, wbuf, 1, rbuf, 16) == 0)
+		printk(KERN_INFO "%s: MCU status [13-15]: %02x %02x %02x\n",
+			dev->name, rbuf[3], rbuf[4], rbuf[5]);
+	else
+		printk(KERN_INFO "%s: MCU status read failed\n", dev->name);
 
-	/* Poll A8 — 4KP FPGA pipeline may need time to become active
-	 * after D0/EC register writes. Typically activates within 100ms.
+	/* Poll A8: the 4KP FPGA pipeline may need time to become active after
+	 * the D0/EC register writes. Typically activates within 100ms. The
+	 * budget is short because this runs under kthread_dma_lock, where it
+	 * stalls STREAMON/STREAMOFF; the run-bit verify in the resync path is
+	 * the functional check, this poll is diagnostic only.
 	 */
-	for (i = 0; i < 20; i++) {
+	for (i = 0; i < 5; i++) {
 		msleep(100);
 		a8 = sc_read(dev, 0, 0xa8);
 		if (a8 != 0) {
@@ -958,7 +1016,7 @@ int sc0710_4kp_wait_pipeline(struct sc0710_dev *dev)
 		}
 	}
 
-	printk(KERN_WARNING "%s: A8 still 0 after 2s — DMA may stall\n", dev->name);
+	printk(KERN_WARNING "%s: A8 still 0 after 500ms, DMA may stall\n", dev->name);
 	return 0;
 }
 
