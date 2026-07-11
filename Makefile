@@ -64,11 +64,10 @@ clean:
 load: all
 	sudo dmesg -c >/dev/null
 	sudo cp /dev/null /var/log/debug
-	#sudo modprobe videobuf2-core
-	sudo modprobe videobuf2-common
-	sudo modprobe videodev
-	#sudo modprobe videobuf-dma-sg
-	sudo modprobe videobuf2-vmalloc
+	# insmod (unlike modprobe) won't pull dependencies, so a clean environment fails
+	# with "Unknown symbol in module". Load exactly the modules modpost recorded in the
+	# built .ko's "depends" field (videodev, videobuf2-*, snd, snd-pcm).
+	D=$$(modinfo -F depends ./build/sc0710.ko | tr ',' ' '); [ -z "$$D" ] || sudo modprobe -a $$D
 	sudo insmod ./build/sc0710.ko \
 		thread_dma_poll_interval_ms=2 \
 		dma_status=0

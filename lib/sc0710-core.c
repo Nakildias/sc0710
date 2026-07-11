@@ -706,8 +706,16 @@ static int sc0710_initdev(struct pci_dev *pci_dev,
 	 * no interrupt was ever observed on hardware), so a handler would
 	 * only invite the spurious-IRQ detector on a shared INTx line. */
 
-	/* Card specific tweaks with subsystems etc */
-	sc0710_card_setup(dev);
+	/* Card specific tweaks with subsystems etc. On the 4K Pro this
+	 * includes programming the ECP5 video-frontend FPGA; if that fails,
+	 * fail the probe: binding is the driver's statement that the card can
+	 * capture. */
+	err = sc0710_card_setup(dev);
+	if (err < 0) {
+		printk(KERN_ERR "%s: card setup failed (%d), aborting probe\n",
+			dev->name, err);
+		goto fail_dev;
+	}
 
 	pci_set_drvdata(pci_dev, dev);
 

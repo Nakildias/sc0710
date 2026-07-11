@@ -2,8 +2,13 @@
 # Copyright (C) 2025-2026 Nakildias <nakildiaspro@gmail.com>
 # SPDX-License-Identifier: GPL-2.0-or-later
 #
-# Shared SC0710 4K Pro ECP5 firmware helpers.
-# Sourced by sc0710-firmware.sh and build-and-load.sh — do not execute directly.
+# Shared sc0710 shell helpers: module load/unload (including stopping media
+# consumers so rmmod can succeed), bind-state checks, firmware file paths and
+# presence, card identification, and immutable-distro handling. Despite the
+# historical name there is no firmware *logic* here — the driver programs the
+# ECP5 itself at probe.
+# Sourced by sc0710-cli.sh, build-and-load.sh and install-sc0710.sh — do not
+# execute directly.
 
 [[ -n "${SC0710_FIRMWARE_LIB_LOADED:-}" ]] && return 0
 SC0710_FIRMWARE_LIB_LOADED=1
@@ -85,12 +90,10 @@ sc0710_board_name_from_subsys() {
 }
 
 sc0710_detect_card_name() {
-    local subsys board
+    local subsys
 
     subsys=$(sc0710_pci_subsys) || return 1
-    board=$(dmesg 2>/dev/null | grep -E "sc0710.*subsystem: ${subsys}.*board:" | tail -1 | sed 's/.*board: \([^\[]*\).*/\1/' | sed 's/ *$//')
-    [[ -n "$board" ]] || board=$(sc0710_board_name_from_subsys "$subsys")
-    printf '%s' "$board"
+    sc0710_board_name_from_subsys "$subsys"
 }
 
 sc0710_firmware_file_valid() {
@@ -129,18 +132,14 @@ sc0710_ensure_firmware_layout() {
     return 0
 }
 
-sc0710_ecp5_programmed_in_dmesg() {
-    local ecp5_log
-    ecp5_log=$(dmesg 2>/dev/null | grep -E "sc0710.*ECP5" || true)
-    echo "$ecp5_log" | grep -q "firmware programmed successfully" && return 0
-    echo "$ecp5_log" | grep -q "already configured" && return 0
-    return 1
-}
-
-sc0710_ecp5_failed_in_dmesg() {
-    local ecp5_log
-    ecp5_log=$(dmesg 2>/dev/null | grep -E "sc0710.*ECP5" || true)
-    echo "$ecp5_log" | grep -qiE "Failed to load firmware|firmware upload failed|programming failed|Invalid firmware file header|ISC_ENABLE failed|ISC_ERASE failed|bitstream error" && return 0
+# Probe success == the card is bound to the driver: on the 4K Pro the driver
+# fails its probe when the ECP5 can't be programmed, so bind state IS the
+# FPGA state — no kernel-log parsing needed.
+sc0710_card_bound() {
+    local dev
+    for dev in "/sys/bus/pci/drivers/${SC0710_DRV_NAME}"/0000:*; do
+        [[ -e "$dev" ]] && return 0
+    done
     return 1
 }
 
@@ -165,15 +164,6 @@ sc0710_stop_media_consumers() {
         [[ -e "$sdev" ]] && fuser -k "$sdev" >/dev/null 2>&1 || true
     done
     sleep 1
-}
-
-sc0710_restart_media_consumers() {
-    local uid
-    while read -r uid; do
-        [[ -n "$uid" ]] || continue
-        sudo -u "#$uid" XDG_RUNTIME_DIR="/run/user/$uid" \
-            systemctl --user start pipewire.socket 2>/dev/null || true
-    done < <(awk -F: '$3 >= 1000 && $3 < 65000 {print $3}' /etc/passwd 2>/dev/null || true)
 }
 
 sc0710_driver_loaded() {
@@ -296,25 +286,10 @@ sc0710_load_driver() {
     return 0
 }
 
-sc0710_wait_for_ecp5_programming() {
-    local wait_secs="${1:-8}"
-    local i
-    for ((i = 0; i < wait_secs; i++)); do
-        if sc0710_ecp5_programmed_in_dmesg; then
-            return 0
-        fi
-        if sc0710_ecp5_failed_in_dmesg; then
-            return 1
-        fi
-        sleep 1
-    done
-    sc0710_ecp5_programmed_in_dmesg
-}
-
-# Load (or reload) the driver and verify the ECP5 was programmed.
+# Load (or reload) the driver and verify the card bound (= ECP5 programmed).
 sc0710_ensure_ecp5_programmed() {
-    local max_attempts="${1:-5}"
-    local attempt delay
+    local max_attempts="${1:-2}"
+    local attempt
 
     if ! sc0710_is_4k_pro; then
         return 0
@@ -322,34 +297,32 @@ sc0710_ensure_ecp5_programmed() {
 
     sc0710_ensure_firmware_layout || return 1
 
-    if sc0710_driver_loaded && sc0710_ecp5_programmed_in_dmesg; then
-        sc0710_fw_log "ECP5 FPGA already programmed."
+    if sc0710_card_bound; then
+        sc0710_fw_log "sc0710 is bound to the card — ECP5 FPGA programmed."
         return 0
     fi
 
+    # Probe runs synchronously during load, so each attempt is settled when
+    # sc0710_load_driver returns; a failed probe leaves the card unbound.
+    # It also leaves the module loaded, and sc0710_load_driver returns success
+    # for a loaded module, so unload first or retries never re-run the probe.
     for ((attempt = 1; attempt <= max_attempts; attempt++)); do
-        delay=$((attempt * 2))
-        sc0710_fw_log "ECP5 programming attempt ${attempt}/${max_attempts}..."
-
-        sc0710_unload_driver || true
-        sleep "$delay"
-
+        sc0710_fw_log "Card not bound; (re)loading driver (attempt ${attempt}/${max_attempts})..."
+        if sc0710_driver_loaded; then
+            sc0710_unload_driver || true
+        fi
         if ! sc0710_load_driver; then
             sc0710_fw_log "WARNING: Driver load failed on attempt ${attempt}"
             sleep 2
             continue
         fi
-
-        if sc0710_wait_for_ecp5_programming 12; then
-            sc0710_fw_log "ECP5 FPGA programmed successfully."
+        if sc0710_card_bound; then
+            sc0710_fw_log "sc0710 is bound to the card — ECP5 FPGA programmed."
             return 0
         fi
-
-        sc0710_fw_log "WARNING: ECP5 not programmed after attempt ${attempt}"
-        dmesg 2>/dev/null | grep -E "sc0710.*ECP5" | tail -5 >> "${SC0710_FW_LOG_FILE:-/dev/null}" || true
         sleep 2
     done
 
-    sc0710_fw_log "ERROR: ECP5 FPGA programming failed after ${max_attempts} attempts."
+    sc0710_fw_log "ERROR: sc0710 did not bind after ${max_attempts} attempts — probe failed (see dmesg for the reason)."
     return 1
 }

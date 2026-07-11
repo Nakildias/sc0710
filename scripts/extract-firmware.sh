@@ -2,20 +2,28 @@
 # Copyright (C) 2025-2026 Nakildias <nakildiaspro@gmail.com>
 # SPDX-License-Identifier: GPL-2.0-or-later
 #
-# Extract ECP5 firmware from the Elgato 4K Pro Windows driver installer.
-# Unified script for both Atomic and Non-Atomic distros.
+# Extract SC0710.FWI.HEX — the ECP5 runtime firmware, streamed to the FPGA at
+# every boot — from the Elgato 4K Pro Windows driver installer and install it
+# under the firmware directory. The URL below is the latest version as of
+# 2026-07.
+#
+# The installer is looked for on disk first (CWD, then next to this script); if
+# absent the script ASKS before downloading — never silently. The package
+# (local or downloaded) is verified against a pinned SHA-256 before use.
 #
 # Atomic: installs to /var/lib/sc0710/firmware/ with symlink at /etc/firmware/sc0710/
 # Non-atomic: installs to /lib/firmware/sc0710/
 #
-# Requires: curl, 7z (p7zip)
-# Usage: sudo bash extract-firmware.sh
+# Requires: 7z (p7zip); curl for approved downloads.
+# Usage: sudo bash extract-firmware.sh [--installer FILE.exe]
 
 set -e
 
-DOWNLOAD_URL="https://edge.elgato.com/egc/windows/drivers/4K_Pro/Elgato_4KPro_1.1.0.202.exe"
+DRIVER_URL="https://edge.elgato.com/egc/windows/drivers/4K_Pro/Elgato_4KPro_1.1.0.202.exe"
+DRIVER_EXE="Elgato_4KPro_1.1.0.202.exe"
+DRIVER_SHA256="b65fa18fe022b17379a6552a91d11272e3792cf363bc18b96d514db562fd1e71"
 FIRMWARE_FILE="SC0710.FWI.HEX"
-INSTALLER="Elgato_4KPro_1.1.0.202.exe"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 # Colors
 GREEN='\033[0;32m'
@@ -28,6 +36,17 @@ NC='\033[0m'
 msg()  { echo -e "${BLUE}::${NC} ${BOLD}$*${NC}"; }
 msg2() { echo -e " ${BLUE}->${NC} $*"; }
 error(){ echo -e "${RED}error:${NC} $*" >&2; }
+
+# --- Args ---
+DRIVER_PATH=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --installer) DRIVER_PATH="${2:?missing path after --installer}"; shift ;;
+        -h|--help)   awk 'NR==1{next} /^#/{sub(/^# ?/,""); print; next} {exit}' "$0"; exit 0 ;;
+        *) error "unknown option: $1 (see --help)"; exit 1 ;;
+    esac
+    shift
+done
 
 # --- Root check ---
 if [[ $EUID -ne 0 ]]; then
@@ -56,10 +75,7 @@ fi
 if [[ -f "$FIRMWARE_PATH" ]]; then
     echo -e "${GREEN}[OK]${NC} Firmware already present at $FIRMWARE_PATH"
     exit 0
-fi
-
-# On atomic, also check standard location
-if [[ "$DISTRO_TYPE" == "atomic" && -f "/lib/firmware/sc0710/$FIRMWARE_FILE" ]]; then
+elif [[ "$DISTRO_TYPE" == "atomic" && -f "/lib/firmware/sc0710/$FIRMWARE_FILE" ]]; then
     echo -e "${GREEN}[OK]${NC} Firmware already present at /lib/firmware/sc0710/$FIRMWARE_FILE"
     exit 0
 fi
@@ -74,6 +90,16 @@ install_deps() {
 
     if [[ "$need_curl" -eq 0 && "$need_7z" -eq 0 ]]; then
         return 0
+    fi
+
+    # Non-interactive (package hook, service): don't run a package manager that
+    # may prompt or deadlock on its own transaction lock.
+    if [[ ! -t 0 ]]; then
+        local missing=""
+        [[ "$need_curl" -eq 1 ]] && missing="$missing curl"
+        [[ "$need_7z"   -eq 1 ]] && missing="$missing p7zip"
+        error "missing dependencies:${missing} — install them and re-run this script."
+        exit 1
     fi
 
     if [[ "$DISTRO_TYPE" == "atomic" ]]; then
@@ -137,15 +163,62 @@ echo ""
 
 install_deps
 
-# --- Download and extract ---
 TMPDIR=$(mktemp -d)
 trap 'rm -rf "$TMPDIR"' EXIT
 
-msg "Downloading Elgato 4K Pro driver installer..."
-curl -L -o "$TMPDIR/$INSTALLER" "$DOWNLOAD_URL"
+# Every package is verified against its pinned SHA-256 — whether downloaded, found
+# on disk, or passed explicitly — so a swapped CDN file or stale local copy fails
+# loudly instead of installing unknown bytes. Bump the pins when bumping versions.
+verify_sha256() {
+    local file="$1" expected="$2" actual
+    actual="$(sha256sum "$file" | cut -d' ' -f1)"
+    if [[ "$actual" != "$expected" ]]; then
+        error "SHA-256 mismatch for $file"
+        echo "  expected: $expected" >&2
+        echo "  actual:   $actual" >&2
+        echo "Not the pinned package version (or a corrupted/tampered copy)." >&2
+        return 1
+    fi
+    msg2 "SHA-256 verified: $(basename "$file")" >&2
+}
+
+# Find a package on disk (CWD, then script dir), else ask before downloading.
+# obtain_package NAME URL EXPLICIT_PATH SIZE_HINT SHA256 -> prints the path, or fails.
+obtain_package() {
+    local name="$1" url="$2" explicit="$3" size="$4" sha256="$5" c answer found=""
+    if [[ -n "$explicit" ]]; then
+        [[ -f "$explicit" ]] || { error "not found: $explicit"; return 1; }
+        msg2 "Using local package: $explicit" >&2
+        found="$explicit"
+    else
+        for c in "$PWD/$name" "$SCRIPT_DIR/$name"; do
+            [[ -f "$c" ]] && { msg2 "Found package on disk: $c" >&2; found="$c"; break; }
+        done
+    fi
+    if [[ -z "$found" ]]; then
+        if [[ ! -t 0 ]]; then
+            error "$name is not on disk and this shell is non-interactive — not downloading."
+            echo "Place it in the CWD (or pass its path as an option) and re-run." >&2
+            return 1
+        fi
+        read -r -p "$name is not on disk. Download it from Elgato ($size)? [y/N] " answer
+        case "$answer" in
+            y|Y|yes|YES) ;;
+            *) error "declined — nothing downloaded"; return 1 ;;
+        esac
+        curl -L --fail -o "$TMPDIR/$name" "$url" >&2
+        found="$TMPDIR/$name"
+    fi
+    verify_sha256 "$found" "$sha256" || return 1
+    echo "$found"
+}
+
+# --- Runtime firmware ---
+msg "Runtime firmware ($FIRMWARE_FILE) — from the driver installer"
+SRC_EXE="$(obtain_package "$DRIVER_EXE" "$DRIVER_URL" "$DRIVER_PATH" "~5 MB" "$DRIVER_SHA256")" || exit 1
 
 msg "Extracting firmware..."
-7z x -y -o"$TMPDIR/extracted" "$TMPDIR/$INSTALLER" "Final/Game_Capture_4K_Pro/$FIRMWARE_FILE" > /dev/null
+7z x -y -o"$TMPDIR/extracted" "$SRC_EXE" "Final/Game_Capture_4K_Pro/$FIRMWARE_FILE" > /dev/null
 
 SRC="$TMPDIR/extracted/Final/Game_Capture_4K_Pro/$FIRMWARE_FILE"
 if [[ ! -f "$SRC" ]]; then
@@ -153,9 +226,7 @@ if [[ ! -f "$SRC" ]]; then
     exit 1
 fi
 
-# --- Install firmware ---
 msg "Installing firmware..."
-
 if [[ "$DISTRO_TYPE" == "atomic" ]]; then
     mkdir -p "$FIRMWARE_STORE"
     cp "$SRC" "$FIRMWARE_STORE/$FIRMWARE_FILE"
@@ -172,10 +243,9 @@ else
     cp "$SRC" "$FIRMWARE_DIR/$FIRMWARE_FILE"
     msg2 "Firmware installed to $FIRMWARE_DIR/$FIRMWARE_FILE"
 fi
-
-echo ""
 echo -e "${GREEN}[OK]${NC} Firmware installed successfully."
 echo ""
-echo -e "${BOLD}Note:${NC} The driver module must be reloaded to pick up the firmware."
+
+echo -e "${BOLD}Note:${NC} The driver module must be reloaded to pick up new files."
 echo -e "Run: ${BOLD}sc0710-cli --restart${NC}"
 echo ""

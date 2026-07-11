@@ -230,10 +230,15 @@ if [[ -L "/etc/firmware/sc0710" ]]; then
     trace_found "Firmware symlink still present" "/etc/firmware/sc0710 -> $(readlink -f /etc/firmware/sc0710 2>/dev/null || readlink /etc/firmware/sc0710)"
 fi
 
-if [[ -d "/lib/firmware/sc0710" ]]; then
-    firmware_any=true
-    trace_found "Firmware directory still present" "/lib/firmware/sc0710"
-fi
+for fwdir in \
+    "/lib/firmware/sc0710" \
+    "/var/lib/sc0710/firmware" \
+    "/etc/firmware/sc0710"; do
+    if [[ -d "$fwdir" && ! -L "$fwdir" ]]; then
+        firmware_any=true
+        trace_found "Firmware directory still present" "$fwdir"
+    fi
+done
 
 if [[ "$firmware_any" == "false" ]]; then
     trace_clear "No 4K Pro firmware files found"
@@ -252,7 +257,7 @@ echo -e "${RED}[TRACES FOUND]${NC} ${TRACE_COUNT} remnant(s) detected."
 echo ""
 echo -e "If removal was intentional, try:"
 echo -e "  ${BOLD}sudo sc0710-cli --remove${NC}   (if the CLI is still installed)"
-echo -e "  ${BOLD}yay -R sc0710-dkms-git${NC}     (AUR package; removes firmware systemd units)"
+echo -e "  ${BOLD}yay -R sc0710-dkms-git${NC}     (AUR package)"
 echo -e "  Stale atomic installs may leave ${BOLD}/lib/modules/\$(uname -r)/extra/${DRV_NAME}/${NC} on the read-only ostree image."
 echo -e "  That path often cannot be deleted manually; blacklist + unload is enough for sc0710 to work."
 echo -e "  To find the owning package: ${BOLD}rpm -qf /lib/modules/\$(uname -r)/extra/${DRV_NAME}/sc0710.ko.xz${NC}"

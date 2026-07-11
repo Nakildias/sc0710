@@ -30,7 +30,7 @@ Both cards share the same `12ab:0710` Magewell chipset but use different board p
 | **Fedora / RHEL** | Stable | DKMS via the automatic installer. |
 | **Debian / Ubuntu** | Stable | **Warning:** distro OBS packages may crash; prefer Flatpak OBS. |
 | **Fedora Atomic** (Bazzite, Bluefin, Aurora, Silverblue) | Stable | Boot-time build service at `/var/lib/sc0710`. No DKMS. 4K Pro ECP5 stack included. |
-| **NixOS** | Supported | Flake module available; firmware stack is simpler than the bash installer (see below). |
+| **NixOS** | Supported | Flake module builds the driver and installs `sc0710-cli`; 4K Pro firmware is a one-time `extract-firmware.sh` run (see below). |
 
 Tested on kernel **6.12 through 7.0+**. Newer kernels may work but are not guaranteed until tested.
 
@@ -51,33 +51,18 @@ sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/Nakildias/sc0710/ma
 - `sc0710-build.service` — rebuilds and loads the module on each boot
 - `sc0710-cli` with atomic-specific commands (`--rebuild`, etc.)
 
-**4K Pro on any distro** additionally gets:
-- Automatic download/extraction of `SC0710.FWI.HEX` from the Elgato Windows driver
-- `sc0710-firmware.service` — prepares firmware files and symlinks before driver load
-- `sc0710-firmware-verify.service` — verifies ECP5 programming after the module loads, with automatic retries
+**4K Pro on any distro** additionally gets extraction of `SC0710.FWI.HEX` from the Elgato Windows driver at install time (`extract-firmware.sh`, with pinned checksums). Downloading from Elgato always asks for consent first, so a non-interactive install extracts only if the Elgato package is already on disk — otherwise re-run the script in a terminal afterwards.
 
 ### 4K Pro ECP5 firmware (cold boot)
 
-The 4K Pro has a Lattice ECP5 FPGA whose configuration is **volatile** — it is lost on full power-off / cold boot. Windows programs it on every boot; this driver does the same.
+The 4K Pro has a Lattice ECP5 FPGA whose configuration is **volatile** — it is lost on full power-off / cold boot. Windows programs it on every boot; this driver programs it during its probe, and **fails the probe if it can't** (missing firmware file, upload failure) — the card then stays unbound and no `/dev/video*` appears, with the reason in `dmesg`.
 
-**Symptoms when ECP5 is not programmed:**
-- HDMI input shows as locked/detected
-- Video is black
-- `dmesg` has no `ECP5 FPGA programmed` message
-
-**After automatic install**, boot services handle programming. If video is still black:
+**If the card didn't bind:**
 
 ```bash
+sudo dmesg | grep sc0710              # shows why the probe failed
+sudo bash scripts/extract-firmware.sh # if the firmware file is missing
 sudo sc0710-cli --restart
-# or
-sudo bash /var/lib/sc0710/sc0710-firmware.sh --verify          # atomic
-sudo bash /usr/local/libexec/sc0710-firmware.sh --verify     # standard
-```
-
-Existing atomic installs can pick up the latest firmware stack with:
-
-```bash
-sudo sc0710-cli --update
 ```
 
 ### Arch Linux (AUR)
@@ -90,33 +75,33 @@ The AUR package installs:
 
 - **DKMS kernel module** — rebuilds automatically on kernel updates
 - **`sc0710-cli`** at `/usr/bin/sc0710-cli` — same management tool as the automatic installer
-- **4K Pro firmware helpers** under `/usr/lib/sc0710/` (`extract-firmware.sh`, `sc0710-firmware.sh`, `sc0710-firmware-lib.sh`)
+- **4K Pro firmware helpers** under `/usr/lib/sc0710/` (`extract-firmware.sh`, `sc0710-firmware-lib.sh`)
 
 **MK.2 users** can load with `sudo modprobe sc0710` (or enable `/etc/modules-load.d/sc0710.conf` for boot load) and manage the driver with `sc0710-cli`.
 
-**4K Pro users** — if a 4K Pro card (`1cfa:0012`) is present at install/upgrade time, the package hook automatically:
+**4K Pro users** — if a 4K Pro card (`1cfa:0012`) is present at install/upgrade time, the package hook:
 
-1. Extracts `SC0710.FWI.HEX` when it is not already on disk (needs network; installs `p7zip` if required)
-2. Creates and enables `sc0710-firmware.service` and `sc0710-firmware-verify.service`
-3. Configures boot module loading via `modules-load.d` and `modprobe.d` softdeps
-4. Starts the firmware services and loads the driver
+1. Extracts `SC0710.FWI.HEX` if the Elgato installer is already on disk (`p7zip` needed; the hook never downloads — pacman runs it non-interactively, and downloading from Elgato requires a consent prompt). If firmware ends up missing, run `sudo bash /usr/lib/sc0710/extract-firmware.sh` in a terminal afterwards.
+2. Configures boot module loading via `modules-load.d` and `modprobe.d` softdeps
+3. Loads the driver (which programs the ECP5 during its probe)
 
-After a **cold boot**, the same systemd units handle ECP5 programming before and after module load. If video is black:
+After a **cold boot**, the driver programs the ECP5 when the module loads — no services involved. If the card didn't bind (no `/dev/video*`):
 
 ```bash
+sudo dmesg | grep sc0710
 sudo sc0710-cli --restart
-# or
-sudo bash /usr/lib/sc0710/sc0710-firmware.sh --verify
 ```
 
-If the card was added **after** the AUR install, run `sudo sc0710-cli --update` to refresh firmware services, or extract firmware manually:
+If the card was added **after** the AUR install, extract the firmware manually:
 
 ```bash
 sudo /usr/lib/sc0710/extract-firmware.sh
 sudo sc0710-cli --restart
 ```
 
-**Removing the AUR package** — `yay -R sc0710-dkms-git` stops, disables, and deletes `sc0710-firmware.service` and `sc0710-firmware-verify.service` when the installed package includes the current install hook. If you are on an older AUR build, upgrade once first so the hook is present. Firmware files under `/lib/firmware/sc0710/` are not removed by `yay -R`; use `sc0710-cli --remove` for a full cleanup.
+**Removing the AUR package** — firmware files under `/lib/firmware/sc0710/` are not removed by `yay -R`; use `sc0710-cli --remove` for a full cleanup.
+
+**Upgrading from an older package version** — old versions created `sc0710-firmware.service`/`sc0710-firmware-verify.service` outside the package (the driver programs the ECP5 itself now, so they no longer exist). The package upgrade removes those leftovers automatically; the [removal check script](#verify-complete-removal) flags any stragglers.
 
 **4K Pro on Arch** — the maintainer primarily tests on MK.2 hardware. Cold-boot ECP5 reports from 4K Pro users are especially welcome ([open an issue](https://github.com/Nakildias/sc0710/issues) with `sc0710-cli --dump`).
 
@@ -146,11 +131,10 @@ Host configuration:
 
 ```nix
 hardware.sc0710.enable = true;          # kernel module + sc0710-cli
-hardware.sc0710.enableFirmware = true;  # basic firmware oneshot service
 # hardware.sc0710.kernel = pkgs.linuxPackages_6_19.kernel;  # optional override
 ```
 
-**Note:** The NixOS module builds the driver and installs `sc0710-cli`, but its firmware service is a single oneshot unit — it does not include the full ECP5 verify/retry stack that the bash installer provides for atomic distros. **4K Pro users on NixOS** may need manual intervention after cold boot until the Nix module is brought up to parity.
+**Note:** The NixOS module builds the driver and installs `sc0710-cli`. **4K Pro users on NixOS** additionally run `scripts/extract-firmware.sh` once (as root, from a repo checkout) to provision the ECP5 firmware and EDID profiles — it installs to `/lib/firmware/sc0710`, which the kernel firmware loader reads directly. The driver programs the FPGA at every module load and refuses to bind if it can't, so no boot service is needed.
 
 ### Manual compilation
 
@@ -188,7 +172,7 @@ Installed by the automatic installer, the AUR package, and the NixOS module. Pro
 | `--software-scaler` | `-ss` | Toggle software scaler modes (all cards) |
 | `--toggle-auto-scalar` | `-as` | Toggle automatic safety scaler |
 | `--procedural-timings` | `-pt` | Cycle timing mode: merge → procedural-only → static-only |
-| `--update` | `-U` | Pull latest source, rebuild, reload. Refreshes firmware services on 4K Pro |
+| `--update` | `-U` | Pull latest source, rebuild, reload. On 4K Pro, re-runs ECP5 programming with retries |
 | `--rebuild` | | *(Atomic only)* Force rebuild the module for the running kernel |
 | `--dump` | | Save a debug report to the Desktop (`dump-DD-MM-YYYY.txt`) for GitHub issues |
 | `--remove` | `-r`, `-R` | Uninstall driver, CLI, services, config files, and 4K Pro firmware |
@@ -210,7 +194,7 @@ Same command as above — checks module, DKMS, CLI, systemd units, config files,
 * **Multi-client support** — multiple apps (e.g. OBS + Discord) can open the device simultaneously
 * **DKMS integration** — automatic rebuilds on kernel updates (standard distros)
 * **Atomic / immutable support** — boot-time rebuild via `sc0710-build.service` (Bazzite, Silverblue, etc.)
-* **4K Pro ECP5 auto-programming** — firmware extraction, cold-boot programming, verify service, and CLI retries
+* **4K Pro ECP5 auto-programming** — firmware extraction at install time; the driver programs the FPGA at load and refuses to bind if it can't
 * **Status images** — storage-efficient No Signal / No Device screens
 * **Connection sensing** — distinguishes unplugged cables from signal loss (not 100% reliable)
 * **Video formats** — 4K60, 1440p144, 1080p240 (EDID changes require Windows)
@@ -223,8 +207,7 @@ Same command as above — checks module, DKMS, CLI, systemd units, config files,
 
 | Problem | What to try |
 |---------|-------------|
-| **4K Pro: signal locked, black video** (cold boot) | `sudo sc0710-cli --restart` or `sudo sc0710-cli --update` then reboot |
-| **4K Pro: ECP5 warning in `--status`** | `sudo bash …/sc0710-firmware.sh --verify` (atomic: `/var/lib/sc0710/`; AUR: `/usr/lib/sc0710/`; standard installer: `/usr/local/libexec/`) |
+| **4K Pro: card didn't bind / no `/dev/video*`** (cold boot) | `sudo dmesg \| grep sc0710` for the probe error; if firmware is missing run `extract-firmware.sh`, then `sudo sc0710-cli --restart` |
 | **Module won't unload** (app in use) | `sc0710-cli --unload` stops PipeWire first; close OBS/etc. |
 | **Atomic: module not built after kernel update** | `sudo sc0710-cli --rebuild` or check `journalctl -u sc0710-build.service -b` |
 | **Driver still present after `--remove`** | Run `sudo sc0710-cli --remove` again, then the [removal check script](#verify-complete-removal) |

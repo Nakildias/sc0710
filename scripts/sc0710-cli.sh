@@ -152,10 +152,15 @@ sc0710_firmware_lib_path() {
     fi
 }
 
-sc0710_firmware_script_path() {
-    local lib
-    lib=$(sc0710_firmware_lib_path) || return 1
-    echo "$(dirname "$lib")/sc0710-firmware.sh"
+# Installed extract-firmware.sh, per layout: AUR, atomic source dir, DKMS source dir.
+sc0710_extract_script_path() {
+    local p
+    for p in /usr/lib/sc0710/extract-firmware.sh \
+             "$SRC_DIR/scripts/extract-firmware.sh" \
+             "$DKMS_SRC/scripts/extract-firmware.sh"; do
+        [[ -f "$p" ]] && { echo "$p"; return 0; }
+    done
+    echo "scripts/extract-firmware.sh (from the repo)"
 }
 
 sc0710_cli_path() {
@@ -350,74 +355,6 @@ EOF
     fi
 }
 
-sc0710_cli_refresh_firmware_services() {
-    local src_root="${1:-}"
-    local fw_script fw_lib verify_after
-    sc0710_is_4k_pro_card || return 0
-
-    if [[ "$IS_ATOMIC" == "true" ]]; then
-        fw_script="$SRC_DIR/sc0710-firmware.sh"
-        fw_lib="$SRC_DIR/sc0710-firmware-lib.sh"
-        verify_after="sc0710-build.service"
-        [[ -z "$src_root" ]] && src_root="$SRC_DIR"
-    else
-        verify_after="systemd-modules-load.service"
-        if [[ -f /usr/lib/sc0710/sc0710-firmware.sh && -f /usr/lib/sc0710/sc0710-firmware-lib.sh ]]; then
-            fw_script="/usr/lib/sc0710/sc0710-firmware.sh"
-            fw_lib="/usr/lib/sc0710/sc0710-firmware-lib.sh"
-        else
-            fw_script="/usr/local/libexec/sc0710-firmware.sh"
-            fw_lib="/usr/local/libexec/sc0710-firmware-lib.sh"
-            mkdir -p /usr/local/libexec
-            [[ -z "$src_root" ]] && src_root="$DKMS_SRC"
-            [[ -f "$src_root/scripts/sc0710-firmware.sh" ]] && cp "$src_root/scripts/sc0710-firmware.sh" "$fw_script" && chmod +x "$fw_script"
-            [[ -f "$src_root/scripts/sc0710-firmware-lib.sh" ]] && cp "$src_root/scripts/sc0710-firmware-lib.sh" "$fw_lib" && chmod +x "$fw_lib"
-        fi
-    fi
-
-    [[ -x "$fw_script" && -f "$fw_lib" ]] || return 0
-
-    cat > "/etc/systemd/system/sc0710-firmware.service" <<FWEOF
-[Unit]
-Description=SC0710 4K Pro ECP5 Firmware Preparation
-After=local-fs.target systemd-udev-settle.service
-Before=${verify_after} sc0710-firmware-verify.service
-ConditionPathExists=${fw_script}
-
-[Service]
-Type=oneshot
-ExecStart=/bin/bash ${fw_script}
-RemainAfterExit=yes
-TimeoutStartSec=180
-StandardOutput=journal
-StandardError=journal
-
-[Install]
-WantedBy=multi-user.target
-FWEOF
-
-    cat > "/etc/systemd/system/sc0710-firmware-verify.service" <<FWVEOF
-[Unit]
-Description=SC0710 4K Pro ECP5 Firmware Verify
-After=${verify_after} sc0710-firmware.service
-ConditionPathExists=${fw_script}
-
-[Service]
-Type=oneshot
-ExecStart=/bin/bash ${fw_script} --verify
-RemainAfterExit=yes
-TimeoutStartSec=300
-StandardOutput=journal
-StandardError=journal
-
-[Install]
-WantedBy=multi-user.target
-FWVEOF
-
-    systemctl daemon-reload
-    systemctl enable sc0710-firmware.service sc0710-firmware-verify.service >/dev/null 2>&1 || true
-}
-
 sc0710_remove_firmware_files() {
     rm -f /lib/firmware/sc0710/SC0710.FWI.HEX 2>/dev/null || true
     rmdir /lib/firmware/sc0710 2>/dev/null || true
@@ -431,7 +368,7 @@ sc0710_remove_firmware_files() {
     rm -f /var/lib/sc0710/firmware/SC0710.FWI.HEX 2>/dev/null || true
     rmdir /var/lib/sc0710/firmware 2>/dev/null || true
 
-    rm -f /usr/local/libexec/sc0710-firmware.sh /usr/local/libexec/sc0710-firmware-lib.sh 2>/dev/null || true
+    rm -f /usr/local/libexec/sc0710-firmware-lib.sh 2>/dev/null || true
 }
 
 # --- Version Check Function ---
@@ -638,7 +575,6 @@ write_debug_dump() {
         [[ -d "/var/lib/dkms/${DRV_NAME}" ]] && printf 'DKMS lib dir present: /var/lib/dkms/%s\n' "$DRV_NAME" >> "$DUMP_FILE" \
             || printf 'DKMS lib dir: not present\n' >> "$DUMP_FILE"
     fi
-    dump_cmd "Firmware service" systemctl status sc0710-firmware.service --no-pager
     for fw in /var/lib/sc0710/firmware/SC0710.FWI.HEX /etc/firmware/sc0710/SC0710.FWI.HEX /lib/firmware/sc0710/SC0710.FWI.HEX; do
         [[ -f "$fw" ]] && printf 'Firmware present: %s\n' "$fw" >> "$DUMP_FILE"
     done
@@ -792,7 +728,7 @@ case "$1" in
                     SC0710_FW_LOG_FILE="/var/log/sc0710/load_$(date '+%Y%m%d_%H%M%S').log" source "$(sc0710_firmware_lib_path)"
                     mkdir -p /var/log/sc0710
                     sc0710_init_firmware_paths
-                    if sc0710_wait_for_ecp5_programming 12 || sc0710_cli_ensure_ecp5 3; then
+                    if sc0710_card_bound || sc0710_cli_ensure_ecp5 3; then
                         echo -e "${GREEN}[OK]${NC} Driver loaded successfully."
                     else
                         echo -e "${RED}[ERROR]${NC} Driver loaded but ECP5 programming failed."
@@ -894,19 +830,12 @@ case "$1" in
         fi
         ;;
     --restart)
-        if sc0710_is_4k_pro_card && sc0710_firmware_lib_path >/dev/null; then
-            if sc0710_cli_ensure_ecp5 5; then
-                echo -e "${GREEN}[OK]${NC} Driver restarted and ECP5 FPGA programmed."
-            else
-                echo -e "${RED}[ERROR]${NC} ECP5 programming failed."
-                echo -e "  Run: ${BOLD}sudo bash $(dirname "$(sc0710_firmware_lib_path)")/sc0710-firmware.sh --verify${NC}"
-                exit 1
-            fi
-            exit 0
-        fi
+        # Always a real unload+load, even when the card is bound and healthy:
+        # a reload is how new firmware/EDID files and module params get picked
+        # up. --load re-verifies the ECP5 on the 4K Pro afterwards.
         "$0" --unload
         sleep 1
-        "$0" --load
+        exec "$0" --load
         ;;
     -s|--status)
         check_version
@@ -1124,19 +1053,18 @@ case "$1" in
             for p in /var/lib/sc0710/firmware/SC0710.FWI.HEX /etc/firmware/sc0710/SC0710.FWI.HEX /lib/firmware/sc0710/SC0710.FWI.HEX; do
                 if [[ -f "$p" ]]; then FW_FOUND=true; echo -e "   ${GREEN}●${NC} Firmware present: $p"; break; fi
             done
-            [[ "$FW_FOUND" == "false" ]] && echo -e "   ${RED}○${NC} Firmware missing. Run: ${BOLD}sudo bash $( [[ "$IS_ATOMIC" == "true" ]] && echo /var/lib/sc0710/sc0710-firmware.sh || sc0710_firmware_script_path 2>/dev/null || echo /usr/lib/sc0710/sc0710-firmware.sh )${NC}"
-            ECP5_MSG=$(dmesg 2>/dev/null | grep -E "sc0710.*ECP5" | tail -1)
-            ECP5_OK=false
-            echo "$ECP5_MSG" | grep -q "firmware programmed successfully" && ECP5_OK=true && echo -e "   ${GREEN}●${NC} ECP5 FPGA programmed"
-            echo "$ECP5_MSG" | grep -q "already configured" && ECP5_OK=true && echo -e "   ${GREEN}●${NC} ECP5 FPGA configured (warm boot)"
-            echo "$ECP5_MSG" | grep -qiE "Failed to load firmware|firmware upload failed|programming failed" && echo -e "   ${RED}○${NC} ECP5 FPGA not programmed"
-            if [[ "$FW_FOUND" == "true" && "$ECP5_OK" == "false" ]] && lsmod | grep -q "^${DRV_NAME}[[:space:]]"; then
-                echo -e "   ${RED}⚠ WARNING:${NC} Firmware file exists but ECP5 is NOT programmed."
-                echo -e "     Run: ${BOLD}sudo bash $( [[ "$IS_ATOMIC" == "true" ]] && echo /var/lib/sc0710/sc0710-firmware.sh || sc0710_firmware_script_path 2>/dev/null || echo /usr/lib/sc0710/sc0710-firmware.sh ) --verify${NC}"
-                echo -e "     Or:  ${BOLD}sc0710-cli --restart${NC}"
+            [[ "$FW_FOUND" == "false" ]] && echo -e "   ${RED}○${NC} Firmware missing. Run: ${BOLD}sudo bash $(sc0710_extract_script_path)${NC}"
+            # The driver fails its probe when the ECP5 can't be programmed, so
+            # bind state is the FPGA state — no kernel-log parsing.
+            if ls /sys/bus/pci/drivers/${DRV_NAME}/0000:* >/dev/null 2>&1; then
+                echo -e "   ${GREEN}●${NC} Driver bound — ECP5 FPGA programmed"
+            elif lsmod | grep -q "^${DRV_NAME}[[:space:]]"; then
+                echo -e "   ${RED}○${NC} Driver loaded but card NOT bound — probe failed (ECP5/firmware)."
+                echo -e "     Check: ${BOLD}sudo dmesg | grep sc0710${NC}"
+                echo -e "     Then:  ${BOLD}sc0710-cli --restart${NC}"
+            else
+                echo -e "   ${YELLOW}○${NC} Driver not loaded"
             fi
-            systemctl is-enabled sc0710-firmware.service >/dev/null 2>&1 && echo -e "   ${GREEN}●${NC} Firmware service enabled" || echo -e "   ${YELLOW}○${NC} Firmware service not installed"
-            systemctl is-enabled sc0710-firmware-verify.service >/dev/null 2>&1 && echo -e "   ${GREEN}●${NC} Firmware verify service enabled" || true
         fi
         echo ""
         ;;
@@ -1223,9 +1151,7 @@ case "$1" in
             tar -xzf "$TEMP_TAR" --strip-components=1 -C "$SRC_DIR" || { rm -f "$TEMP_TAR"; exit 1; }
             rm -f "$TEMP_TAR"
             [[ -f "$SRC_DIR/scripts/build-and-load.sh" ]] && cp "$SRC_DIR/scripts/build-and-load.sh" "$SRC_DIR/build-and-load.sh" && chmod +x "$SRC_DIR/build-and-load.sh"
-            [[ -f "$SRC_DIR/scripts/sc0710-firmware.sh" ]] && cp "$SRC_DIR/scripts/sc0710-firmware.sh" "$SRC_DIR/sc0710-firmware.sh" && chmod +x "$SRC_DIR/sc0710-firmware.sh"
             [[ -f "$SRC_DIR/scripts/sc0710-firmware-lib.sh" ]] && cp "$SRC_DIR/scripts/sc0710-firmware-lib.sh" "$SRC_DIR/sc0710-firmware-lib.sh" && chmod +x "$SRC_DIR/sc0710-firmware-lib.sh"
-            sc0710_cli_refresh_firmware_services
             NEW_VER="$CURRENT_VERSION"
             [[ -f "$SRC_DIR/version" ]] && NEW_VER=$(cat "$SRC_DIR/version" | tr -d '[:space:]')
             lsmod | grep -q "$DRV_NAME" && "$0" --unload
@@ -1272,10 +1198,15 @@ case "$1" in
             NEW_DKMS_SRC="/usr/src/${DRV_NAME}-${NEW_DKMS_VER}"
 
             mv "$TEMP_DIR" "$NEW_DKMS_SRC"
-            sc0710_cli_refresh_firmware_services "$NEW_DKMS_SRC"
 
             dkms add -m "$DRV_NAME" -v "$NEW_DKMS_VER" >/dev/null 2>&1
             if dkms install -m "$DRV_NAME" -v "$NEW_DKMS_VER" -k "$(uname -r)" --force 2>&1; then
+                # Refresh the installed firmware lib alongside the driver (the
+                # atomic branch does the same); only if it was installed before.
+                if [[ -f /usr/local/libexec/sc0710-firmware-lib.sh && -f "$NEW_DKMS_SRC/scripts/sc0710-firmware-lib.sh" ]]; then
+                    cp "$NEW_DKMS_SRC/scripts/sc0710-firmware-lib.sh" /usr/local/libexec/sc0710-firmware-lib.sh
+                    chmod +x /usr/local/libexec/sc0710-firmware-lib.sh
+                fi
                 if sc0710_is_4k_pro_card && sc0710_firmware_lib_path >/dev/null; then
                     if sc0710_cli_ensure_ecp5 5; then
                         echo -e "${GREEN}[OK]${NC} Driver updated (v${REAL_NEW_VER}), ECP5 FPGA programmed."

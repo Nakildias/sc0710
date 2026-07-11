@@ -490,7 +490,8 @@ extern const unsigned int sc0710_idcount;
 
 extern void sc0710_card_list(struct sc0710_dev *dev);
 extern void sc0710_gpio_setup(struct sc0710_dev *dev);
-extern void sc0710_card_setup(struct sc0710_dev *dev);
+extern int sc0710_card_setup(struct sc0710_dev *dev);
+extern void *sc0710_firmware_load(struct sc0710_dev *dev, const char *rel, size_t *out_size);
 
 u32  sc_read(struct sc0710_dev *dev, int bar, u32 reg);
 void sc_write(struct sc0710_dev *dev, int bar, u32 reg, u32 value);

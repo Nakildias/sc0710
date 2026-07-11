@@ -172,62 +172,23 @@ verify_essential_files() {
     return 0
 }
 
-install_4k_pro_firmware_stack() {
-    local fw_script="$1"
-    local fw_lib="$2"
-    local verify_after="${3:-sc0710-build.service}"
-    local src_root="${4:-}"
+# The driver programs the ECP5 at probe and fails the probe if it can't, so
+# no boot-time firmware services are needed — only the helper lib that
+# sc0710-cli and the atomic build service source.
+install_4k_pro_firmware_lib() {
+    local fw_lib="$1"
+    local src_root="${2:-}"
 
     [[ -z "$src_root" ]] && src_root="${SOURCE:-/var/lib/sc0710}"
 
-    [[ -f "$src_root/scripts/sc0710-firmware.sh" ]] && cp "$src_root/scripts/sc0710-firmware.sh" "$fw_script" && chmod +x "$fw_script"
     [[ -f "$src_root/scripts/sc0710-firmware-lib.sh" ]] && cp "$src_root/scripts/sc0710-firmware-lib.sh" "$fw_lib" && chmod +x "$fw_lib"
 
-    if [[ ! -x "$fw_script" || ! -f "$fw_lib" ]]; then
-        warning "Firmware scripts missing; 4K Pro ECP5 auto-programming may not work."
-        return 1
+    # Best-effort: a missing helper lib degrades sc0710-cli, it must not abort
+    # the install (callers run under set -e).
+    if [[ ! -f "$fw_lib" ]]; then
+        warning "sc0710-firmware-lib.sh missing; sc0710-cli status/restart helpers may not work."
     fi
-
-    cat > "/etc/systemd/system/sc0710-firmware.service" <<FWEOF
-[Unit]
-Description=SC0710 4K Pro ECP5 Firmware Preparation
-After=local-fs.target systemd-udev-settle.service
-Before=${verify_after} sc0710-firmware-verify.service
-ConditionPathExists=${fw_script}
-
-[Service]
-Type=oneshot
-ExecStart=/bin/bash ${fw_script}
-RemainAfterExit=yes
-TimeoutStartSec=180
-StandardOutput=journal
-StandardError=journal
-
-[Install]
-WantedBy=multi-user.target
-FWEOF
-
-    cat > "/etc/systemd/system/sc0710-firmware-verify.service" <<FWVEOF
-[Unit]
-Description=SC0710 4K Pro ECP5 Firmware Verify
-After=${verify_after} sc0710-firmware.service
-ConditionPathExists=${fw_script}
-
-[Service]
-Type=oneshot
-ExecStart=/bin/bash ${fw_script} --verify
-RemainAfterExit=yes
-TimeoutStartSec=300
-StandardOutput=journal
-StandardError=journal
-
-[Install]
-WantedBy=multi-user.target
-FWVEOF
-
-    systemctl daemon-reload
-    systemctl enable sc0710-firmware.service sc0710-firmware-verify.service
-    log "Installed sc0710-firmware.service and sc0710-firmware-verify.service"
+    return 0
 }
 
 confirm() {
@@ -636,17 +597,13 @@ else
     log "No 4K Pro card detected, skipping firmware extraction"
 fi
 
-# --- 5.6. Firmware Service (4K Pro only) ---
+# --- 5.6. Firmware helper lib (4K Pro only) ---
 if lspci -n -v -d 12ab:0710 2>/dev/null | grep -qi "1cfa:0012"; then
-    msg "4K Pro detected — installing firmware services..."
-    install_4k_pro_firmware_stack \
-        "/var/lib/sc0710/sc0710-firmware.sh" \
-        "/var/lib/sc0710/sc0710-firmware-lib.sh" \
-        "sc0710-build.service" \
-        "$SOURCE"
-    msg2 "4K Pro firmware services installed (atomic)."
+    msg "4K Pro detected — installing firmware helper lib..."
+    install_4k_pro_firmware_lib "/var/lib/sc0710/sc0710-firmware-lib.sh" "$SOURCE"
+    msg2 "4K Pro firmware helper lib installed (atomic)."
 else
-    log "No 4K Pro card detected, skipping firmware service installation"
+    log "No 4K Pro card detected, skipping firmware helper installation"
 fi
 
 # --- 6. Create the boot-time build script ---
@@ -667,7 +624,7 @@ msg "Creating systemd service for boot-time module build..."
 cat > "$SERVICE_FILE" <<EOF
 [Unit]
 Description=SC0710 Capture Card Driver - Build and Load
-After=local-fs.target basic.target systemd-udev-settle.service sc0710-firmware.service
+After=local-fs.target basic.target systemd-udev-settle.service
 Wants=systemd-udev-settle.service
 ConditionPathExists=/var/lib/sc0710/build-and-load.sh
 
@@ -930,13 +887,9 @@ if lspci -n -v -d 12ab:0710 2>/dev/null | grep -qi "1cfa:0012"; then
         msg "4K Pro detected — extracting ECP5 firmware..."
         [[ -f "$SOURCE/scripts/extract-firmware.sh" ]] && bash "$SOURCE/scripts/extract-firmware.sh" && msg2 "Firmware extracted." || warning "Firmware extraction failed."
     fi
-    msg "4K Pro detected — installing firmware services..."
+    msg "4K Pro detected — installing firmware helper lib..."
     mkdir -p "/usr/local/libexec"
-    install_4k_pro_firmware_stack \
-        "/usr/local/libexec/sc0710-firmware.sh" \
-        "/usr/local/libexec/sc0710-firmware-lib.sh" \
-        "systemd-modules-load.service" \
-        "$SOURCE"
+    install_4k_pro_firmware_lib "/usr/local/libexec/sc0710-firmware-lib.sh" "$SOURCE"
 fi
 
 USE_DKMS=false
@@ -984,7 +937,7 @@ if lspci -n -v -d 12ab:0710 2>/dev/null | grep -qi "1cfa:0012" && [[ -f "/usr/lo
     if sc0710_ensure_ecp5_programmed 3; then
         msg2 "Driver loaded and ECP5 FPGA programmed."
     else
-        warning "ECP5 programming failed. Run: sudo bash /usr/local/libexec/sc0710-firmware.sh --verify"
+        warning "ECP5 programming failed (card not bound). Check dmesg, ensure the firmware file exists (sudo bash $SOURCE/scripts/extract-firmware.sh), then: sudo modprobe -r sc0710 && sudo modprobe sc0710"
     fi
 elif ! DRIVER_ERR=$(modprobe "$DRV_NAME" 2>&1); then
     error "Failed to load $DRV_NAME. Error: $DRIVER_ERR"
