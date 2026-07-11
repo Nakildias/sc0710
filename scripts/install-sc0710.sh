@@ -893,7 +893,9 @@ if lsmod | grep -q "$DRV_NAME"; then
     fi
 fi
 
-[[ -d "$SRC_DEST" ]] && rm -rf "$SRC_DEST"
+# Clean previous DKMS/src trees before staging. Cleanup must run first —
+# calling it after staging deletes the freshly copied /usr/src tree.
+sc0710_dkms_cleanup
 LOCAL_MODE=false
 [[ -f "$PROJECT_ROOT/Makefile" && -f "$PROJECT_ROOT/lib/sc0710.h" ]] && confirm "Use local source?" "Y" && LOCAL_MODE=true
 if [[ "$LOCAL_MODE" == "true" ]]; then
@@ -931,6 +933,16 @@ fi
 USE_DKMS=false
 confirm "Enable automatic updates (DKMS)?" "Y" && USE_DKMS=true
 if [[ "$USE_DKMS" == "true" ]]; then
+    # Ship DKMS helpers system-wide (same layout as aur/PKGBUILD). dkms.conf
+    # MAKE[0] invokes /usr/lib/sc0710/sc0710-dkms-make.sh on rebuilds.
+    install -d /usr/lib/sc0710
+    for _dkms_helper in sc0710-dkms-lib.sh sc0710-dkms-ensure.sh sc0710-dkms-make.sh; do
+        if [[ -f "$SRC_DEST/scripts/$_dkms_helper" ]]; then
+            install -Dm755 "$SRC_DEST/scripts/$_dkms_helper" "/usr/lib/sc0710/$_dkms_helper"
+        else
+            die "Missing DKMS helper: $SRC_DEST/scripts/$_dkms_helper"
+        fi
+    done
     cat > "$SRC_DEST/dkms.conf" << DKMSEOF
 PACKAGE_NAME="$DRV_NAME"
 PACKAGE_VERSION="$DKMS_VERSION"
@@ -940,7 +952,6 @@ AUTOINSTALL="yes"
 BUILT_MODULE_LOCATION[0]="build/"
 MAKE[0]="bash /usr/lib/sc0710/sc0710-dkms-make.sh \$kernelver"
 DKMSEOF
-    sc0710_dkms_cleanup
     dkms add -m "$DRV_NAME" -v "$DKMS_VERSION" >/dev/null 2>&1 || true
     dkms build -m "$DRV_NAME" -v "$DKMS_VERSION" -k "$KERNEL_VER" 2>&1 | tee -a "$LOG_FILE" || { error "DKMS build failed."; exit 1; }
     dkms install -m "$DRV_NAME" -v "$DKMS_VERSION" -k "$KERNEL_VER" --force 2>&1 | tee -a "$LOG_FILE" || { error "DKMS install failed."; exit 1; }
