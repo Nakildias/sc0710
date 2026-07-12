@@ -191,13 +191,18 @@ if [[ "$DO_WORKING_TREE" -eq 1 ]]; then
         makepkg -sei --noconfirm
     else
         makepkg -se --noconfirm
-        msg "Package built: ${BUILD_DIR}/${PKGNAME}"-*.pkg.tar.zst
     fi
 elif [[ "$DO_INSTALL" -eq 1 ]]; then
     makepkg -si --noconfirm
 else
     makepkg -s --noconfirm
-    msg "Package built: ${BUILD_DIR}/${PKGNAME}"-*.pkg.tar.zst
+fi
+
+if [[ "$DO_INSTALL" -eq 0 ]]; then
+    # The EXIT trap removes BUILD_DIR so move it
+    pkgfile=("$BUILD_DIR/${PKGNAME}"-*.pkg.tar.zst)
+    cp "${pkgfile[@]}" "$SCRIPT_DIR/"
+    msg "Package built: ${SCRIPT_DIR}/$(basename "${pkgfile[0]}")"
 fi
 
 if [[ "$DO_VERIFY" -eq 1 ]]; then

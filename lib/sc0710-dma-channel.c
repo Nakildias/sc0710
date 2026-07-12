@@ -278,18 +278,6 @@ static bool sc0710_detect_horizontal_tear(const u8 *buf, u32 width, u32 height, 
  *    to perform transfers.
  */
 
-/* Shared bounds check for the scaler branches, which write a full output
- * frame with no truncation; `what` tags the log line per branch. */
-static bool sc0710_vb_fits(struct sc0710_dev *dev, const char *what,
-	u32 need, unsigned long have)
-{
-	if (need <= have)
-		return true;
-	printk_ratelimited(KERN_ERR "%s: V4L2 buffer %lu too small for %s frame %u\n",
-		dev->name, have, what, need);
-	return false;
-}
-
 /* Copy the contains of the video chain into a video4linux buffer.
  * Return < 0 on error
  * Return number of buffers we copyinto from dma into user buffers.
@@ -307,15 +295,11 @@ static void sc0710_dma_dequeue_video(struct sc0710_dma_channel *ch,
 	struct sc0710_dev *dev = ch->dev;
 	struct sc0710_client *client;
 	unsigned long flags;
-	int scaler_active = 0;
-	u32 src_w = 0, src_h = 0;
-	u32 dst_w = 0, dst_h = 0;
-	u32 scaled_framesize = 0;
 	u32 source_framesize = cached_framesize;
 	u32 source_w = cached_width, source_h = cached_height;
-	int any_auto_scaler = 0;
-	int auto_scaler_gathered = 0;
-	int sw_scaler_allowed = sc0710_software_scaler_allowed(dev);
+	int frame_gathered = 0;
+	int delivered = 0;
+	int stale_clients = 0;
 	const u8 *woven_frame = NULL;
 	u32 streak_required = dma_resync_tear_streak_required ?
 		dma_resync_tear_streak_required : 1;
@@ -332,46 +316,44 @@ static void sc0710_dma_dequeue_video(struct sc0710_dma_channel *ch,
 		return;
 	}
 
+	/* Format negotiation refuses formats the field weave can't produce,
+	 * but the source can go interlaced mid-session; drop rather than
+	 * deliver scrambled frames. */
+	if (cached_interlaced && !dev->pixfmt->weave_ok) {
+		printk_ratelimited(KERN_WARNING "%s: interlaced signal with a capture format the field weave does not support, dropping frames\n",
+			dev->name);
+		return;
+	}
+
 	/* During resolution transitions the detected format (cached_framesize)
 	 * may differ from the DMA chain allocation (total_transfer_size) because
 	 * the channel cannot be resized while STATE_RUNNING.
-	 *
-	 * With auto_scaler enabled we keep delivering frames using the NEW
-	 * detected resolution as the true data size.  The DMA buffer is at
-	 * least as large as the new frame (it was allocated for the old,
-	 * larger resolution), so reading cached_framesize bytes is safe.
-	 *
-	 * With auto_scaler disabled we drop, as delivering mis-sized raw
-	 * data would corrupt the image.
+	 * Delivering mis-sized raw data would corrupt the image, so drop;
+	 * clients renegotiate on the V4L2_EVENT_SOURCE_CHANGE they were sent.
 	 */
 	if (chain->total_transfer_size > 0 &&
 	    cached_framesize != (u32)chain->total_transfer_size) {
-		if (auto_scaler && cached_framesize <= (u32)chain->total_transfer_size) {
-			dprintk(1, "%s() transition: fmt=%u DMA=%d, using detected size %ux%u\n",
-				__func__, cached_framesize, chain->total_transfer_size,
-				source_w, source_h);
-		} else {
-			dprintk(1, "%s() frame size mismatch (%u vs DMA %d) - dropping\n",
-				__func__, cached_framesize, chain->total_transfer_size);
-			return;
-		}
+		dprintk(1, "%s() frame size mismatch (%u vs DMA %d) - dropping\n",
+			__func__, cached_framesize, chain->total_transfer_size);
+		return;
 	}
 
 	/* Pre-allocate staging buffer outside of spinlock context.
 	 * vzalloc/vfree are sleeping calls that must not be called
 	 * while holding spinlocks.  We size the buffer once here for
-	 * the explicit scaler, auto-scaler, and interlaced weaving paths.
+	 * the tear-validation and interlaced weaving paths.
 	 */
-	if ((sw_scaler_allowed || cached_interlaced) &&
-	    (!dev->scaler_staging_buf ||
-	     dev->scaler_staging_size < source_framesize)) {
-		u8 *old = dev->scaler_staging_buf;
-		dev->scaler_staging_buf = vzalloc(source_framesize);
-		if (dev->scaler_staging_buf) {
-			dev->scaler_staging_size = source_framesize;
+	if ((cached_interlaced || ch->tear_validation_frames_left > 0) &&
+	    (!dev->frame_staging_buf ||
+	     dev->frame_staging_size < source_framesize)) {
+		u8 *old = dev->frame_staging_buf;
+
+		dev->frame_staging_buf = vzalloc(source_framesize);
+		if (dev->frame_staging_buf) {
+			dev->frame_staging_size = source_framesize;
 		} else {
-			dev->scaler_staging_size = 0;
-			printk_ratelimited(KERN_ERR "%s: Failed to allocate scaler staging buffer (%u bytes)\n",
+			dev->frame_staging_size = 0;
+			printk_ratelimited(KERN_ERR "%s: Failed to allocate frame staging buffer (%u bytes)\n",
 				dev->name, source_framesize);
 		}
 		if (old)
@@ -382,6 +364,7 @@ static void sc0710_dma_dequeue_video(struct sc0710_dma_channel *ch,
 	    (!dev->weave_staging_buf ||
 	     dev->weave_staging_size < source_framesize)) {
 		u8 *old = dev->weave_staging_buf;
+
 		dev->weave_staging_buf = vzalloc(source_framesize);
 		if (dev->weave_staging_buf) {
 			dev->weave_staging_size = source_framesize;
@@ -398,17 +381,18 @@ static void sc0710_dma_dequeue_video(struct sc0710_dma_channel *ch,
 	 * resync when a persistent tear seam is detected.
 	 */
 	if (ch->tear_validation_frames_left > 0) {
-		if (dev->scaler_staging_buf &&
-		    dev->scaler_staging_size >= source_framesize) {
+		if (dev->pixfmt->tear_ok &&
+		    dev->frame_staging_buf &&
+		    dev->frame_staging_size >= source_framesize) {
 			int gathered = sc0710_dma_chain_dq_to_ptr(ch, chain,
-				dev->scaler_staging_buf, source_framesize);
+				dev->frame_staging_buf, source_framesize);
 			int tear_line = -1;
 			bool tear_detected = false;
 
 			if (gathered == (int)source_framesize) {
-				auto_scaler_gathered = 1;
+				frame_gathered = 1;
 				tear_detected = sc0710_detect_horizontal_tear(
-					dev->scaler_staging_buf, source_w, source_h, &tear_line);
+					dev->frame_staging_buf, source_w, source_h, &tear_line);
 			}
 
 			if (tear_detected) {
@@ -436,30 +420,11 @@ static void sc0710_dma_dequeue_video(struct sc0710_dma_channel *ch,
 
 			ch->tear_validation_frames_left--;
 		} else {
-			/* Validation needs a contiguous frame buffer; disable if unavailable. */
+			/* Validation needs a contiguous frame buffer and the
+			 * YUYV-only tear detector; disable if unavailable. */
 			ch->tear_validation_frames_left = 0;
 			ch->tear_streak_count = 0;
 			ch->tear_last_line = -1;
-		}
-	}
-
-	/* Check if software scaler is active */
-	if (sw_scaler_allowed &&
-	    dev->scaler_mode != SCALER_MODE_DISABLED &&
-	    source_w && source_h) {
-		src_w = source_w;
-		src_h = source_h;
-		sc0710_scaler_get_output_size(dev, src_w, src_h, &dst_w, &dst_h);
-
-		if (dst_w != src_w || dst_h != src_h) {
-			scaled_framesize = dst_w * 2 * dst_h;
-
-			if (dev->scaler_staging_buf) {
-				int gathered = sc0710_dma_chain_dq_to_ptr(ch, chain,
-					dev->scaler_staging_buf, source_framesize);
-				if (gathered > 0)
-					scaler_active = 1;
-			}
 		}
 	}
 
@@ -468,16 +433,16 @@ static void sc0710_dma_dequeue_video(struct sc0710_dma_channel *ch,
 	 * a proper interleaved frame before delivering to clients.
 	 */
 	if (cached_interlaced && source_h >= 2 &&
-	    dev->scaler_staging_buf && dev->scaler_staging_size >= source_framesize &&
+	    dev->frame_staging_buf && dev->frame_staging_size >= source_framesize &&
 	    dev->weave_staging_buf && dev->weave_staging_size >= source_framesize) {
-		if (!auto_scaler_gathered && !scaler_active) {
+		if (!frame_gathered) {
 			int gathered = sc0710_dma_chain_dq_to_ptr(ch, chain,
-				dev->scaler_staging_buf, source_framesize);
+				dev->frame_staging_buf, source_framesize);
 			if (gathered == (int)source_framesize)
-				auto_scaler_gathered = 1;
+				frame_gathered = 1;
 		}
-		if (auto_scaler_gathered || scaler_active) {
-			sc0710_weave_fields(dev->scaler_staging_buf,
+		if (frame_gathered) {
+			sc0710_weave_fields(dev->frame_staging_buf,
 				dev->weave_staging_buf, source_w, source_h);
 			woven_frame = dev->weave_staging_buf;
 		}
@@ -493,6 +458,16 @@ static void sc0710_dma_dequeue_video(struct sc0710_dma_channel *ch,
 
 		if (!client->streaming)
 			continue;
+
+		/* A client still locked to a different resolution gets nothing:
+		 * it was told to renegotiate via V4L2_EVENT_SOURCE_CHANGE, and
+		 * mis-sized raw delivery would corrupt the image. */
+		if (client->stream_width && client->stream_height &&
+		    (client->stream_width != source_w ||
+		     client->stream_height != source_h)) {
+			stale_clients++;
+			continue;
+		}
 
 		spin_lock_irqsave(&client->buffer_lock, buf_flags);
 
@@ -510,76 +485,7 @@ static void sc0710_dma_dequeue_video(struct sc0710_dma_channel *ch,
 			continue;
 		}
 
-		if (scaler_active) {
-			const u8 *scale_src = woven_frame ? woven_frame : dev->scaler_staging_buf;
-			if (!sc0710_vb_fits(dev, "scaled", scaled_framesize, buffer_size)) {
-				spin_unlock_irqrestore(&client->buffer_lock, buf_flags);
-				continue;
-			}
-			sc0710_scaler_scale_frame(scale_src,
-				src_w, src_h, dst, dst_w, dst_h);
-			vb2_set_plane_payload(&vb_buf->vb.vb2_buf, 0, scaled_framesize);
-		} else if (auto_scaler &&
-			   source_w && source_h &&
-			   client->stream_width && client->stream_height &&
-			   (source_w != client->stream_width ||
-			    source_h != client->stream_height) &&
-			   sw_scaler_allowed) {
-			u32 adapt_dst_w = client->stream_width;
-			u32 adapt_dst_h = client->stream_height;
-			u32 adapt_fs = adapt_dst_w * 2 * adapt_dst_h;
-			const u8 *scale_src;
-
-			if (!sc0710_vb_fits(dev, "adapted", adapt_fs, buffer_size)) {
-				spin_unlock_irqrestore(&client->buffer_lock, buf_flags);
-				continue;
-			}
-			if (!dev->scaler_staging_buf) {
-				spin_unlock_irqrestore(&client->buffer_lock, buf_flags);
-				continue;
-			}
-			if (!auto_scaler_gathered) {
-				sc0710_dma_chain_dq_to_ptr(ch, chain,
-					dev->scaler_staging_buf, source_framesize);
-				auto_scaler_gathered = 1;
-			}
-			scale_src = woven_frame ? woven_frame : dev->scaler_staging_buf;
-			sc0710_scaler_scale_frame(scale_src,
-				source_w, source_h,
-				dst, adapt_dst_w, adapt_dst_h);
-			vb2_set_plane_payload(&vb_buf->vb.vb2_buf, 0, adapt_fs);
-			any_auto_scaler = 1;
-		} else if (!auto_scaler &&
-			   dev->scaler_mode == SCALER_MODE_DISABLED &&
-			   source_w && source_h &&
-			   client->stream_width && client->stream_height &&
-			   (source_w != client->stream_width ||
-			    source_h != client->stream_height) &&
-			   sw_scaler_allowed) {
-			u32 dyn_dst_w = client->stream_width;
-			u32 dyn_dst_h = client->stream_height;
-			u32 dyn_fs = dyn_dst_w * 2 * dyn_dst_h;
-			const u8 *scale_src;
-
-			if (!sc0710_vb_fits(dev, "dynamic-res", dyn_fs, buffer_size)) {
-				spin_unlock_irqrestore(&client->buffer_lock, buf_flags);
-				continue;
-			}
-			if (!dev->scaler_staging_buf) {
-				spin_unlock_irqrestore(&client->buffer_lock, buf_flags);
-				continue;
-			}
-			if (!auto_scaler_gathered) {
-				sc0710_dma_chain_dq_to_ptr(ch, chain,
-					dev->scaler_staging_buf, source_framesize);
-				auto_scaler_gathered = 1;
-			}
-			scale_src = woven_frame ? woven_frame : dev->scaler_staging_buf;
-			sc0710_scaler_scale_frame(scale_src,
-				source_w, source_h,
-				dst, dyn_dst_w, dyn_dst_h);
-			vb2_set_plane_payload(&vb_buf->vb.vb2_buf, 0, dyn_fs);
-		} else if (woven_frame) {
+		if (woven_frame) {
 			if (source_framesize <= buffer_size) {
 				memcpy(dst, woven_frame, source_framesize);
 				vb2_set_plane_payload(&vb_buf->vb.vb2_buf, 0, source_framesize);
@@ -605,15 +511,27 @@ static void sc0710_dma_dequeue_video(struct sc0710_dma_channel *ch,
 
 		list_del(&vb_buf->list);
 		vb2_buffer_done(&vb_buf->vb.vb2_buf, VB2_BUF_STATE_DONE);
+		delivered = 1;
 
 		spin_unlock_irqrestore(&client->buffer_lock, buf_flags);
 	}
-	dev->auto_scaler_active = any_auto_scaler;
 	ch->frame_sequence++;
 	spin_unlock_irqrestore(&ch->client_list_lock, flags);
 
-	/* Re-set the buffer timeout */
-	mod_timer(&ch->timeout, jiffies + VBUF_TIMEOUT);
+	/* Count for the zero-copy split only when a client actually got the
+	 * frame; drops and skips count in neither bucket. */
+	if (zero_copy && delivered)
+		ch->zc_frames_copied++;
+
+	/* Re-set the buffer timeout. The placeholder deadline is pushed
+	 * forward only when every streaming client got this frame: while any
+	 * client is still locked to a stale resolution the pending timer is
+	 * left alone, so it fires and keeps those clients fed with
+	 * placeholders until they renegotiate (the timeout handler skips the
+	 * live-resolution clients and re-arms itself). A dead timer (the
+	 * resync stop deletes it) is still re-armed. */
+	if ((delivered && !stale_clients) || !timer_pending(&ch->timeout))
+		mod_timer(&ch->timeout, jiffies + VBUF_TIMEOUT);
 }
 
 
@@ -652,17 +570,325 @@ static void sc0710_dma_dequeue_audio(struct sc0710_dma_channel *ch, struct sc071
  * video is complete. Process this transfered data into video or audio
  * frames.
  */
+/* ---- Zero-copy chain targeting (zero_copy=1) --------------------------- */
+
+struct sc0710_zc_piece {
+	dma_addr_t addr;
+	u32        len;
+};
+
+/* Split the buffer's mapped DMA segments into exactly numAllocations
+ * contiguous pieces summing to the chain's transfer size, so the descriptor
+ * count (and with it the next pointers and the one-time credit programming)
+ * never changes when a chain is retargeted. Piece sizes are free - each
+ * descriptor's length is rewritten anyway - so the frame's bytes in each
+ * segment are tiled with that segment's share of the pieces; a piece only
+ * must not span segments. Returns false when the buffer can't back this
+ * chain (more frame-covering segments than descriptors). */
+static bool sc0710_dma_chain_carve(const struct sc0710_dma_descriptor_chain *chain,
+	const struct sc0710_buffer *buf,
+	struct sc0710_zc_piece pieces[SC0710_MAX_CHAIN_DESCRIPTORS])
+{
+	u32 npieces = chain->numAllocations;
+	u32 remaining = chain->total_transfer_size;
+	u32 used[SC0710_MAX_CHAIN_DESCRIPTORS];
+	u32 nused = 0;
+	u32 i, j = 0;
+
+	if (buf->zc_nsegs == 0 || remaining == 0)
+		return false;
+
+	/* The frame occupies the first total_transfer_size bytes; clip each
+	 * segment to its frame-covering share. */
+	for (i = 0; i < buf->zc_nsegs && remaining; i++) {
+		used[nused] = min(buf->zc_seg[i].len, remaining);
+		remaining -= used[nused];
+		nused++;
+	}
+	if (remaining || nused > npieces)
+		return false;
+
+	for (i = 0; i < nused; i++) {
+		/* Remaining pieces over remaining segments, front-loaded;
+		 * every segment gets at least one. */
+		u32 k = (npieces - j) - (nused - i - 1) * ((npieces - j) / (nused - i));
+		u32 off = 0, chunk;
+
+		while (k--) {
+			chunk = k ? (used[i] - off) / (k + 1) : used[i] - off;
+			if (chunk == 0)
+				return false;
+			pieces[j].addr = buf->zc_seg[i].addr + off;
+			pieces[j].len  = chunk;
+			off += chunk;
+			j++;
+		}
+	}
+
+	return j == npieces;
+}
+
+/* A descriptor's address must change in one store: the fetcher reads
+ * descriptors independently of the completed count, and a torn fetch
+ * mixing old and new address halves would DMA a frame to a wild address. */
+static void sc0710_desc_set_dst(struct sc0710_dma_descriptor *desc, dma_addr_t addr)
+{
+	u64 *dst = (u64 *)(void *)&desc->dst_l;
+
+	WRITE_ONCE(*dst, (u64)addr);
+}
+
+/* Same single-store rule for the writeback address. */
+static void sc0710_desc_set_src(struct sc0710_dma_descriptor *desc, dma_addr_t addr)
+{
+	u64 *src = (u64 *)(void *)&desc->src_l;
+
+	WRITE_ONCE(*src, (u64)addr);
+}
+
+/* Staleness sentinel: move every descriptor's writeback to the other half
+ * of its slot. The device fetches a descriptor's writeback address together
+ * with its data address, so after a rewrite, a writeback landing in the
+ * retired half proves the device consumed a stale (pre-rewrite) descriptor
+ * - the same stale copy whose data address is also old. Caller holds
+ * ch->lock, with the chain's next lap not yet credit-granted. */
+static void sc0710_dma_chain_flip_wbm(struct sc0710_dma_channel *ch,
+	struct sc0710_dma_descriptor_chain *chain)
+{
+	u32 phase = chain->wbm_phase ^ 1;
+	u32 j;
+
+	for (j = 0; j < chain->numAllocations; j++) {
+		struct sc0710_dma_descriptor_chain_allocation *dca =
+			&chain->allocations[j];
+		u32 *slot = dca->wbm_cpu;
+
+		/* Retire the whole slot: the device writes back on EVERY
+		 * descriptor, so the just-serviced lap left writebacks in the
+		 * retiring half (only the last descriptor's are cleared by the
+		 * service path) - residue that would read as staleness when
+		 * this half is scanned after the next flip. */
+		slot[0] = 0;
+		slot[1] = 0;
+		slot[2] = 0;
+		slot[3] = 0;
+		dca->wbm[0] = &slot[phase * 2];
+		dca->wbm[1] = &slot[phase * 2 + 1];
+		sc0710_desc_set_src(dca->desc, dca->wbm_dma + phase * 8);
+	}
+	/* Descriptor rewrites must be DMA-visible before the chain is granted again. */
+	wmb();
+	chain->wbm_phase = phase;
+	ch->zc_wbm_flips++;
+}
+
+/* Count (and clear) writebacks that landed in the retired slot halves:
+ * each is one descriptor the device fetched before the last rewrite. */
+static u32 sc0710_dma_chain_stale_scan(struct sc0710_dma_channel *ch,
+	struct sc0710_dma_descriptor_chain *chain)
+{
+	u32 old = chain->wbm_phase ^ 1;
+	u32 stale = 0;
+	u32 j;
+
+	for (j = 0; j < chain->numAllocations; j++) {
+		u32 *half = chain->allocations[j].wbm_cpu + old * 2;
+
+		if (half[0] || half[1]) {
+			half[0] = 0;
+			half[1] = 0;
+			stale++;
+		}
+	}
+	if (stale) {
+		ch->zc_stale_events++;
+		ch->zc_stale_descs += stale;
+	}
+	return stale;
+}
+
+/* Point the chain's descriptors back at its own coherent allocations.
+ * Caller holds ch->lock and has verified the engine can't be fetching
+ * these descriptors (chain just completed, or engine stopped). */
+static void sc0710_dma_chain_target_scratch(struct sc0710_dma_descriptor_chain *chain)
+{
+	u32 j;
+
+	for (j = 0; j < chain->numAllocations; j++) {
+		struct sc0710_dma_descriptor_chain_allocation *dca =
+			&chain->allocations[j];
+
+		dca->desc->lengthBytes = dca->buf_size;
+		sc0710_desc_set_dst(dca->desc, dca->buf_dma);
+	}
+	/* Descriptor rewrites must be DMA-visible before the chain is granted again. */
+	wmb();
+	chain->target_buf = NULL;
+	chain->target_client = NULL;
+}
+
+/* Take the client's next queued buffer and aim the chain's descriptors at
+ * it. On any failure the buffer returns to the head of the queue and the
+ * chain keeps its current (scratch) target. Caller holds ch->lock and the
+ * chain must be untargeted. Rewriting is safe here because the fetcher is
+ * credit-gated: this chain's next lap is granted only after the service
+ * pass's rewrites have landed, so the engine can't be fetching them. */
+static void sc0710_dma_chain_try_target(struct sc0710_dma_channel *ch, int chain_idx,
+	struct sc0710_client *client)
+{
+	struct sc0710_dev *dev = ch->dev;
+	struct sc0710_dma_descriptor_chain *chain = &ch->chains[chain_idx];
+	struct sc0710_zc_piece pieces[SC0710_MAX_CHAIN_DESCRIPTORS];
+	struct sc0710_buffer *buf = NULL;
+	struct sc0710_dma_descriptor *desc;
+	unsigned long flags;
+	u32 j;
+
+	if (chain->target_buf)
+		return;
+
+	spin_lock_irqsave(&client->buffer_lock, flags);
+	if (!list_empty(&client->buffer_list)) {
+		buf = list_first_entry(&client->buffer_list, struct sc0710_buffer, list);
+		list_del(&buf->list);
+	}
+	spin_unlock_irqrestore(&client->buffer_lock, flags);
+	if (!buf)
+		return;
+
+	if (!sc0710_dma_chain_carve(chain, buf, pieces)) {
+		dprintk(2, "%s() carve failed (%u segs for %u pieces), copy path\n",
+			__func__, buf->zc_nsegs, chain->numAllocations);
+		spin_lock_irqsave(&client->buffer_lock, flags);
+		list_add(&buf->list, &client->buffer_list);
+		spin_unlock_irqrestore(&client->buffer_lock, flags);
+		return;
+	}
+
+	for (j = 0; j < chain->numAllocations; j++) {
+		desc = chain->allocations[j].desc;
+		desc->lengthBytes = pieces[j].len;
+		sc0710_desc_set_dst(desc, pieces[j].addr);
+	}
+	/* Descriptor rewrites must be DMA-visible before the chain is granted again. */
+	wmb();
+	chain->target_buf = buf;
+	chain->target_client = client;
+}
+
+/* Deliver a frame the hardware already placed in the targeted buffer. */
+static void sc0710_dma_deliver_targeted(struct sc0710_dma_channel *ch,
+	struct sc0710_dma_descriptor_chain *chain)
+{
+	struct sc0710_buffer *buf = chain->target_buf;
+
+	/* Point the chain back at scratch before handing the buffer over:
+	 * whether or not a new buffer gets targeted afterwards, the chain
+	 * must never keep DMA-targeting a buffer userspace owns. Safe to
+	 * rewrite here: the chain's next lap is not yet credit-granted. */
+	sc0710_dma_chain_target_scratch(chain);
+
+	vb2_set_plane_payload(&buf->vb.vb2_buf, 0, chain->total_transfer_size);
+	buf->vb.vb2_buf.timestamp = ktime_get_ns();
+	buf->vb.sequence = ch->frame_sequence++;
+	buf->vb.field = V4L2_FIELD_NONE;
+	vb2_buffer_done(&buf->vb.vb2_buf, VB2_BUF_STATE_DONE);
+
+	ch->zc_frames_direct++;
+
+	/* Re-set the buffer timeout */
+	mod_timer(&ch->timeout, jiffies + VBUF_TIMEOUT);
+}
+
+/* Return an undelivered targeted buffer to the head of its client's queue
+ * and point the chain back at scratch. Caller holds ch->lock and the
+ * engine must be quiesced (or the chain just completed). */
+static void sc0710_dma_chain_untarget(struct sc0710_dma_descriptor_chain *chain)
+{
+	struct sc0710_buffer *buf = chain->target_buf;
+	struct sc0710_client *client = chain->target_client;
+	unsigned long flags;
+
+	if (!buf)
+		return;
+
+	sc0710_dma_chain_target_scratch(chain);
+
+	spin_lock_irqsave(&client->buffer_lock, flags);
+	list_add(&buf->list, &client->buffer_list);
+	spin_unlock_irqrestore(&client->buffer_lock, flags);
+}
+
+/* Point every chain back at the scratch ring and requeue targeted buffers.
+ * Callers hold kthread_dma_lock or run after the DMA thread has stopped
+ * (PCI remove), with the XDMA engine stopped and drained, ahead of anything
+ * that frees chains or unmaps client buffers. */
+void sc0710_dma_channel_untarget_all(struct sc0710_dma_channel *ch)
+{
+	int i;
+
+	mutex_lock(&ch->lock);
+	for (i = 0; i < ch->numDescriptorChains; i++)
+		sc0710_dma_chain_untarget(&ch->chains[i]);
+	mutex_unlock(&ch->lock);
+}
+
+/* Zero-copy is engaged per completed chain, and only when the whole frame
+ * can land in the client's buffer exactly as the source produced it: one
+ * streaming client, progressive, client negotiated the source format, no
+ * post-resync frame dropping and no tear-validation window (both read
+ * frames from the scratch ring). Returns the client, or NULL for the copy
+ * path. Caller holds ch->lock. */
+static struct sc0710_client *sc0710_dma_zc_client(struct sc0710_dma_channel *ch,
+	u32 cached_framesize, u32 cached_width, u32 cached_height,
+	u32 cached_interlaced)
+{
+	struct sc0710_client *client, *zc_client = NULL;
+	unsigned long flags;
+	int streaming = 0;
+
+	if (!zero_copy || ch->mediatype != CHTYPE_VIDEO)
+		return NULL;
+	if (ch->zc_stale_trip)
+		return NULL;
+	if (cached_framesize == 0 || cached_interlaced)
+		return NULL;
+	if (ch->skip_next_frames || ch->tear_validation_frames_left)
+		return NULL;
+
+	spin_lock_irqsave(&ch->client_list_lock, flags);
+	list_for_each_entry(client, &ch->client_list, list) {
+		if (!client->streaming)
+			continue;
+		streaming++;
+		zc_client = client;
+	}
+	spin_unlock_irqrestore(&ch->client_list_lock, flags);
+
+	if (streaming != 1 ||
+	    zc_client->stream_width != cached_width ||
+	    zc_client->stream_height != cached_height ||
+	    zc_client->stream_framesize != cached_framesize)
+		return NULL;
+
+	return zc_client;
+}
+
 int sc0710_dma_channel_service(struct sc0710_dma_channel *ch)
 {
 	struct sc0710_dev *dev = ch->dev;
 	struct sc0710_dma_descriptor_chain_allocation *dca;
 	struct sc0710_dma_descriptor_chain *chain;
 	const struct sc0710_format *cached_fmt;
+	struct sc0710_client *zc_client;
 	u32 cached_framesize;
 	u32 cached_width, cached_height;
 	u32 cached_interlaced;
 	u32 wbm[2];
 	u32 v;
+	bool sentinel;
+	bool stale_completion;
+	int consumed = 0;
 	int i;
 
 	mutex_lock(&ch->lock);
@@ -681,8 +907,8 @@ int sc0710_dma_channel_service(struct sc0710_dma_channel *ch)
 		return 0;
 	}
 
-	cached_fmt = dev->fmt;
-	cached_framesize = cached_fmt ? cached_fmt->framesize : 0;
+	cached_fmt = READ_ONCE(dev->fmt);
+	cached_framesize = sc0710_framesize(dev, cached_fmt);
 	cached_width = cached_fmt ? cached_fmt->width : 0;
 	cached_height = cached_fmt ? cached_fmt->height : 0;
 	cached_interlaced = cached_fmt ? cached_fmt->interlaced : 0;
@@ -700,6 +926,11 @@ int sc0710_dma_channel_service(struct sc0710_dma_channel *ch)
 	dprintk(3, "ch#%d    was %d now %d\n", ch->nr, ch->dma_completed_descriptor_count_last, v);
 	ch->dma_completed_descriptor_count_last = v;
 	ch->dma_last_completion_jiffies = jiffies;
+
+	zc_client = sc0710_dma_zc_client(ch, cached_framesize,
+		cached_width, cached_height, cached_interlaced);
+
+	sentinel = zero_copy && ch->mediatype == CHTYPE_VIDEO;
 
 	for (i = 0; i < ch->numDescriptorChains; i++) {
 		chain = &ch->chains[i];
@@ -722,10 +953,46 @@ int sc0710_dma_channel_service(struct sc0710_dma_channel *ch)
 		wbm[0] = *dca->wbm[0];
 		wbm[1] = *dca->wbm[1];
 
+		/* With the sentinel armed, a lap whose last descriptor was
+		 * consumed stale completes into the retired slot half. */
+		stale_completion = false;
+		if (sentinel && !(wbm[0] && wbm[1])) {
+			u32 *half = dca->wbm_cpu + (chain->wbm_phase ^ 1) * 2;
+
+			wbm[0] = half[0];
+			wbm[1] = half[1];
+			stale_completion = wbm[0] && wbm[1];
+		}
+
 		/* If the write back metadata is set, we know the chain is complete, we'll
 		 * need to process a complete video/audio transfer.
 		 */
 		if (wbm[0] && wbm[1]) {
+			if (sentinel && sc0710_dma_chain_stale_scan(ch, chain) &&
+			    !ch->zc_stale_trip) {
+				/* The device consumed a pre-rewrite descriptor:
+				 * its read-ahead outran the credit gating, and a
+				 * frame may already have landed in a delivered
+				 * buffer. Permanently force the copy path; the
+				 * resync rebuilds the ring with the engine
+				 * stopped and returns held buffers. */
+				ch->zc_stale_trip = true;
+				dev->tear_resync_pending = 1;
+				zc_client = NULL;
+				printk(KERN_ERR "%s: [ch%d] zero-copy: stale descriptor "
+					"writeback detected - a delivered frame may have been "
+					"overwritten; disabling zero-copy targeting and "
+					"scheduling a DMA resync\n", dev->name, ch->nr);
+			}
+
+			/* A tripped sentinel holds a targeted chain untouched
+			 * (writeback included): the buffer is still
+			 * driver-owned, and the resync returns it with the
+			 * engine stopped. */
+			if (chain->target_buf && ch->zc_stale_trip)
+				continue;
+
+			consumed++;
 
 			if (sc0710_debug_mode > 2) {
 				printk("%s ch#%d    [%02d] %08x - wbm %08x %08x (DQ) segs: %d\n",
@@ -743,11 +1010,19 @@ int sc0710_dma_channel_service(struct sc0710_dma_channel *ch)
 
 			/* Service the audio, or video.
 			 * Pass cached_framesize to prevent mid-operation format changes.
-			 */
-			if (ch->mediatype == CHTYPE_VIDEO) {
-				sc0710_dma_dequeue_video(ch, chain, cached_framesize,
-					cached_width, cached_height,
-					cached_interlaced);
+			 * A completion seen only through the retired writeback half
+			 * came from a pre-rewrite descriptor: this lap's data went
+			 * to that descriptor's old address, not the scratch ring,
+			 * so there is no frame to deliver - housekeeping still runs
+			 * below so the ring keeps turning until the resync. */
+			if (ch->mediatype == CHTYPE_VIDEO && !stale_completion) {
+				if (chain->target_buf) {
+					sc0710_dma_deliver_targeted(ch, chain);
+				} else {
+					sc0710_dma_dequeue_video(ch, chain, cached_framesize,
+						cached_width, cached_height,
+						cached_interlaced);
+				}
 			} else
 			if (ch->mediatype == CHTYPE_AUDIO) {
 				sc0710_dma_dequeue_audio(ch, chain);
@@ -756,16 +1031,36 @@ int sc0710_dma_channel_service(struct sc0710_dma_channel *ch)
 			/* Reset the descriptor state so we know when it's complete next time. */
 			*(dca->wbm[0]) = 0;
 			*(dca->wbm[1]) = 0;
-			
+
 			/* Write memory barrier to ensure metadata clear is visible
 			 * before any subsequent operations.
 			 */
 			wmb();
+
+			/* Arm the sentinel for the next lap alongside whatever
+			 * rewrite this pass makes (scratch re-point, retarget, or
+			 * the flip itself in measurement mode). */
+			if (sentinel && !ch->zc_stale_trip)
+				sc0710_dma_chain_flip_wbm(ch, chain);
+
+			/* Re-arm this chain for the next lap. */
+			if (zc_client &&
+			    (u32)chain->total_transfer_size == cached_framesize)
+				sc0710_dma_chain_try_target(ch, i, zc_client);
+
+			/* Credit-gated fetching (zero_copy): fund this chain's
+			 * next lap now that every rewrite of this pass has
+			 * landed - the fetcher can never read a stale
+			 * descriptor. Unconditional per consumed completion:
+			 * copy-path and skipped frames use ring credits too. */
+			if (zero_copy && ch->mediatype == CHTYPE_VIDEO)
+				sc_write(ch->dev, 1, ch->reg_sg_credits,
+					chain->numAllocations);
 		}
 	}
 
 	mutex_unlock(&ch->lock);
-	return 0; /* Success */
+	return consumed;
 }
 
 /* Build the scatter gather table chaining all of the chains and decriptors together. */
@@ -780,9 +1075,20 @@ static int sc0710_dma_channel_chains_link(struct sc0710_dma_channel *ch)
 	u8 *wbm_cpu = (u8 *)ch->pt_cpu + PAGE_SIZE;
 	int i, j;
 
+	/* Both pt pages bound the ring: page 1 holds the 32-byte descriptors,
+	 * page 2 the writeback slots at the same stride. */
+	BUILD_BUG_ON(SC0710_MAX_CHANNEL_DESCRIPTOR_CHAINS * SC0710_MAX_CHAIN_DESCRIPTORS *
+		     sizeof(struct sc0710_dma_descriptor) > PAGE_SIZE);
+
 	/* Now that we have all of the dma allocations, we can update the descriptor tables with DMA io addresses. */
 	for (i = 0; i < ch->numDescriptorChains; i++) {
 		chain = &ch->chains[i];
+
+		/* A (re)built ring always starts on the scratch allocations,
+		 * with the writeback ping-pong on its first half. */
+		chain->target_buf = NULL;
+		chain->target_client = NULL;
+		chain->wbm_phase = 0;
 
 		for (j = 0; j < chain->numAllocations; j++) {
 			dca = &chain->allocations[j];
@@ -800,7 +1106,15 @@ static int sc0710_dma_channel_chains_link(struct sc0710_dma_channel *ch)
 				dca->desc->next_h = ((u64)curr_tbl + sizeof(struct sc0710_dma_descriptor)) >> 32;
 			}
 
+			/* The Completed control bit - which the vendor never uses -
+			 * makes the engine raise a completion event (with the IRQ
+			 * block armed, an interrupt) for the descriptor. The
+			 * interrupt-driven service wants one per chain, so the
+			 * last descriptor carries it. */
 			dca->desc->control     = 0xAD4B0000;
+			if (ch->dev->irq_service_active &&
+			    j + 1 == chain->numAllocations)
+				dca->desc->control |= 0x02;
 			dca->desc->lengthBytes = dca->buf_size;
 			dca->desc->src_l       = (u64)curr_wbm;
 			dca->desc->src_h       = (u64)curr_wbm >> 32;
@@ -810,6 +1124,8 @@ static int sc0710_dma_channel_chains_link(struct sc0710_dma_channel *ch)
 			/* Use CPU virtual address calculated from coherent allocation */
 			dca->wbm[0] = (u32 *)wbm_cpu;
 			dca->wbm[1] = (u32 *)(wbm_cpu + sizeof(u32));
+			dca->wbm_cpu = (u32 *)wbm_cpu;
+			dca->wbm_dma = curr_wbm;
 
 			curr_tbl += sizeof(struct sc0710_dma_descriptor);
 			curr_wbm += sizeof(struct sc0710_dma_descriptor);
@@ -965,7 +1281,8 @@ int sc0710_dma_channel_resize(struct sc0710_dev *dev, u32 nr, enum sc0710_channe
 
 	sc0710_dma_chains_free(ch);
 
-	printk(KERN_INFO "%s channel %d resized for framesize %d\n", dev->name, nr, dev->fmt->framesize);
+	printk(KERN_INFO "%s channel %d resized for framesize %d\n",
+		dev->name, nr, sc0710_framesize(dev, dev->fmt));
 
 	if (ch->mediatype == CHTYPE_VIDEO) {
 		ch->numDescriptorChains = DMA_TRANSFER_CHAINS;
@@ -974,7 +1291,7 @@ int sc0710_dma_channel_resize(struct sc0710_dev *dev, u32 nr, enum sc0710_channe
 		 * size, which could be much larger or smaller than any previous allocation.
 		 * Video transfers vary and need adjustment.
 		 */
-		ch->buf_size = dev->fmt->framesize;
+		ch->buf_size = sc0710_framesize(dev, dev->fmt);
 		if (sc0710_debug_mode)
 			printk("Resizing channel for size %d\n", ch->buf_size);
 	} else
@@ -1030,15 +1347,8 @@ void sc0710_dma_channel_free(struct sc0710_dev *dev, u32 nr)
 
 	ch->enabled = 0;
 
-	/* Unregister video and audio subsystems and detach them from this driver. */
-	if (ch->mediatype == CHTYPE_VIDEO) {
-		sc0710_video_unregister(ch);
-	}
-	if (ch->mediatype == CHTYPE_AUDIO) {
-		sc0710_audio_unregister(dev);
-	}
-
-	/* We don't need any DMA allocations, free them. */
+	/* The V4L2/ALSA nodes are taken down by the remove path before any
+	 * hardware teardown; this frees DMA resources only. */
 	sc0710_dma_chains_free(ch);
 
 	if (sc0710_debug_mode)
@@ -1087,7 +1397,44 @@ int sc0710_dma_channel_start_prep(struct sc0710_dma_channel *ch)
 		total_descriptors += ch->chains[i].numAllocations;
 	ch->sg_total_descriptors = total_descriptors;
 
+	/* The writeback ping-pong restarts on clean first halves: residue
+	 * from a previous session must not read as completion or staleness. */
+	for (i = 0; i < ch->numDescriptorChains; i++) {
+		struct sc0710_dma_descriptor_chain *chain = &ch->chains[i];
+		u32 j;
+
+		chain->wbm_phase = 0;
+		for (j = 0; j < chain->numAllocations; j++) {
+			struct sc0710_dma_descriptor_chain_allocation *dca =
+				&chain->allocations[j];
+
+			memset(dca->wbm_cpu, 0, 4 * sizeof(u32));
+			dca->wbm[0] = &dca->wbm_cpu[0];
+			dca->wbm[1] = &dca->wbm_cpu[1];
+			sc0710_desc_set_src(dca->desc, dca->wbm_dma);
+		}
+	}
+
 	return 0;
+}
+
+/* Wait for the engine to finish in-flight work after the run bit is
+ * cleared: the XDMA engine drops the status Busy bit once its descriptor
+ * fetches and payload writes have drained. Zero-copy needs this before
+ * descriptors are rewritten or client buffers handed back; bounded, with
+ * a settle delay as the fallback if Busy never clears. */
+static void sc0710_dma_channel_quiesce(struct sc0710_dma_channel *ch)
+{
+	int i;
+
+	for (i = 0; i < 100; i++) {
+		if (!(sc_read(ch->dev, 1, ch->reg_dma_status1) & 0x01))
+			return;
+		usleep_range(100, 200);
+	}
+	printk(KERN_WARNING "%s: [ch%d] DMA engine still busy after stop, settling blind\n",
+		ch->dev->name, ch->nr);
+	usleep_range(5000, 6000);
 }
 
 /* Stop the hardware, stop all DMA activity. */
@@ -1099,6 +1446,8 @@ int sc0710_dma_channel_stop(struct sc0710_dma_channel *ch)
 	 * timer_delete_sync() is final. */
 	mutex_lock(&ch->lock);
 	sc_write(ch->dev, 1, ch->reg_dma_control_w1c, 0x00000001);
+	if (zero_copy && ch->mediatype == CHTYPE_VIDEO)
+		sc0710_dma_channel_quiesce(ch);
 	sc0710_things_per_second_reset(&ch->bitsPerSecond);
 	sc0710_things_per_second_reset(&ch->descPerSecond);
 	ch->state = STATE_STOPPED;
@@ -1116,11 +1465,40 @@ int sc0710_dma_channel_start(struct sc0710_dma_channel *ch)
 	if (ch->state == STATE_RUNNING)
 		return 0;
 
+	/* Zero-copy retargets descriptors between ring laps, and the fetcher
+	 * prefetches the entire ring - so it is gated with the SGDMA common
+	 * block's credit mode (0x6020, W1S 0x6024 / W1C 0x6028; C2H channels
+	 * are bits 16+): the fetcher only reads descriptors it has been
+	 * granted, and a chain's next lap is granted only after its rewrites
+	 * (see the service loop). Set or clear the enable explicitly so a
+	 * reload without zero-copy never inherits it. */
+	if (ch->mediatype == CHTYPE_VIDEO)
+		sc_write(ch->dev, 1, zero_copy ? 0x6024 : 0x6028, 0x00010000);
+
+	/* Engine-level interrupt enables are already set at prep, but the
+	 * vendor never arms the IRQ block's channel mask (0x2010, W1S 0x2014
+	 * / W1C 0x2018) or the vector mapping (0x20a0/0x20a4). Arm the block
+	 * for the interrupt-driven service; clear it otherwise so reloads
+	 * never inherit it. */
+	if (ch->mediatype == CHTYPE_VIDEO) {
+		if (ch->dev->irq_service_active) {
+			sc_write(ch->dev, 1, 0x20a0, 0);
+			sc_write(ch->dev, 1, 0x20a4, 0);
+			sc_write(ch->dev, 1, 0x2014, 0xff);
+		} else {
+			sc_write(ch->dev, 1, 0x2018, 0xff);
+		}
+	}
+
 	sc_write(ch->dev, 1, ch->reg_dma_control_w1s, 0x00000001);
 
 	/* Write SG credits after run bit is set.
 	 * The XDMA SG fetcher requires the engine to be running
 	 * before credits are accepted.
+	 * With credit mode enabled (zero_copy) this funds exactly one ring
+	 * lap and the service loop funds each following lap chain by chain;
+	 * with the enable clear (the default) the write is inert and the
+	 * ring free-runs.
 	 */
 	sc_write(ch->dev, 1, ch->reg_sg_credits, ch->sg_total_descriptors);
 

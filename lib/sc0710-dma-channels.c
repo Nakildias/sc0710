@@ -92,20 +92,20 @@ void sc0710_dma_channels_stop(struct sc0710_dev *dev)
  */
 void sc0710_program_pipeline_regs(struct sc0710_dev *dev)
 {
-	if (dev->fmt)
-		sc_write(dev, 0, BAR0_00C8, dev->fmt->height);
-	else
-		sc_write(dev, 0, BAR0_00C8, 0x438); /* 1080 default */
+	u32 c8 = dev->fmt ? dev->fmt->height : 0x438;
+	u32 d0 = dev->pixfmt->pipeline_d0;
+
+	sc_write(dev, 0, BAR0_00C8, c8);
 
 	if (dev->board == SC0710_BOARD_ELGATEO_4KP)
 		sc_write(dev, 0, BAR0_00D8, 0x438);
 
-	sc_write(dev, 0, BAR0_00D0, 0x4100);
+	sc_write(dev, 0, BAR0_00D0, d0);
 	sc_write(dev, 0, 0xCC, 0x00000000);
 	if (dev->board != SC0710_BOARD_ELGATEO_4KP)
 		sc_write(dev, 0, BAR0_00DC, 0x00000000);
 	sc_write(dev, 0, BAR0_00D0, 0x4300);
-	sc_write(dev, 0, BAR0_00D0, 0x4100);
+	sc_write(dev, 0, BAR0_00D0, d0);
 
 	if (dev->board == SC0710_BOARD_ELGATEO_4KP)
 		sc_write(dev, 0, 0xEC, 0x00000001);
@@ -151,20 +151,21 @@ int sc0710_dma_channels_start(struct sc0710_dev *dev)
 	return 0;
 }
 
-/* Called every 2m in polled DMA mode, check
- * each dma channel. If writeback metadata suggests a transfer
+/* Check each dma channel. If writeback metadata suggests a transfer
  * has completed, process it and hand the audio/video to linux
- * subsystems.
+ * subsystems. Returns the number of chain completions consumed.
  */
 int sc0710_dma_channels_service(struct sc0710_dev *dev)
 {
-	int i, ret;
+	int i, ret, consumed = 0;
 
 	for (i = 0; i < SC0710_MAX_CHANNELS; i++) {
 		if (!dev->channel[i].enabled)
 			continue;
 		ret = sc0710_dma_channel_service(&dev->channel[i]);
+		if (ret > 0)
+			consumed += ret;
 	}
 
-	return 0;
+	return consumed;
 }

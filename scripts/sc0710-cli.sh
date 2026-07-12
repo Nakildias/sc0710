@@ -93,19 +93,11 @@ save_config() {
         dbg=$(cat /sys/module/sc0710/parameters/debug 2>/dev/null || echo 0)
     fi
     local img=$(cat /sys/module/sc0710/parameters/use_status_images 2>/dev/null || echo 1)
-    local smode=0
-    if [[ -f /sys/module/sc0710/parameters/scaler_mode ]]; then
-        smode=$(cat /sys/module/sc0710/parameters/scaler_mode 2>/dev/null || echo 0)
-    fi
-    local autos=1
-    if [[ -f /sys/module/sc0710/parameters/auto_scaler ]]; then
-        autos=$(cat /sys/module/sc0710/parameters/auto_scaler 2>/dev/null || echo 1)
-    fi
     local pt=0
     if [[ -f /sys/module/sc0710/parameters/procedural_timings ]]; then
         pt=$(cat /sys/module/sc0710/parameters/procedural_timings 2>/dev/null || echo 0)
     fi
-    echo "options sc0710 sc0710_debug_mode=$dbg use_status_images=$img scaler_mode=$smode auto_scaler=$autos procedural_timings=$pt" > /etc/modprobe.d/sc0710-params.conf
+    echo "options sc0710 sc0710_debug_mode=$dbg use_status_images=$img procedural_timings=$pt" > /etc/modprobe.d/sc0710-params.conf
     echo -e "${BLUE}[PERSIST]${NC} Settings saved to /etc/modprobe.d/sc0710-params.conf"
 }
 
@@ -712,8 +704,6 @@ show_help() {
     echo -e "    ${BOLD}-s, --status${NC}     Show module and build status"
     echo -e "    ${BOLD}-d, --debug${NC}      Toggle debug mode on/off"
     echo -e "    ${BOLD}-it, --image-toggle${NC} Toggle status images on/off"
-    echo -e "    ${BOLD}-ss, --software-scaler${NC} Toggle software scaler modes (all cards)"
-    echo -e "    ${BOLD}-as, --toggle-auto-scalar${NC} Toggle automatic safety scaler on/off"
     echo -e "    ${BOLD}-pt, --procedural-timings${NC} Toggle timing calculation mode (merge/procedural/static)"
     echo -e "    ${BOLD}-ec, --edid-config${NC} Open the EDID configuration GUI (4K Pro / MK.2)"
     echo -e "    ${BOLD}-U, --update${NC}     Check for updates and reinstall"
@@ -808,61 +798,74 @@ case "$1" in
         fi
         echo -e "${BLUE}::${NC} Unloading driver..."
 
-        if [[ "$IS_ATOMIC" == "true" ]]; then
-            if rmmod "$DRV_NAME" 2>/dev/null; then
-                echo -e "${GREEN}[OK]${NC} Driver unloaded successfully."
-                exit 0
+        if rmmod "$DRV_NAME" 2>/dev/null; then
+            echo -e "${GREEN}[OK]${NC} Driver unloaded successfully."
+            exit 0
+        fi
+
+        echo -e "${YELLOW}[BUSY]${NC} Module is in use. Stopping PipeWire and consumers..."
+        # A plain kill is not enough: systemd restarts the session manager
+        # within a second and it re-grabs the card's nodes before the rmmod
+        # retry. Stop the user services first - BOTH sockets, or any client
+        # touching the pulse socket resurrects the whole stack (wireplumber
+        # is WantedBy=pipewire.service) - and restart them once unloaded.
+        PW_UIDS=()
+        while read -r pid; do
+            uid=$(stat -c %u "/proc/$pid" 2>/dev/null) || continue
+            PW_UIDS+=("$uid")
+        done < <(pgrep -x pipewire 2>/dev/null || true)
+        for uid in $(printf '%s\n' "${PW_UIDS[@]}" | sort -u); do
+            sudo -u "#$uid" XDG_RUNTIME_DIR="/run/user/$uid" \
+                DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" \
+                systemctl --user stop pipewire.socket pipewire-pulse.socket \
+                    pipewire.service pipewire-pulse.service wireplumber.service || true
+        done
+
+        # Target only THIS driver's video nodes, never the whole of
+        # /dev/video* (holders of webcams etc. are unrelated apps).
+        VID_NODES=()
+        for v in /sys/class/video4linux/video*; do
+            [[ -e "$v" ]] || continue
+            if [[ "$(readlink "$v/device/driver" 2>/dev/null)" == */"$DRV_NAME" ]]; then
+                VID_NODES+=("/dev/$(basename "$v")")
             fi
-            echo -e "${YELLOW}[BUSY]${NC} Module is in use. Stopping PipeWire and consumers..."
-            PW_UIDS=()
-            while read -r pid; do
-                uid=$(stat -c %u "/proc/$pid" 2>/dev/null) || continue
-                PW_UIDS+=("$uid")
-            done < <(pgrep -x pipewire 2>/dev/null || true)
-            for uid in $(printf '%s\n' "${PW_UIDS[@]}" | sort -u); do
-                sudo -u "#$uid" XDG_RUNTIME_DIR="/run/user/$uid" \
-                    systemctl --user stop pipewire.socket pipewire.service wireplumber.service 2>/dev/null || true
-            done
-            for vdev in /dev/video*; do
-                [[ -e "$vdev" ]] && fuser -k "$vdev" >/dev/null 2>&1 || true
-            done
-            for sdev in /dev/snd/*; do
-                [[ -e "$sdev" ]] && fuser -k "$sdev" >/dev/null 2>&1 || true
-            done
-            sleep 1
-            if rmmod "$DRV_NAME" 2>/dev/null; then
-                echo -e "${GREEN}[OK]${NC} Driver unloaded successfully."
-            else
-                sleep 2
-                if rmmod "$DRV_NAME" 2>/dev/null; then
-                    echo -e "${GREEN}[OK]${NC} Driver unloaded successfully."
-                else
-                    echo -e "${RED}[ERROR]${NC} Module is still held by the kernel."
-                    for uid in $(printf '%s\n' "${PW_UIDS[@]}" | sort -u); do
-                        sudo -u "#$uid" XDG_RUNTIME_DIR="/run/user/$uid" \
-                            systemctl --user start pipewire.socket 2>/dev/null || true
-                    done
-                    exit 1
-                fi
+        done
+
+        # The card holds ALSA nodes too; target only THIS card's sound
+        # devices, never the whole of /dev/snd (holders of other cards are
+        # the desktop's audio stack).
+        SND_NODES=()
+        CARD_LINK=$(readlink "/proc/asound/$DRV_NAME" 2>/dev/null || true)
+        if [[ "$CARD_LINK" == card* ]]; then
+            N="${CARD_LINK#card}"
+            SND_NODES=(/dev/snd/pcmC"$N"D* /dev/snd/controlC"$N")
+        fi
+        fuser -k "${VID_NODES[@]}" "${SND_NODES[@]}" >/dev/null 2>&1 || true
+        sleep 1
+
+        if ! rmmod "$DRV_NAME" 2>/dev/null; then
+            sleep 2
+            if ! rmmod "$DRV_NAME" 2>/dev/null; then
+                # Never rmmod -f: force-unloading under an open capture fd
+                # is a guaranteed kernel panic, not a recovery.
+                echo -e "${RED}[ERROR]${NC} Module is still in use; close these and retry:"
+                fuser -v "${VID_NODES[@]}" "${SND_NODES[@]}" 2>&1 || true
+                for uid in $(printf '%s\n' "${PW_UIDS[@]}" | sort -u); do
+                    sudo -u "#$uid" XDG_RUNTIME_DIR="/run/user/$uid" \
+                        DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" \
+                        systemctl --user start pipewire.socket pipewire-pulse.socket 2>/dev/null || true
+                done
+                exit 1
             fi
+        fi
+        echo -e "${GREEN}[OK]${NC} Driver unloaded successfully."
+        if [[ ${#PW_UIDS[@]} -gt 0 ]]; then
             echo -e "${BLUE}[INFO]${NC} Restarting PipeWire..."
             for uid in $(printf '%s\n' "${PW_UIDS[@]}" | sort -u); do
                 sudo -u "#$uid" XDG_RUNTIME_DIR="/run/user/$uid" \
-                    systemctl --user start pipewire.socket 2>/dev/null || true
+                    DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" \
+                    systemctl --user start pipewire.socket pipewire-pulse.socket 2>/dev/null || true
             done
-        else
-            if ! rmmod "$DRV_NAME" 2>/dev/null; then
-                echo -e "${YELLOW}[BUSY]${NC} Standard unload failed. Attempting force..."
-                fuser -k /dev/video* >/dev/null 2>&1 || true
-                sleep 0.5
-                if rmmod -f "$DRV_NAME" 2>/dev/null; then
-                    echo -e "${GREEN}[OK]${NC} Driver force-unloaded successfully."
-                else
-                    echo -e "${RED}[ERROR]${NC} Kernel refused to force unload. A reboot may be required."
-                fi
-            else
-                echo -e "${GREEN}[OK]${NC} Driver unloaded successfully."
-            fi
         fi
         ;;
     --restart)
@@ -1008,39 +1011,6 @@ case "$1" in
                     [[ -n "$RESOLUTION" && "$RESOLUTION" != "$HDMI_LINE" ]] && echo -e "   Resolution: ${RESOLUTION}"
                     [[ -n "$TIMING" ]] && echo -e "   Total timing: ${TIMING}"
                 fi
-                SCALER_LINE=$(echo "$PROC_INFO" | grep "^      scaler:" | head -1)
-                AUTO_SCALER_LINE=$(echo "$PROC_INFO" | grep "^ auto scaler:" | head -1)
-                AUTO_SCALER_CFG_LINE=$(echo "$PROC_INFO" | grep "^ auto scaler cfg:" | head -1)
-                if [[ -n "$SCALER_LINE" ]]; then
-                    echo ""
-                    echo -e "${BLUE}::${NC} ${BOLD}Scaler Information${NC}"
-                    SCALER_MODE=$(echo "$SCALER_LINE" | sed 's/.*scaler: \([^ ]*.*\)/\1/')
-                    [[ "$SCALER_MODE" == "DISABLED" ]] && echo -e "   Software Scaler: ${YELLOW}DISABLED${NC}" || echo -e "   Software Scaler: ${GREEN}${SCALER_MODE}${NC}"
-                    if [[ -n "$AUTO_SCALER_LINE" ]]; then
-                        AUTO_VAL=$(echo "$AUTO_SCALER_LINE" | sed 's/.*auto scaler: \(.*\)/\1/')
-                        echo "$AUTO_VAL" | grep -q "ON" && echo -e "   Auto Scaler: ${GREEN}ON (Prevented Kernel Panic)${NC}" || echo -e "   Auto Scaler: ${BLUE}OFF${NC}"
-                    fi
-                    # Auto-Scaler Config and Dynamic Resolution are mutually exclusive (only one active at a time)
-                    if [[ -n "$AUTO_SCALER_CFG_LINE" ]]; then
-                        AUTO_CFG_VAL=$(echo "$AUTO_SCALER_CFG_LINE" | sed 's/.*auto scaler cfg: \([A-Z]*\).*/\1/')
-                        if [[ "$AUTO_CFG_VAL" == "ENABLED" ]]; then
-                            echo -e "   Auto-Scaler Config: ${GREEN}ENABLED${NC}"
-                        else
-                            echo -e "   Auto-Scaler Config: ${YELLOW}DISABLED${NC}"
-                        fi
-                    fi
-                    DYN_RES_LINE=$(echo "$PROC_INFO" | grep "^ dynamic res:" | head -1)
-                    if [[ -n "$DYN_RES_LINE" ]]; then
-                        DYN_RES_VAL=$(echo "$DYN_RES_LINE" | sed 's/.*dynamic res: \([A-Z]*\).*/\1/')
-                        if [[ "$DYN_RES_VAL" == "ACTIVE" ]]; then
-                            echo -e "   Dynamic Resolution: ${GREEN}ACTIVE${NC}"
-                        else
-                            echo -e "   Dynamic Resolution: ${YELLOW}INACTIVE${NC}"
-                        fi
-                    else
-                        echo -e "   Dynamic Resolution: ${YELLOW}INACTIVE${NC}"
-                    fi
-                fi
             else
                 echo -e "   ${RED}○${NC} Could not read HDMI status"
             fi
@@ -1134,34 +1104,6 @@ case "$1" in
         else
             echo 1 > /sys/module/sc0710/parameters/use_status_images
             echo -e "${GREEN}[OK]${NC} Status images enabled"
-        fi
-        save_config
-        ;;
-    -ss|--software-scaler)
-        if [[ ! -f /sys/module/sc0710/parameters/scaler_mode ]]; then
-            echo -e "${RED}[ERROR]${NC} Module not loaded. Load it first with: sc0710-cli --load"
-            exit 1
-        fi
-        CURRENT=$(cat /sys/module/sc0710/parameters/scaler_mode)
-        case "${CURRENT:-0}" in
-            0) echo 1 > /sys/module/sc0710/parameters/scaler_mode; echo -e "${GREEN}[OK]${NC} Software Scaler enabled: Upscale Mode" ;;
-            1) echo 2 > /sys/module/sc0710/parameters/scaler_mode; echo -e "${YELLOW}[OK]${NC} Software Scaler: Downscale Mode" ;;
-            *) echo 0 > /sys/module/sc0710/parameters/scaler_mode; echo -e "${BLUE}[OK]${NC} Software Scaler disabled" ;;
-        esac
-        save_config
-        ;;
-    -as|--toggle-auto-scaler|--toggle-auto-scalar)
-        if [[ ! -f /sys/module/sc0710/parameters/auto_scaler ]]; then
-            echo -e "${RED}[ERROR]${NC} auto_scaler parameter not available."
-            exit 1
-        fi
-        CURRENT=$(cat /sys/module/sc0710/parameters/auto_scaler)
-        if [[ "$CURRENT" == "1" ]]; then
-            echo 0 > /sys/module/sc0710/parameters/auto_scaler
-            echo -e "${YELLOW}[OK]${NC} Automatic safety scaler disabled"
-        else
-            echo 1 > /sys/module/sc0710/parameters/auto_scaler
-            echo -e "${GREEN}[OK]${NC} Automatic safety scaler enabled"
         fi
         save_config
         ;;

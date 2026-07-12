@@ -163,14 +163,12 @@ Installed by the automatic installer, the AUR package, and the NixOS module. Pro
 
 | Command | Alias | Description |
 |---------|-------|-------------|
-| `--status` | `-s` | Module state, card info, signal format, scaler, ECP5 status (4K Pro), DKMS or build service status |
+| `--status` | `-s` | Module state, card info, signal format, ECP5 status (4K Pro), DKMS or build service status |
 | `--load` | `-l` | Load the module. On 4K Pro, verifies ECP5 programming after load |
 | `--unload` | `-u` | Unload the module (stops PipeWire consumers if the module is busy) |
 | `--restart` | | Full reload. On 4K Pro, runs ECP5 programming with retries |
 | `--debug` | `-d` | Toggle verbose `dmesg` logging |
 | `--image-toggle` | `-it` | Toggle No Signal images vs colorbars |
-| `--software-scaler` | `-ss` | Toggle software scaler modes (all cards) |
-| `--toggle-auto-scalar` | `-as` | Toggle automatic safety scaler |
 | `--procedural-timings` | `-pt` | Cycle timing mode: merge → procedural-only → static-only |
 | `--update` | `-U` | Pull latest source, rebuild, reload. On 4K Pro, re-runs ECP5 programming with retries |
 | `--rebuild` | | *(Atomic only)* Force rebuild the module for the running kernel |
@@ -198,10 +196,99 @@ Same command as above — checks module, DKMS, CLI, systemd units, config files,
 * **Status images** — storage-efficient No Signal / No Device screens
 * **Connection sensing** — distinguishes unplugged cables from signal loss (not 100% reliable)
 * **Video formats** — 4K60, 1440p144, 1080p240. **EDID Source control (Internal/Display/Merged) on both cards** via the `EDID Source` V4L2 control (`v4l2-ctl --set-ctrl=edid_source=N`). **Custom EDID read/write on both cards** via `VIDIOC_G_EDID`/`VIDIOC_S_EDID` — the 4K Pro through its EEPROM (`edid=` boot param, profiles from `scripts/extract-firmware.sh`), the MK.2 through its MCU (runtime only). The graphical **EDID Config app** (`sc0710-cli --edid-config`) manages this for both cards and can fetch Elgato's official EDID profiles
-* **Mode-switch stability** — DMA resync, restart validation, and watchdog recovery during resolution/refresh changes
-* **Safety scaling** — auto-scaler and dynamic-resolution paths reduce crash-prone transitions
+* **Mode-switch stability** — DMA resync, restart validation, and watchdog recovery during resolution/refresh changes; apps are told to renegotiate via `V4L2_EVENT_SOURCE_CHANGE`
 * **Timing controls** — runtime modes (`merge`, `procedural-only`, `static-only`) via CLI
 * **Debug dumps** — `sc0710-cli --dump` collects distro, kernel, `lspci`, driver version, and service state for issue reports
+
+### Pixel formats (YUYV 4:2:2 and native BGR24 4:4:4)
+
+Two capture formats are offered; pick per app over V4L2, no reload:
+
+* **`YUYV` (default)** — packed 4:2:2, 2 bytes/pixel. Lowest bandwidth, always available.
+* **`BGR24`** — native **4:4:4**, 3 bytes/pixel: the card's full-chroma mode (Elgato markets
+  it "RGB24 8-bit 4:4:4"; the bytes are BGR-ordered). ~50 % more PCIe/RAM bandwidth than
+  YUYV, so it is opt-in. Reported as **full-range sRGB**, so color-managed apps take the
+  bytes as captured instead of range-expanding them.
+
+```bash
+v4l2-ctl -d /dev/video0 --list-formats                     # YUYV + BGR3
+v4l2-ctl -d /dev/video0 --set-fmt-video=pixelformat=BGR3   # select 4:4:4
+# OBS / ffmpeg pick it via the normal format menu / -pixel_format bgr24
+```
+
+The format is device-wide (one card, one DMA pipeline) and can only be changed while no app
+is capturing or holding buffers (a change attempt then returns `EBUSY`). Interlaced sources
+are YUYV-only: a `BGR24` request is clamped to YUYV, and if a signal turns interlaced
+mid-session under `BGR24` the driver delivers no frames until the format or signal changes.
+For **bit-accurate** RGB capture, also present an RGB-only EDID (below): on a YCbCr wire the
+card round-trips RGB→YCbCr→RGB and loses ~2 codes; on an RGB wire it captures within ±1 of
+bit-perfect.
+
+### Choosing the presented EDID
+
+The card presents an EDID to the HDMI source; changing it changes what the source outputs
+(resolution, and RGB vs YCbCr). Two ways:
+
+* **`edid=<name>` module param** — loads `/lib/firmware/sc0710/edid/<name>.bin` at module
+  load (profiles installed by `extract-firmware.sh`), e.g. `edid=1440p`.
+* **`VIDIOC_S_EDID` at runtime** — `v4l2-ctl --set-edid`. For a **raw binary** EDID file add
+  `,format=raw`; the default expects the hex-text format that `--get-edid` produces:
+
+```bash
+v4l2-ctl -d /dev/video0 --get-edid                          # dump current (hex text)
+v4l2-ctl -d /dev/video0 --set-edid=file=my-edid.bin,format=raw   # write a raw .bin
+```
+
+An RGB-only EDID (color-encoding bits `00`, no YCbCr flags) makes the source output RGB
+4:4:4 — the wire to pair with `BGR24` for bit-accurate 4:4:4 capture. The source
+renegotiates ~8–10 s after a write (a brief re-detect of the old mode first is normal).
+
+### Low-latency capture
+
+* **Interrupt-driven completion (`irq_service=1`, default)** — the card's MSI wakes
+  the DMA service when a frame completes, replacing the 2 ms completion polling;
+  completion latency drops to interrupt latency and the idle polling load goes away.
+  Polling survives as a 100 ms watchdog tick: completed work the watchdog finds that
+  no interrupt announced is logged and counted (`irq:` line in `/proc/sc0710-state`),
+  and three consecutive misses drop the session back to 2 ms polling with a KERN_ERR
+  in dmesg. `irq_service=0` restores classic polling; failed MSI allocation logs a
+  warning and falls back to polling. (`thread_dma_poll_interval_ms` remains as an
+  override for the service tick; the default auto-selects.)
+* **`zero_copy=1` (experimental)** — DMA frames straight into the capturing app's buffers, skipping
+  the per-frame copy (~1.5–3 ms at 4K). **Strict single-client mode**: one streaming
+  app per video node (a second gets `EBUSY`). Load-time only. The DMA descriptor fetcher is credit-gated in this mode —
+  early hardware testing caught it consuming stale (pre-rewrite) descriptors and
+  writing into already-delivered buffers; with credits a chain is only fetchable after
+  its rewrites, and a permanent writeback sentinel trips loudly (and falls back to the
+  copy path) if a stale fetch ever happens anyway. Validated on hardware: a userspace
+  mutation checker (checksumming app-owned buffers) runs clean, with zero sentinel
+  events across long captures. For full engagement keep more buffers queued than the
+  DMA ring has chains (5+, e.g. `--stream-mmap=8`; most players do) — a thin queue
+  routes starved laps through the copy path (`zc frames:` in `/proc/sc0710-state`
+  shows the direct/copied split). Buffers can be exported as dmabufs
+  (`VIDIOC_EXPBUF`) for GPU-direct consumers. `zero_copy=0` (the default) keeps the
+  vendor's free-running ring, byte-identical.
+
+**Zero-copy buffer eligibility:** a frame is DMA'd directly into a buffer when the
+buffer's DMA segments fit the chain's descriptor budget (`zc_split=`, default 8, max
+32); the frame is tiled across the buffer's own segments, so fragmentation within the
+budget is fine. Buffers over the 32-segment hard limit are refused at QBUF with a
+`zero-copy: buffer memory too fragmented` dmesg line; buffers between the budget and
+the limit are accepted but served through the copy path (visible in the `zc frames:`
+split — raise `zc_split=` to widen the budget). If buffers are too fragmented, fixes,
+best first:
+
+```bash
+# Give ONLY the capture card a translating IOMMU domain (runtime, reversible,
+# no reboot; resets to the boot default on reboot). VFIO passthrough and every
+# other host device are unaffected.
+G=$(basename $(readlink /sys/bus/pci/devices/<BDF>/iommu_group))
+echo <BDF> | sudo tee /sys/bus/pci/devices/<BDF>/driver/unbind
+echo DMA-FQ | sudo tee /sys/kernel/iommu_groups/$G/type
+echo <BDF> | sudo tee /sys/bus/pci/drivers_probe
+# or: defragment and retry
+sudo sh -c 'echo 1 > /proc/sys/vm/compact_memory'
+```
 
 ## Troubleshooting
 

@@ -76,7 +76,6 @@
 
 /* Global debug mode - extern declaration for use in all source files */
 extern unsigned int sc0710_debug_mode;
-extern unsigned int auto_scaler;
 extern unsigned int procedural_timings;
 extern unsigned int dma_resync_validate_frames;
 extern unsigned int dma_resync_tear_streak_required;
@@ -87,6 +86,14 @@ extern unsigned int refresh_rate_resync_delay_ms;
 /* EDID profile to present to the HDMI source (edid= module param); empty = factory default. */
 extern char *sc0710_edid_profile;
 
+/* Zero-copy capture (zero_copy= module param, load-time only): DMA directly
+ * into the single streaming client's buffers. */
+extern unsigned int zero_copy;
+
+/* Zero-copy scratch split (zc_split= module param, load-time only):
+ * descriptors per video chain; 0 = keep the default 4 MiB segmenting. */
+extern unsigned int zc_split;
+
 #define SC0710_MAX_CHANNELS 2
 
 /* A chain contains 1..SC0710_MAX_CHAIN_DESCRIPTORS descriptors,
@@ -94,7 +101,7 @@ extern char *sc0710_edid_profile;
  * target the buffer pieces.
  */
 #define SC0710_MAX_CHANNEL_DESCRIPTOR_CHAINS 4
-#define SC0710_MAX_CHAIN_DESCRIPTORS 8
+#define SC0710_MAX_CHAIN_DESCRIPTORS 32
 
 #define UNSET (-1U)
 
@@ -110,13 +117,6 @@ extern char *sc0710_edid_profile;
 #define SC0710_BOARD_UNKNOWN             0
 #define SC0710_BOARD_ELGATEO_4KP60_MK2   1
 #define SC0710_BOARD_ELGATEO_4KP         2
-
-/* Software scaler modes (available on supported cards) */
-enum sc0710_scaler_mode {
-	SCALER_MODE_DISABLED = 0,
-	SCALER_MODE_UPSCALE  = 1,  /* Scale everything to 3840x2160 */
-	SCALER_MODE_DOWNSCALE = 2, /* Scale everything to 1920x1080 */
-};
 
 enum sc0710_timing_mode {
 	TIMING_MODE_MERGE = 0,           /* Use static match + dynamic fallback */
@@ -171,6 +171,15 @@ struct sc0710_buffer
 	/* sc0710 specific */
 	const struct sc0710_format *fmt;
 	u32 expected_framesize;
+
+	/* Zero-copy: DMA-segment snapshot of the mapped plane, taken at
+	 * buf_prepare. zc_nsegs == 0 means the plane is not directly
+	 * DMA-addressable (non-zero-copy queue, or mapping failed). */
+	u32 zc_nsegs;
+	struct {
+		dma_addr_t addr;
+		u32        len;
+	} zc_seg[SC0710_MAX_CHAIN_DESCRIPTORS];
 };
 
 struct sc0710_dmaqueue {
@@ -217,6 +226,9 @@ enum sc0710_channel_state_e
  * 4K = 16588800
  * allocations = 4K / allocsegment
  */
+struct sc0710_client;
+struct sc0710_buffer;
+
 struct sc0710_dma_descriptor_chain
 {
 	int enabled;
@@ -231,7 +243,18 @@ struct sc0710_dma_descriptor_chain
 		u64                          *buf_cpu;  /* Virtual address */
 		dma_addr_t                    buf_dma;  /* Physical address - accessible to the PCIe endpoint */
 		u32                          *wbm[2];   /* Write back metadata where we can monitor descriptor completion */
+		u32                          *wbm_cpu;  /* Writeback base; wbm[] picks the active half */
+		dma_addr_t                    wbm_dma;  /* Writeback slot base (device) */
 	} allocations[SC0710_MAX_CHAIN_DESCRIPTORS];
+
+	/* Zero-copy: non-NULL while the chain's descriptors point at a client's
+	 * buffer instead of the coherent scratch allocations above. Written only
+	 * under ch->lock. */
+	struct sc0710_buffer *target_buf;
+	struct sc0710_client *target_client;
+	/* Which half of each descriptor's 16-byte writeback area is active;
+	 * flipped alongside every chain rewrite (staleness sentinel). */
+	u32 wbm_phase;
 };
 
 /* Forward declaration for multi-client support */
@@ -253,9 +276,9 @@ struct sc0710_client {
 	u32                      stream_height;
 	u32                      stream_framesize;
 
-	/* Per-client VB2 queue for multi-app support */
+	/* Per-client VB2 queue for multi-app support; q->lock is the node's
+	 * ioctl mutex (ch->v4l2_lock), shared by all clients of the channel. */
 	struct vb2_queue         vb2_queue;
-	struct mutex             vb2_lock;       /* Lock for this client's queue */
 };
 
 struct sc0710_dma_channel
@@ -329,6 +352,20 @@ struct sc0710_dma_channel
 	int                          tear_last_line;
 	u32                          tear_resync_retries_left;
 
+	/* Zero-copy delivery counters (frames DMA'd straight into a client
+	 * buffer vs. delivered through the copy path while zero_copy=1). */
+	u64                          zc_frames_direct;
+	u64                          zc_frames_copied;
+
+	/* Staleness sentinel: every chain rewrite moves the descriptors'
+	 * writeback to the other half of their slots, so a write landing in
+	 * the retired half proves the device consumed a pre-rewrite (stale)
+	 * descriptor. A trip permanently forces the copy path. */
+	bool                         zc_stale_trip;
+	u64                          zc_wbm_flips;
+	u64                          zc_stale_events;
+	u64                          zc_stale_descs;
+
 	/* Channel 1 */
 	struct sc0710_audio_dev     *audio_dev;
 };
@@ -383,6 +420,25 @@ struct sc0710_format
 	struct v4l2_dv_timings dv_timings;
 };
 
+/* A selectable capture pixel format: everything the driver forks on per
+ * format lives in this row, so adding a format is one table entry.
+ * Packed formats only; a planar format (NV12) needs its own sizing. */
+struct sc0710_pixfmt {
+	u32  fourcc;
+	u32  bpp;         /* Bytes per pixel */
+	u32  pipeline_d0; /* BAR0 0xD0 capture-format selector value */
+	/* Full-range RGB output: colorimetry reports sRGB (the detected YCbCr
+	 * colorimetry does not describe it), and black is all-zero bytes. */
+	bool rgb;
+	/* The interlaced field weave understands this memory layout. */
+	bool weave_ok;
+	/* The horizontal-tear detector understands this memory layout. */
+	bool tear_ok;
+};
+
+extern const struct sc0710_pixfmt sc0710_pixfmts[];
+extern const unsigned int sc0710_pixfmts_count;
+
 struct sc0710_audio_dev
 {
 	struct sc0710_dev         *dev;
@@ -391,14 +447,18 @@ struct sc0710_audio_dev
 	snd_pcm_uframes_t          buffer_ptr;
 	snd_pcm_uframes_t          period_pos;
 	bool                       running;
-	bool                       silence_active;
+	unsigned long              last_sample_jiffies; /* Last real-sample delivery */
 	struct delayed_work        silence_work;
 };
 
 struct sc0710_dev {
 	struct list_head           devlist;
 
-	atomic_t                   refcount;
+	/* Set at the top of PCI remove. Every file-handle-reachable hardware
+	 * path re-checks it after taking its serializing mutex (signalMutex or
+	 * kthread_dma_lock) and bails with -ENODEV, so remove can drain
+	 * in-flight holders and then tear the hardware down. */
+	bool                       disconnected;
 
 	/* board details */
 	int                        nr;
@@ -437,6 +497,9 @@ struct sc0710_dev {
 	u32                        pixelLineH, pixelLineV; /* HDMI line format */
 	u32                        width, height;    /* Actual display */
 	u32                        interlaced;
+	/* Selected V4L2 output format (device-wide, changed only while idle):
+	 * a row of sc0710_pixfmts, never NULL; YUYV is the default. */
+	const struct sc0710_pixfmt *pixfmt;
 	const struct sc0710_format *fmt;
 	const struct sc0710_format *last_fmt;  /* Last active format for placeholders */
 	/* Fallback for unlisted timings: two slots, alternated on each timing
@@ -453,13 +516,11 @@ struct sc0710_dev {
 	u32                        unlocked_no_timing_count; /* Consecutive polls with no lock and no timing */
 	u32                        lock_dropout_count;       /* 4K Pro: consecutive polls with no lock while previously locked */
 
-	/* Software scaler */
-	enum sc0710_scaler_mode    scaler_mode;
-	u8                        *scaler_staging_buf;  /* Contiguous frame for scaling input */
-	u32                        scaler_staging_size;  /* Current allocation size */
+	/* Frame staging (interlaced weave input, tear validation) */
+	u8                        *frame_staging_buf;   /* Contiguous gather of one source frame */
+	u32                        frame_staging_size;   /* Current allocation size */
 	u8                        *weave_staging_buf;   /* Destination for interlaced field weaving */
 	u32                        weave_staging_size;
-	u32                        auto_scaler_active;   /* Was auto-scaler triggered this frame? */
 
 	/* Procamp */
 	s32                        brightness;
@@ -478,11 +539,39 @@ struct sc0710_dev {
 	int reconfig_in_progress;
 	int tear_resync_pending;
 
+	/* Interrupt-driven DMA service (irq_service) */
+	bool irq_requested;
+	bool irq_service_active;   /* line requested via MSI and service enabled */
+	bool irq_dead;             /* tripwire: interrupts lost, polling again */
+	wait_queue_head_t dma_wq;
+	atomic_t dma_irq_pending;
+	u64  irq_count;
+	u64  irq_missed;
+	u64  dma_completions;
+	u32  irq_status_seen;      /* OR of engine statuses sampled in the handler */
+
 	/* Debounce: require consecutive stable polls before triggering reconfig */
 	u32 timing_stable_count;
 	u32 pending_pixelLineH, pending_pixelLineV;
 	u8 pending_hint_interval, pending_hint_flags;
 };
+
+/* Bytes per pixel of the selected output format. */
+static inline u32 sc0710_bpp(const struct sc0710_dev *dev)
+{
+	return dev->pixfmt->bpp;
+}
+
+/* Frame size of fmt under the selected pixel format, computed live so a
+ * format change while a signal is locked (which does not re-detect timing)
+ * can't leave the DMA sizing stale. 0 when fmt is NULL. Callers racing the
+ * HDMI thread must pass their own snapshot of dev->fmt, not dev->fmt
+ * itself: dev->pixfmt only changes while idle, dev->fmt does not. */
+static inline u32 sc0710_framesize(const struct sc0710_dev *dev,
+	const struct sc0710_format *fmt)
+{
+	return fmt ? fmt->width * dev->pixfmt->bpp * fmt->height : 0;
+}
 
 struct sc0710_fh
 {
@@ -550,6 +639,7 @@ int  sc0710_dma_channel_service(struct sc0710_dma_channel *ch);
 int  sc0710_dma_channel_start_prep(struct sc0710_dma_channel *ch);
 int  sc0710_dma_channel_start(struct sc0710_dma_channel *ch);
 int  sc0710_dma_channel_stop(struct sc0710_dma_channel *ch);
+void sc0710_dma_channel_untarget_all(struct sc0710_dma_channel *ch);
 int  sc0710_dma_channel_resize(struct sc0710_dev *dev, u32 nr, enum sc0710_channel_dir_e direction, u32 baseaddr,
 	enum sc0710_channel_type_e mediatype);
 enum sc0710_channel_state_e sc0710_dma_channel_state(struct sc0710_dma_channel *ch);
@@ -570,6 +660,7 @@ s64  sc0710_things_per_second_query(struct sc0710_things_per_second *tps);
 
 /* video.c */
 void sc0710_video_unregister(struct sc0710_dma_channel *ch);
+void sc0710_video_disconnect(struct sc0710_dma_channel *ch);
 int  sc0710_video_register(struct sc0710_dma_channel *ch);
 void sc0710_video_free_status_frames(void);
 void sc0710_video_notify_source_change(struct sc0710_dev *dev);
@@ -593,13 +684,3 @@ int  sc0710_audio_register(struct sc0710_dev *dev);
 void sc0710_audio_unregister(struct sc0710_dev *dev);
 int  sc0710_audio_deliver_samples(struct sc0710_dev *dev, struct sc0710_dma_channel *ch,
         const u8 *buf, int bitdepth, int strideBytes, int channels, int samplesPerChannel);
-void sc0710_audio_on_signal_lost(struct sc0710_dev *dev);
-void sc0710_audio_on_signal_restored(struct sc0710_dev *dev);
-
-/* -scaler.c (software scaler) */
-bool sc0710_software_scaler_allowed(const struct sc0710_dev *dev);
-void sc0710_scaler_get_output_size(struct sc0710_dev *dev,
-	u32 src_width, u32 src_height, u32 *out_width, u32 *out_height);
-int  sc0710_scaler_scale_frame(const u8 *src, u32 src_width, u32 src_height,
-	u8 *dst, u32 dst_width, u32 dst_height);
-const char *sc0710_scaler_mode_name(enum sc0710_scaler_mode mode);

@@ -147,6 +147,60 @@ static enum v4l2_quantization sc0710_get_v4l2_quantization(struct sc0710_dev *de
 	return V4L2_QUANTIZATION_DEFAULT;
 }
 
+/* The selectable capture formats. 0xD0 bit 6 selects the packed 4:4:4
+ * capture format (BGR byte order); clear = YUYV 4:2:2. */
+const struct sc0710_pixfmt sc0710_pixfmts[] = {
+	{
+		.fourcc      = V4L2_PIX_FMT_YUYV,  /* packed 4:2:2, default */
+		.bpp         = 2,
+		.pipeline_d0 = 0x4100,
+		.weave_ok    = true,
+		.tear_ok     = true,
+	}, {
+		.fourcc      = V4L2_PIX_FMT_BGR24, /* packed 4:4:4 */
+		.bpp         = 3,
+		.pipeline_d0 = 0x4140,
+		.rgb         = true,
+	},
+};
+
+const unsigned int sc0710_pixfmts_count = ARRAY_SIZE(sc0710_pixfmts);
+
+/* The table row for fourcc, or NULL when unknown. */
+static const struct sc0710_pixfmt *sc0710_pixfmt_find(u32 fourcc)
+{
+	unsigned int i;
+
+	for (i = 0; i < sc0710_pixfmts_count; i++) {
+		if (sc0710_pixfmts[i].fourcc == fourcc)
+			return &sc0710_pixfmts[i];
+	}
+	return NULL;
+}
+
+/* Fill the colorimetry fields for the negotiated pixel format.
+ * RGB formats reach userspace as full-range bytes (measured black 0, white
+ * 254-255), so they are tagged full-range sRGB; the detected YCbCr
+ * colorimetry does not describe the RGB output and would make color-managed
+ * apps range-expand it. */
+static void sc0710_fill_colorimetry(struct sc0710_dev *dev,
+	const struct sc0710_pixfmt *pf, struct v4l2_pix_format *pix)
+{
+	if (pf->rgb) {
+		pix->colorspace = V4L2_COLORSPACE_SRGB;
+		pix->xfer_func = V4L2_XFER_FUNC_SRGB;
+		pix->ycbcr_enc = V4L2_YCBCR_ENC_DEFAULT;
+		pix->quantization = force_quantization == 1 ?
+			V4L2_QUANTIZATION_LIM_RANGE :
+			V4L2_QUANTIZATION_FULL_RANGE;
+		return;
+	}
+	pix->colorspace = sc0710_get_v4l2_colorspace(dev);
+	pix->xfer_func = sc0710_get_v4l2_xfer_func(dev);
+	pix->ycbcr_enc = sc0710_get_v4l2_ycbcr_enc(dev);
+	pix->quantization = sc0710_get_v4l2_quantization(dev);
+}
+
 #define FILL_MODE_COLORBARS 0
 #define FILL_MODE_GREENSCREEN 1
 #define FILL_MODE_BLUESCREEN 2
@@ -316,24 +370,13 @@ void sc0710_video_free_status_frames(void)
 	mutex_unlock(&status_frames_lock);
 }
 
-/* Compute the effective output dimensions, accounting for the software scaler.
- * When the scaler is active, the output resolution differs
- * from the source resolution.  When disabled, output = source.
- */
+/* Compute the output dimensions and frame size for a detected format. */
 static void sc0710_get_effective_size(struct sc0710_dev *dev,
 	const struct sc0710_format *fmt, u32 *width, u32 *height, u32 *framesize)
 {
-	u32 w = fmt->width;
-	u32 h = fmt->height;
-
-	if (sc0710_software_scaler_allowed(dev) &&
-	    dev->scaler_mode != SCALER_MODE_DISABLED) {
-		sc0710_scaler_get_output_size(dev, w, h, &w, &h);
-	}
-
-	*width = w;
-	*height = h;
-	*framesize = w * 2 * h;
+	*width = fmt->width;
+	*height = fmt->height;
+	*framesize = sc0710_framesize(dev, fmt);
 }
 
 static void fill_frame(struct sc0710_dma_channel *ch,
@@ -839,10 +882,9 @@ static int vidioc_g_input(struct file *file, void *priv, unsigned int *i)
 
 static int vidioc_enum_fmt_vid_cap(struct file *file, void *priv, struct v4l2_fmtdesc *f)
 {
-	if (f->index != 0)
+	if (f->index >= sc0710_pixfmts_count)
 		return -EINVAL;
-
-	f->pixelformat = V4L2_PIX_FMT_YUYV;
+	f->pixelformat = sc0710_pixfmts[f->index].fourcc;
 	return 0;
 }
 
@@ -860,15 +902,12 @@ static int vidioc_g_fmt_vid_cap(struct file *file, void *priv, struct v4l2_forma
 
 	f->fmt.pix.width = eff_w;
 	f->fmt.pix.height = eff_h;
-	f->fmt.pix.pixelformat = V4L2_PIX_FMT_YUYV;
+	f->fmt.pix.pixelformat = dev->pixfmt->fourcc;
 	f->fmt.pix.field = fmt->interlaced ?
 		V4L2_FIELD_INTERLACED : V4L2_FIELD_NONE;
-	f->fmt.pix.bytesperline = eff_w * 2;
+	f->fmt.pix.bytesperline = eff_w * sc0710_bpp(dev);
 	f->fmt.pix.sizeimage = eff_fs;
-	f->fmt.pix.colorspace = sc0710_get_v4l2_colorspace(dev);
-	f->fmt.pix.xfer_func = sc0710_get_v4l2_xfer_func(dev);
-	f->fmt.pix.ycbcr_enc = sc0710_get_v4l2_ycbcr_enc(dev);
-	f->fmt.pix.quantization = sc0710_get_v4l2_quantization(dev);
+	sc0710_fill_colorimetry(dev, dev->pixfmt, &f->fmt.pix);
 
 	return 0;
 }
@@ -878,6 +917,7 @@ static int vidioc_try_fmt_vid_cap(struct file *file, void *priv, struct v4l2_for
 	struct sc0710_dma_channel *ch = video_drvdata(file);
 	struct sc0710_dev *dev = ch->dev;
 	const struct sc0710_format *fmt;
+	const struct sc0710_pixfmt *pf;
 	u32 eff_w, eff_h, eff_fs;
 
 	/* Use real format if available, otherwise use lastfmt, then default */
@@ -885,24 +925,60 @@ static int vidioc_try_fmt_vid_cap(struct file *file, void *priv, struct v4l2_for
 
 	sc0710_get_effective_size(dev, fmt, &eff_w, &eff_h, &eff_fs);
 
+	/* Unknown formats clamp to YUYV, as do formats the field weave can't
+	 * produce for an interlaced source. Size for the requested format,
+	 * not the currently active one. */
+	pf = sc0710_pixfmt_find(f->fmt.pix.pixelformat);
+	if (!pf || (fmt->interlaced && !pf->weave_ok))
+		pf = &sc0710_pixfmts[0];
+
 	f->fmt.pix.width = eff_w;
 	f->fmt.pix.height = eff_h;
-	f->fmt.pix.pixelformat = V4L2_PIX_FMT_YUYV;
+	f->fmt.pix.pixelformat = pf->fourcc;
 	f->fmt.pix.field = fmt->interlaced ?
 		V4L2_FIELD_INTERLACED : V4L2_FIELD_NONE;
-	f->fmt.pix.bytesperline = eff_w * 2;
-	f->fmt.pix.sizeimage = eff_fs;
-	f->fmt.pix.colorspace = sc0710_get_v4l2_colorspace(dev);
-	f->fmt.pix.xfer_func = sc0710_get_v4l2_xfer_func(dev);
-	f->fmt.pix.ycbcr_enc = sc0710_get_v4l2_ycbcr_enc(dev);
-	f->fmt.pix.quantization = sc0710_get_v4l2_quantization(dev);
+	f->fmt.pix.bytesperline = eff_w * pf->bpp;
+	f->fmt.pix.sizeimage = eff_w * pf->bpp * eff_h;
+	sc0710_fill_colorimetry(dev, pf, &f->fmt.pix);
 
 	return 0;
 }
 
 static int vidioc_s_fmt_vid_cap(struct file *file, void *priv, struct v4l2_format *f)
 {
-	return vidioc_try_fmt_vid_cap(file, priv, f);
+	struct sc0710_dma_channel *ch = video_drvdata(file);
+	struct sc0710_dev *dev = ch->dev;
+	struct sc0710_client *client;
+	unsigned long flags;
+	bool busy = false;
+	int ret = vidioc_try_fmt_vid_cap(file, priv, f);
+
+	if (ret)
+		return ret;
+
+	/* Format is device-wide (one card, one DMA pipeline). Only change it while
+	 * capture is stopped, so the DMA sizing and the 0xD0 format bit stay
+	 * consistent for the whole session; a change request during capture is
+	 * rejected unless it matches the active format. */
+	if (ch->state == STATE_RUNNING)
+		return f->fmt.pix.pixelformat == dev->pixfmt->fourcc ? 0 : -EBUSY;
+
+	/* Same rule while any client holds buffers: they were negotiated and
+	 * mapped at the current format's size. The buffer ioctls serialize on
+	 * the node's ioctl lock, so the snapshot can't race an allocation. */
+	spin_lock_irqsave(&ch->client_list_lock, flags);
+	list_for_each_entry(client, &ch->client_list, list) {
+		if (vb2_is_busy(&client->vb2_queue)) {
+			busy = true;
+			break;
+		}
+	}
+	spin_unlock_irqrestore(&ch->client_list_lock, flags);
+	if (busy)
+		return f->fmt.pix.pixelformat == dev->pixfmt->fourcc ? 0 : -EBUSY;
+
+	dev->pixfmt = sc0710_pixfmt_find(f->fmt.pix.pixelformat);
+	return 0;
 }
 
 static int vidioc_enum_framesizes(struct file *file, void *priv, struct v4l2_frmsizeenum *fsize)
@@ -911,7 +987,7 @@ static int vidioc_enum_framesizes(struct file *file, void *priv, struct v4l2_frm
 	struct sc0710_dev *dev = ch->dev;
 	u32 eff_w, eff_h, eff_fs;
 
-	if (fsize->pixel_format != V4L2_PIX_FMT_YUYV)
+	if (!sc0710_pixfmt_find(fsize->pixel_format))
 		return -EINVAL;
 
 	/* Only support the currently detected resolution */
@@ -936,7 +1012,7 @@ static int vidioc_enum_frameintervals(struct file *file, void *priv, struct v4l2
 	struct sc0710_dev *dev = ch->dev;
 	u32 eff_w, eff_h, eff_fs;
 
-	if (fival->pixel_format != V4L2_PIX_FMT_YUYV)
+	if (!sc0710_pixfmt_find(fival->pixel_format))
 		return -EINVAL;
 
 	if (fival->index != 0)
@@ -1001,8 +1077,6 @@ static int vidioc_subscribe_event(struct v4l2_fh *fh,
 /* VB2 buffer operations                                       */
 /* ----------------------------------------------------------- */
 
-#define SC0710_MAX_FRAME_SIZE (3840u * 2u * 2160u)
-
 static int sc0710_queue_setup(struct vb2_queue *q,
 	unsigned int *num_buffers, unsigned int *num_planes,
 	unsigned int sizes[], struct device *alloc_devs[])
@@ -1012,33 +1086,23 @@ static int sc0710_queue_setup(struct vb2_queue *q,
 	struct sc0710_dev *dev = ch->dev;
 	const struct sc0710_format *fmt;
 	u32 eff_w, eff_h, eff_fs;
-	int dynamic_res_active;
 
 	/* Use real format if available, otherwise use lastfmt, then default */
 	fmt = dev->fmt ? dev->fmt : (dev->last_fmt ? dev->last_fmt : sc0710_get_default_format());
 
 	sc0710_get_effective_size(dev, fmt, &eff_w, &eff_h, &eff_fs);
 
-	dynamic_res_active = (!auto_scaler &&
-			      dev->scaler_mode == SCALER_MODE_DISABLED);
-
 	if (*num_buffers < 2)
 		*num_buffers = 2;
 
 	*num_planes = 1;
 
-	if (dynamic_res_active) {
-		/* Allocate at max resolution so any mid-stream resolution
-		 * change fits without killing the stream or truncating.
-		 */
-		sizes[0] = SC0710_MAX_FRAME_SIZE;
-		dprintk(2, "%s() dynamic res: buffer count=%d, size=%d (max 4K)\n",
-			__func__, *num_buffers, sizes[0]);
-	} else {
-		sizes[0] = eff_fs;
-		dprintk(2, "%s() buffer count=%d, size=%d\n",
-			__func__, *num_buffers, sizes[0]);
-	}
+	/* Negotiated size only. A mid-stream resolution change routes
+	 * through V4L2_EVENT_SOURCE_CHANGE and renegotiation, so buffers
+	 * never need to hold more than the negotiated frame. */
+	sizes[0] = eff_fs;
+	dprintk(2, "%s() buffer count=%d, size=%d\n",
+		__func__, *num_buffers, sizes[0]);
 
 	return 0;
 }
@@ -1058,21 +1122,53 @@ static int sc0710_buf_prepare(struct vb2_buffer *vb)
 
 	sc0710_get_effective_size(dev, fmt, &eff_w, &eff_h, &eff_fs);
 
-	/* When auto_scaler is active the dequeue path scales every frame
-	 * to match the client's stream resolution.  Buffers only need to
-	 * hold that scaled output, not the raw source frame.
-	 */
-	if (auto_scaler && client->stream_framesize &&
-	    client->stream_framesize < eff_fs) {
-		eff_w = client->stream_width;
-		eff_h = client->stream_height;
+	/* While streaming, delivery writes at most the locked stream size
+	 * (mismatched sources are skipped and placeholders clamp to the
+	 * buffer), so requeues validate against that; checking a newer,
+	 * larger detected format would break the client's QBUF loop
+	 * mid-stream. */
+	if (client->streaming && client->stream_framesize)
 		eff_fs = client->stream_framesize;
-	}
 
 	if (vb2_plane_size(vb, 0) < eff_fs) {
 		dprintk(0, "%s() buffer too small (%lu < %u)\n",
 			__func__, vb2_plane_size(vb, 0), eff_fs);
 		return -EINVAL;
+	}
+
+	if (zero_copy) {
+		struct sg_table *sgt = vb2_dma_sg_plane_desc(vb, 0);
+		struct scatterlist *sg;
+		unsigned int i;
+
+		/* Snapshot the plane's DMA segments for descriptor targeting.
+		 * A plane scattered across more segments than the frame chain
+		 * has descriptors can't be DMA'd into; refuse it rather than
+		 * silently degrade (strict mode). With an IOMMU the whole
+		 * plane typically maps as one segment. */
+		buf->zc_nsegs = 0;
+		for_each_sgtable_dma_sg(sgt, sg, i) {
+			if (i >= SC0710_MAX_CHAIN_DESCRIPTORS) {
+				buf->zc_nsegs = 0;
+				printk_ratelimited(KERN_WARNING
+					"%s: zero-copy: buffer memory too fragmented for direct DMA (more than %u segments), refusing buffer\n",
+					dev->name, SC0710_MAX_CHAIN_DESCRIPTORS);
+				return -EINVAL;
+			}
+			buf->zc_seg[i].addr = sg_dma_address(sg);
+			buf->zc_seg[i].len  = sg_dma_len(sg);
+			buf->zc_nsegs = i + 1;
+		}
+
+		dprintk(2, "%s() zero-copy buffer: %u DMA segment(s)\n",
+			__func__, buf->zc_nsegs);
+
+		/* Map the kernel view now, in process context: the copy
+		 * fallback and placeholder paths read the vaddr under
+		 * spinlocks/timer context, where dma-sg's lazy first
+		 * mapping must not happen. */
+		if (!vb2_plane_vaddr(vb, 0))
+			return -ENOMEM;
 	}
 
 	vb2_set_plane_payload(vb, 0, eff_fs);
@@ -1095,6 +1191,25 @@ static void sc0710_buf_queue(struct vb2_buffer *vb)
 	spin_unlock_irqrestore(&client->buffer_lock, flags);
 }
 
+/* Unwind a failed STREAMON: undo the streaming markers and hand every
+ * queued buffer back to vb2 (the start_streaming failure contract). */
+static void sc0710_start_streaming_unwind(struct sc0710_dma_channel *ch,
+	struct sc0710_client *client)
+{
+	struct sc0710_buffer *buf, *tmp;
+	unsigned long flags;
+
+	client->streaming = false;
+	atomic_dec(&ch->streaming_refcount);
+
+	spin_lock_irqsave(&client->buffer_lock, flags);
+	list_for_each_entry_safe(buf, tmp, &client->buffer_list, list) {
+		list_del(&buf->list);
+		vb2_buffer_done(&buf->vb.vb2_buf, VB2_BUF_STATE_QUEUED);
+	}
+	spin_unlock_irqrestore(&client->buffer_lock, flags);
+}
+
 static int sc0710_start_streaming(struct vb2_queue *q, unsigned int count)
 {
 	struct sc0710_client *client = vb2_get_drv_priv(q);
@@ -1110,8 +1225,9 @@ static int sc0710_start_streaming(struct vb2_queue *q, unsigned int count)
 		generate_status_frames_if_needed();
 
 	/* Record the resolution this client expects for its entire stream
-	 * lifetime.  Dynamic resolution mode uses this to scale frames
-	 * back to the client's expected size when the source changes.
+	 * lifetime.  Frames are delivered only while the source still
+	 * matches it; after a source change the client is expected to
+	 * restart streaming (V4L2_EVENT_SOURCE_CHANGE).
 	 */
 	{
 		const struct sc0710_format *sfmt;
@@ -1134,6 +1250,17 @@ static int sc0710_start_streaming(struct vb2_queue *q, unsigned int count)
 	refcount = atomic_inc_return(&ch->streaming_refcount);
 	dprintk(1, "%s() streaming refcount now %d\n", __func__, refcount);
 
+	/* Zero-copy is strict single-client: frames DMA into one client's
+	 * buffers, and there is no copy pass to fan out to a second. The
+	 * refcount doubles as the race-free exclusivity check. */
+	if (zero_copy && refcount > 1) {
+		printk_ratelimited(KERN_WARNING
+			"%s: zero-copy: a client is already streaming, refusing a second\n",
+			dev->name);
+		sc0710_start_streaming_unwind(ch, client);
+		return -EBUSY;
+	}
+
 	/* Only start DMA if we're the first streaming client AND have signal.
 	 * kthread_dma_lock serializes this against the HDMI thread's resync:
 	 * without it a resync between the refcount increment and the resize
@@ -1141,23 +1268,16 @@ static int sc0710_start_streaming(struct vb2_queue *q, unsigned int count)
 	 * running channel and stream from a stale ring. */
 	if (refcount == 1 && dev->fmt != NULL) {
 		mutex_lock(&dev->kthread_dma_lock);
-		ret = sc0710_dma_channels_resize(dev);
-		if (ret == 0)
-			ret = sc0710_dma_channels_start(dev);
+		if (READ_ONCE(dev->disconnected)) {
+			ret = -ENODEV;
+		} else {
+			ret = sc0710_dma_channels_resize(dev);
+			if (ret == 0)
+				ret = sc0710_dma_channels_start(dev);
+		}
 		mutex_unlock(&dev->kthread_dma_lock);
 		if (ret < 0) {
-			struct sc0710_buffer *buf, *tmp;
-			unsigned long flags;
-
-			client->streaming = false;
-			atomic_dec(&ch->streaming_refcount);
-
-			spin_lock_irqsave(&client->buffer_lock, flags);
-			list_for_each_entry_safe(buf, tmp, &client->buffer_list, list) {
-				list_del(&buf->list);
-				vb2_buffer_done(&buf->vb.vb2_buf, VB2_BUF_STATE_QUEUED);
-			}
-			spin_unlock_irqrestore(&client->buffer_lock, flags);
+			sc0710_start_streaming_unwind(ch, client);
 			return ret;
 		}
 	} else if (dev->fmt == NULL) {
@@ -1197,7 +1317,18 @@ static void sc0710_stop_streaming(struct vb2_queue *q)
 	if (refcount <= 0) {
 		mutex_lock(&dev->kthread_dma_lock);
 		atomic_set(&ch->streaming_refcount, 0); /* Clamp to 0 */
-		sc0710_dma_channels_stop(dev);
+		/* After a disconnect the remove path owns the hardware (the
+		 * engines are stopped, the BARs may be unmapped): only the
+		 * software teardown below remains ours. */
+		if (!READ_ONCE(dev->disconnected)) {
+			sc0710_dma_channels_stop(dev);
+			/* Point the chains back at the scratch ring: vb2 is
+			 * about to unmap the client's buffers, and no
+			 * descriptor may retain their DMA addresses (the stop
+			 * above quiesced the engine). */
+			if (zero_copy)
+				sc0710_dma_channel_untarget_all(ch);
+		}
 		timer_delete_sync(&ch->timeout);
 		mutex_unlock(&dev->kthread_dma_lock);
 	}
@@ -1235,6 +1366,7 @@ static int sc0710_video_open(struct file *file)
 	struct sc0710_fh *fh;
 	struct vb2_queue *q;
 	unsigned long flags;
+	u32 users;
 	int err;
 
 	dprintk(0, "%s() dev=%s\n", __func__, video_device_node_name(vdev));
@@ -1257,7 +1389,6 @@ static int sc0710_video_open(struct file *file)
 	fh->client->streaming = false;
 	INIT_LIST_HEAD(&fh->client->buffer_list);
 	spin_lock_init(&fh->client->buffer_lock);
-	mutex_init(&fh->client->vb2_lock);
 
 	/* Initialize per-client VB2 queue */
 	q = &fh->client->vb2_queue;
@@ -1267,10 +1398,21 @@ static int sc0710_video_open(struct file *file)
 	q->drv_priv = fh->client;  /* Point to client, not channel */
 	q->buf_struct_size = sizeof(struct sc0710_buffer);
 	q->ops = &sc0710_video_qops;
-	q->mem_ops = &vb2_vmalloc_memops;
+	/* Zero-copy needs DMA-mappable buffers the descriptors can target;
+	 * GFP_DMA32 matches the device's 32-bit DMA mask so driver-allocated
+	 * pages map without bounce buffering. */
+	if (zero_copy) {
+		q->mem_ops = &vb2_dma_sg_memops;
+		q->gfp_flags = GFP_DMA32;
+	} else {
+		q->mem_ops = &vb2_vmalloc_memops;
+	}
 	q->timestamp_flags = V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC;
 	q->min_queued_buffers = 2;
-	q->lock = &fh->client->vb2_lock;  /* Use client's lock */
+	/* The node's ioctl lock: the v4l2 core holds it across every ioctl, so
+	 * vb2's blocking waits (DQBUF, read) drop the mutex the caller actually
+	 * holds, and other clients' ioctls proceed during the wait. */
+	q->lock = &ch->v4l2_lock;
 	q->dev = &dev->pci->dev;
 
 	err = vb2_queue_init(q);
@@ -1281,13 +1423,12 @@ static int sc0710_video_open(struct file *file)
 		return err;
 	}
 
-	/* Add to channel's client list */
+	/* Add to the channel's client list; videousers rides the same lock
+	 * (the v4l2 core does not hold vdev->lock for open/release). */
 	spin_lock_irqsave(&ch->client_list_lock, flags);
 	list_add_tail(&fh->client->list, &ch->client_list);
+	users = ++ch->videousers;
 	spin_unlock_irqrestore(&ch->client_list_lock, flags);
-
-	/* Track video users (v4l2_lock already held by framework) */
-	ch->videousers++;
 
 	v4l2_fh_init(&fh->fh, vdev);
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6,18,0)
@@ -1300,7 +1441,7 @@ static int sc0710_video_open(struct file *file)
 	file->private_data = fh;
 #endif
 
-	dprintk(2, "%s() new client opened, videousers=%d\n", __func__, ch->videousers);
+	dprintk(2, "%s() new client opened, videousers=%d\n", __func__, users);
 
 	return 0;
 }
@@ -1312,26 +1453,30 @@ static int sc0710_video_release(struct file *file)
 	struct sc0710_dma_channel *ch = fh->ch;
 	struct sc0710_dev *dev = ch->dev;
 	unsigned long flags;
+	u32 users;
 
 	dprintk(2, "%s() dev=%s\n", __func__, video_device_node_name(vdev));
 
 	/* Release the per-client VB2 queue */
 	if (fh->client) {
-		/* Remove from client list */
+		/* Remove from the client list; videousers rides the same lock
+		 * (the v4l2 core does not hold vdev->lock for open/release). */
 		spin_lock_irqsave(&ch->client_list_lock, flags);
 		list_del(&fh->client->list);
+		users = --ch->videousers;
 		spin_unlock_irqrestore(&ch->client_list_lock, flags);
+		dprintk(2, "%s() videousers=%d\n", __func__, users);
 
-		/* Release the queue (handles stopping streaming if needed) */
+		/* Release the queue (handles stopping streaming if needed).
+		 * The core does not hold vdev->lock for release; take the queue
+		 * lock ourselves like the vb2 fop helpers do. */
+		mutex_lock(&ch->v4l2_lock);
 		vb2_queue_release(&fh->client->vb2_queue);
+		mutex_unlock(&ch->v4l2_lock);
 
 		kfree(fh->client);
 		fh->client = NULL;
 	}
-
-	/* v4l2_lock already held by framework */
-	ch->videousers--;
-	dprintk(2, "%s() videousers=%d\n", __func__, ch->videousers);
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6,18,0)
 	v4l2_fh_del(&fh->fh, file);
@@ -1351,10 +1496,19 @@ static ssize_t sc0710_fop_read(struct file *file, char __user *buf,
 			       size_t count, loff_t *ppos)
 {
 	struct sc0710_fh *fh = file->private_data;
+	ssize_t ret;
+
 	if (!fh || !fh->client)
 		return -EINVAL;
-	return vb2_read(&fh->client->vb2_queue, buf, count, ppos,
-			file->f_flags & O_NONBLOCK);
+	/* The core does not hold vdev->lock for fops; read-fileio mutates
+	 * queue state and its blocking wait drops the queue lock, so take it
+	 * here the way vb2_fop_read does. */
+	if (mutex_lock_interruptible(&fh->ch->v4l2_lock))
+		return -ERESTARTSYS;
+	ret = vb2_read(&fh->client->vb2_queue, buf, count, ppos,
+		       file->f_flags & O_NONBLOCK);
+	mutex_unlock(&fh->ch->v4l2_lock);
+	return ret;
 }
 
 static __poll_t sc0710_fop_poll(struct file *file, poll_table *wait)
@@ -1365,7 +1519,11 @@ static __poll_t sc0710_fop_poll(struct file *file, poll_table *wait)
 	if (!fh || !fh->client)
 		return EPOLLERR;
 
+	/* vb2_poll can start read-fileio; serialize it like vb2_fop_poll. */
+	if (mutex_lock_interruptible(&fh->ch->v4l2_lock))
+		return EPOLLERR;
 	rc = vb2_poll(&fh->client->vb2_queue, file, wait);
+	mutex_unlock(&fh->ch->v4l2_lock);
 
 	/* Also wake callers waiting for V4L2 events (SOURCE_CHANGE) */
 	poll_wait(file, &fh->fh.wait, wait);
@@ -1378,6 +1536,7 @@ static __poll_t sc0710_fop_poll(struct file *file, poll_table *wait)
 static int sc0710_fop_mmap(struct file *file, struct vm_area_struct *vma)
 {
 	struct sc0710_fh *fh = file->private_data;
+
 	if (!fh || !fh->client)
 		return -EINVAL;
 	return vb2_mmap(&fh->client->vb2_queue, vma);
@@ -1388,6 +1547,7 @@ static int sc0710_vidioc_reqbufs(struct file *file, void *priv,
 				 struct v4l2_requestbuffers *p)
 {
 	struct sc0710_fh *fh = file->private_data;
+
 	if (!fh || !fh->client)
 		return -EINVAL;
 	return vb2_reqbufs(&fh->client->vb2_queue, p);
@@ -1397,15 +1557,27 @@ static int sc0710_vidioc_querybuf(struct file *file, void *priv,
 				  struct v4l2_buffer *p)
 {
 	struct sc0710_fh *fh = file->private_data;
+
 	if (!fh || !fh->client)
 		return -EINVAL;
 	return vb2_querybuf(&fh->client->vb2_queue, p);
+}
+
+static int sc0710_vidioc_expbuf(struct file *file, void *priv,
+				struct v4l2_exportbuffer *p)
+{
+	struct sc0710_fh *fh = file->private_data;
+
+	if (!fh || !fh->client)
+		return -EINVAL;
+	return vb2_expbuf(&fh->client->vb2_queue, p);
 }
 
 static int sc0710_vidioc_qbuf(struct file *file, void *priv,
 			      struct v4l2_buffer *p)
 {
 	struct sc0710_fh *fh = file->private_data;
+
 	if (!fh || !fh->client)
 		return -EINVAL;
 	return vb2_qbuf(&fh->client->vb2_queue, NULL, p);
@@ -1415,6 +1587,7 @@ static int sc0710_vidioc_dqbuf(struct file *file, void *priv,
 			       struct v4l2_buffer *p)
 {
 	struct sc0710_fh *fh = file->private_data;
+
 	if (!fh || !fh->client)
 		return -EINVAL;
 	return vb2_dqbuf(&fh->client->vb2_queue, p,
@@ -1425,6 +1598,7 @@ static int sc0710_vidioc_streamon(struct file *file, void *priv,
 				  enum v4l2_buf_type type)
 {
 	struct sc0710_fh *fh = file->private_data;
+
 	if (!fh || !fh->client)
 		return -EINVAL;
 	return vb2_streamon(&fh->client->vb2_queue, type);
@@ -1434,6 +1608,7 @@ static int sc0710_vidioc_streamoff(struct file *file, void *priv,
 				   enum v4l2_buf_type type)
 {
 	struct sc0710_fh *fh = file->private_data;
+
 	if (!fh || !fh->client)
 		return -EINVAL;
 	return vb2_streamoff(&fh->client->vb2_queue, type);
@@ -1547,6 +1722,7 @@ static const struct v4l2_ioctl_ops video_ioctl_ops =
 
 	.vidioc_reqbufs          = sc0710_vidioc_reqbufs,
 	.vidioc_querybuf         = sc0710_vidioc_querybuf,
+	.vidioc_expbuf           = sc0710_vidioc_expbuf,
 	.vidioc_qbuf             = sc0710_vidioc_qbuf,
 	.vidioc_dqbuf            = sc0710_vidioc_dqbuf,
 	.vidioc_streamon         = sc0710_vidioc_streamon,
@@ -1629,29 +1805,36 @@ static void sc0710_vid_timeout(struct timer_list *t)
 	struct sc0710_dev *dev = ch->dev;
 	struct sc0710_client *client;
 	const struct sc0710_format *fmt;
+	const struct sc0710_format *live_fmt;
 	unsigned long flags, buf_flags;
 	int any_streaming = 0;
+	int dma_active;
+	u32 live_w = 0, live_h = 0;
 	u32 eff_w, eff_h, eff_fs;
 
 	/* Use lastfmt for placeholder frames to render at last known resolution */
 	fmt = dev->last_fmt ? dev->last_fmt : sc0710_get_default_format();
 
-	/* Compute effective (possibly scaled) output dimensions */
 	sc0710_get_effective_size(dev, fmt, &eff_w, &eff_h, &eff_fs);
 
-	/* If we have real signal and the channel is running, DMA is handling
-	 * frame delivery, just reschedule.
+	/* With a live signal and a running channel, DMA is delivering to
+	 * every client whose locked resolution matches the detected format;
+	 * those are skipped below, and placeholders go only to clients
+	 * pending renegotiation after a source change.
 	 * The state check keeps a stopped channel (failed DMA reconfigure with
-	 * signal still locked) on the placeholder path below.
-	 * ch->state is read unlocked; staleness costs one placeholder frame. */
-	if (dev->fmt != NULL && dev->locked && ch->state == STATE_RUNNING) {
-		/* Re-set the buffer timeout for DMA monitoring */
-		if (atomic_read(&ch->streaming_refcount) > 0)
-			mod_timer(&ch->timeout, jiffies + VBUF_TIMEOUT);
-		return;
+	 * signal still locked) on the placeholder path.
+	 * dev->fmt, dev->locked and ch->state are read unlocked; staleness
+	 * costs one placeholder frame. The fmt pointer is snapshotted once:
+	 * the HDMI thread NULLs it on signal loss, and a stale pointer stays
+	 * valid (static tables, double-buffered dynamic slots) where a second
+	 * read would not. */
+	live_fmt = READ_ONCE(dev->fmt);
+	dma_active = (live_fmt != NULL && dev->locked && ch->state == STATE_RUNNING);
+	if (dma_active) {
+		live_w = live_fmt->width;
+		live_h = live_fmt->height;
 	}
 
-	/* No signal - deliver placeholder frames to all streaming clients */
 	dprintk(0, "%s(ch#%d) - delivering placeholder frames\n", __func__, ch->nr);
 
 	spin_lock_irqsave(&ch->client_list_lock, flags);
@@ -1663,6 +1846,11 @@ static void sc0710_vid_timeout(struct timer_list *t)
 			continue;
 
 		any_streaming = 1;
+
+		if (dma_active &&
+		    client->stream_width == live_w &&
+		    client->stream_height == live_h)
+			continue;
 
 		spin_lock_irqsave(&client->buffer_lock, buf_flags);
 
@@ -1682,27 +1870,39 @@ static void sc0710_vid_timeout(struct timer_list *t)
 				unsigned long buf_sz = vb2_plane_size(&buf->vb.vb2_buf, 0);
 				u32 fill_w = eff_w, fill_h = eff_h, fill_fs = eff_fs;
 
-				/* Clamp to buffer capacity to prevent overflow when
-				 * the detected format is larger than what the client
-				 * allocated (e.g. 4K placeholder into 1080p buffer).
-				 */
-				if (fill_fs > buf_sz && fill_w && fill_h) {
-					sc0710_guess_dims_from_framesize((u32)buf_sz,
-								&fill_w, &fill_h);
-					fill_fs = fill_w * 2 * fill_h;
-				}
-				if (fill_fs > buf_sz) {
-					/* Last resort: the largest 1920-wide strip
-					 * that fits. Never write a hardcoded
-					 * geometry past the client's buffer. */
-					fill_w = 1920;
-					fill_h = min_t(u32, 1080, buf_sz / (1920 * 2));
-					fill_fs = fill_w * 2 * fill_h;
-				}
-
-				{
+				if (dev->pixfmt->rgb) {
+					/* The pattern renderer and the dims
+					 * fallbacks below are YUYV-only;
+					 * RGB black is all zeros. */
+					if (fill_fs > buf_sz)
+						fill_fs = buf_sz;
+					memset(dst, 0, fill_fs);
+					vb2_set_plane_payload(&buf->vb.vb2_buf, 0, fill_fs);
+				} else {
 					int fillmode = dev->cable_connected ?
 						FILL_MODE_NOSIGNAL : FILL_MODE_NODEVICE;
+
+					/* Clamp to buffer capacity to prevent
+					 * overflow when the detected format is
+					 * larger than what the client allocated
+					 * (e.g. 4K placeholder into 1080p buffer).
+					 */
+					if (fill_fs > buf_sz && fill_w && fill_h) {
+						sc0710_guess_dims_from_framesize((u32)buf_sz,
+									&fill_w, &fill_h);
+						fill_fs = fill_w * 2 * fill_h;
+					}
+					if (fill_fs > buf_sz) {
+						/* Last resort: the largest
+						 * 1920-wide strip that fits.
+						 * Never write a hardcoded
+						 * geometry past the client's
+						 * buffer. */
+						fill_w = 1920;
+						fill_h = min_t(u32, 1080, buf_sz / (1920 * 2));
+						fill_fs = fill_w * 2 * fill_h;
+					}
+
 					fill_frame(ch, dst, fill_w, fill_h, fillmode);
 					vb2_set_plane_payload(&buf->vb.vb2_buf, 0, fill_fs);
 				}
@@ -1743,8 +1943,7 @@ void sc0710_video_notify_source_change(struct sc0710_dev *dev)
 		v4l2_event_queue(&ch->vdev, &ev);
 	}
 
-	printk(KERN_INFO "%s: SOURCE_CHANGE event queued — stream kept alive\n",
-		dev->name);
+	printk(KERN_INFO "%s: SOURCE_CHANGE event queued\n", dev->name);
 }
 
 void sc0710_video_unregister(struct sc0710_dma_channel *ch)
@@ -1756,8 +1955,27 @@ void sc0710_video_unregister(struct sc0710_dma_channel *ch)
 	if (video_is_registered(&ch->vdev))
 		video_unregister_device(&ch->vdev);
 
-	/* No-op unless the handler was initialized (4K Pro only). */
-	v4l2_ctrl_handler_free(&dev->ctrl_handler);
+	/* The control handler stays alive: open file handles unsubscribe
+	 * their control events through it at close. It is freed with dev,
+	 * after the last handle is gone. */
+}
+
+/* Remove-path disconnect, after the node is unregistered and in-flight
+ * ioctls drained: shut the frame timer down (later mod_timer calls are
+ * silently ignored) and error the client queues so blocked DQBUF/poll/read
+ * waiters wake with -EIO - nothing will complete their buffers again. New
+ * clients can't appear (open is refused once the node is unregistered). */
+void sc0710_video_disconnect(struct sc0710_dma_channel *ch)
+{
+	struct sc0710_client *client;
+	unsigned long flags;
+
+	timer_shutdown_sync(&ch->timeout);
+
+	spin_lock_irqsave(&ch->client_list_lock, flags);
+	list_for_each_entry(client, &ch->client_list, list)
+		vb2_queue_error(&client->vb2_queue);
+	spin_unlock_irqrestore(&ch->client_list_lock, flags);
 }
 
 int sc0710_video_register(struct sc0710_dma_channel *ch)

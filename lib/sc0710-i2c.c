@@ -408,6 +408,18 @@ void sc0710_reset_dma_frame_sync(struct sc0710_dev *dev)
 		}
 	}
 
+	/* Zero-copy chains may point at client buffers. With the engines
+	 * stopped and writebacks cleared, point them back at the scratch ring
+	 * and requeue the buffers before the resize frees or rebuilds anything
+	 * (this also covers the resize-failure bail below). */
+	if (zero_copy) {
+		for (ch_idx = 0; ch_idx < SC0710_MAX_CHANNELS; ch_idx++) {
+			ch = &dev->channel[ch_idx];
+			if (ch->enabled && ch->mediatype == CHTYPE_VIDEO)
+				sc0710_dma_channel_untarget_all(ch);
+		}
+	}
+
 	/* Phase 2: Resize DMA buffers for the new resolution.
 	 * On failure leave the channels stopped: restarting over a missing ring
 	 * would hand the engine a NULL descriptor pointer. The next timing
@@ -556,17 +568,21 @@ int sc0710_i2c_read_hdmi_status(struct sc0710_dev *dev)
 		return ret;
 	}
 	/* Lock detection differs by board.
-	 * MK2: rbuf[8] is a dedicated lock flag (0 or 1).
-	 * 4K Pro: rbuf[8] is part of the active resolution data, not a lock flag.
-	 *         Use presence of timing data in [4:7] as the lock indicator instead.
-	 *         The 4K Pro MCU intermittently returns all-zero responses even with
-	 *         a valid signal, so require multiple consecutive dropouts before
-	 *         declaring signal loss.
+	 * 4K Pro: no dedicated lock flag; the captured-timing bytes [8:11] are
+	 * zeroed whenever the MCU is not capturing, so their presence is the
+	 * lock indicator. The detected-input bytes [4:7] are not usable: the
+	 * MCU keeps reporting the last negotiated timing there after the cable
+	 * is unplugged, so a lock derived from them never drops. They still
+	 * drive cable-vs-signal detection in the unlocked branch below.
+	 * MK2: rbuf[8] is a dedicated lock flag (0 or 1); the semantics of
+	 * bytes [9:11] on that board are unverified, so they must not feed
+	 * the lock.
+	 * The MCU intermittently returns all-zero responses even with a valid
+	 * signal, so require multiple consecutive dropouts before declaring
+	 * signal loss.
 	 */
-
-
 	if (dev->board == SC0710_BOARD_ELGATEO_4KP)
-		raw_locked = (rbuf[4] | rbuf[5] | rbuf[6] | rbuf[7]) != 0;
+		raw_locked = (rbuf[8] | rbuf[9] | rbuf[10] | rbuf[11]) != 0;
 	else
 		raw_locked = rbuf[8] != 0;
 
@@ -759,9 +775,6 @@ int sc0710_i2c_read_hdmi_status(struct sc0710_dev *dev)
 		}
 	}
 
-	if (was_locked && (!dev->locked || !dev->fmt))
-		sc0710_audio_on_signal_lost(dev);
-
 	mutex_unlock(&dev->signalMutex);
 	return 0; /* Success */
 
@@ -854,7 +867,7 @@ confirmed_timing_change:
 			dyn->fpsnum     = fps_est * 1000;
 			dyn->fpsden     = 1000;
 			dyn->depth      = 8;
-			dyn->framesize  = dev->width * 2 * dev->height;
+			dyn->framesize  = dev->width * sc0710_bpp(dev) * dev->height;
 			snprintf(dev->dynamic_fmt_name[dev->dynamic_fmt_idx],
 				 sizeof(dev->dynamic_fmt_name[0]),
 				 "%ux%u%s%u(dynamic)",
@@ -912,10 +925,7 @@ confirmed_timing_change:
 		}
 	}
 
-	if (!auto_scaler && dev->scaler_mode == SCALER_MODE_DISABLED)
-		sc0710_video_notify_source_change(dev);
-
-	sc0710_audio_on_signal_restored(dev);
+	sc0710_video_notify_source_change(dev);
 
 	return 0;
 }
@@ -1423,6 +1433,10 @@ int sc0710_set_edid_source(struct sc0710_dev *dev, u32 src)
 	int ret;
 
 	mutex_lock(&dev->signalMutex);
+	if (READ_ONCE(dev->disconnected)) {
+		mutex_unlock(&dev->signalMutex);
+		return -ENODEV;
+	}
 	if (dev->board == SC0710_BOARD_ELGATEO_4KP)
 		ret = __sc0710_4kp_set_edid_source(dev, src);
 	else if (dev->board == SC0710_BOARD_ELGATEO_4KP60_MK2)
@@ -1549,6 +1563,10 @@ int sc0710_i2c_get_edid(struct sc0710_dev *dev, u8 *buf, int start, int len)
 	int addr, ret = 0;
 
 	mutex_lock(&dev->signalMutex);
+	if (READ_ONCE(dev->disconnected)) {
+		mutex_unlock(&dev->signalMutex);
+		return -ENODEV;
+	}
 	if (dev->board == SC0710_BOARD_ELGATEO_4KP60_MK2) {
 		ret = sc0710_mk2_read_edid(dev, buf, start, len);
 		mutex_unlock(&dev->signalMutex);
@@ -1580,6 +1598,11 @@ int sc0710_i2c_set_edid(struct sc0710_dev *dev, const u8 *edid, int len)
 		return -EINVAL;
 
 	mutex_lock(&dev->signalMutex);
+
+	if (READ_ONCE(dev->disconnected)) {
+		mutex_unlock(&dev->signalMutex);
+		return -ENODEV;
+	}
 
 	if (dev->board == SC0710_BOARD_ELGATEO_4KP60_MK2) {
 		/* MK.2: fn 0x59 UpdateEDID protocol to the frontend MCU, entirely

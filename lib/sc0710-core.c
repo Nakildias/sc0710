@@ -25,6 +25,7 @@
 #include <linux/vmalloc.h>
 #include <linux/module.h>
 #include <linux/idr.h>
+#include <linux/interrupt.h>
 #include "sc0710.h"
 
 MODULE_DESCRIPTION("Elgato 4K60 Pro MK.2 / 4K Pro capture driver");
@@ -35,7 +36,7 @@ MODULE_VERSION(SC0710_DRV_VERSION);
 /* 1 = Basic device statistics
  * 2 = PCIe register dump for entire device
  */
-unsigned int procfs_verbosity = 3;
+unsigned int procfs_verbosity = 1;
 module_param(procfs_verbosity, int, 0644);
 MODULE_PARM_DESC(procfs_verbosity, "enable procfs debugging via /proc/sc0710");
 
@@ -51,26 +52,25 @@ unsigned int thread_hdmi_poll_interval_ms = 200;
 module_param(thread_hdmi_poll_interval_ms, int, 0644);
 MODULE_PARM_DESC(thread_hdmi_poll_interval_ms, "have the kernel thread poll hdmi every N ms (def:200)");
 
-unsigned int thread_dma_poll_interval_ms = 2;
+unsigned int thread_dma_poll_interval_ms;
 module_param(thread_dma_poll_interval_ms, int, 0644);
-MODULE_PARM_DESC(thread_dma_poll_interval_ms, "have the kernel thread poll dma every N ms (def:2)");
+MODULE_PARM_DESC(thread_dma_poll_interval_ms,
+	"DMA service tick in ms. 0 (default) = auto: 100 (watchdog duty) while the "
+	"interrupt-driven service is active, 2 (completion polling) otherwise. An "
+	"explicit value always wins.");
 
-unsigned int dma_status = 0;
-module_param(dma_status, int, 0644);
-MODULE_PARM_DESC(dma_status, "Manually start or stop dma activities (def:0 Stopped)");
+unsigned int irq_service = 1;
+module_param(irq_service, uint, 0444);
+MODULE_PARM_DESC(irq_service,
+	"Interrupt-driven DMA completion service (1=on, default): the card's MSI "
+	"wakes the service thread and polling drops to a watchdog tick. 0 = classic "
+	"completion polling. If MSI allocation fails, the driver falls back to "
+	"polling loudly.");
 
 unsigned int sc0710_debug_mode = 0;
 module_param(sc0710_debug_mode, int, 0644);
 MODULE_PARM_DESC(sc0710_debug_mode, "Enable debug logging (0=off, 1=on)");
 EXPORT_SYMBOL(sc0710_debug_mode);
-
-unsigned int scaler_mode = 0;
-module_param(scaler_mode, int, 0644);
-MODULE_PARM_DESC(scaler_mode, "Software scaler: 0=disabled, 1=upscale 4K, 2=downscale 1080P");
-
-unsigned int auto_scaler = 1;
-module_param(auto_scaler, int, 0644);
-MODULE_PARM_DESC(auto_scaler, "Automatic safety scaler on mismatch: 0=off, 1=on");
 
 unsigned int procedural_timings = TIMING_MODE_MERGE;
 module_param(procedural_timings, int, 0644);
@@ -85,6 +85,23 @@ MODULE_PARM_DESC(edid,
 	"sc0710-cli --edid-config). Loads "
 	"/lib/firmware/sc0710/edid/<name>.bin, installed by scripts/extract-firmware.sh; "
 	"empty = factory default.");
+
+unsigned int zero_copy;
+module_param(zero_copy, uint, 0444);
+MODULE_PARM_DESC(zero_copy,
+	"Experimental: capture DMA writes directly into the streaming client's buffers, "
+	"skipping the per-frame copy (0=off, 1=on). Strict single-client mode: one "
+	"streaming client per video node, buffers whose memory is too fragmented for "
+	"the DMA chain's descriptor budget are refused.");
+
+unsigned int zc_split = 8;
+module_param(zc_split, uint, 0444);
+MODULE_PARM_DESC(zc_split,
+	"With zero_copy=1: split each video DMA chain's scratch into "
+	"this many descriptors (1-32, default 8) instead of 4 MiB segments - smaller "
+	"pieces shrink the contiguity a client buffer must provide and make the "
+	"coherent scratch allocations more reliable. 0 = keep the vendor 4 MiB "
+	"segmenting.");
 
 unsigned int dma_resync_validate_frames = 8;
 module_param(dma_resync_validate_frames, int, 0644);
@@ -198,8 +215,6 @@ static int sc0710_dev_setup(struct sc0710_dev *dev)
 	mutex_init(&dev->lock);
 	mutex_init(&dev->signalMutex);
 
-	atomic_inc(&dev->refcount);
-
 	dev->nr = ida_alloc_max(&sc0710_nr_ida, SC0710_MAXBOARDS - 1, GFP_KERNEL);
 	if (dev->nr < 0) {
 		printk(KERN_ERR "sc0710: all %d board slots in use, refusing probe\n",
@@ -224,6 +239,9 @@ static int sc0710_dev_setup(struct sc0710_dev *dev)
 	/* The keepalive thread needs a mutex */
 	mutex_init(&dev->kthread_hdmi_lock);
 	mutex_init(&dev->kthread_dma_lock);
+	init_waitqueue_head(&dev->dma_wq);
+	atomic_set(&dev->dma_irq_pending, 0);
+	dev->pixfmt = &sc0710_pixfmts[0];
 
 	if (get_resources(dev) < 0) {
 		printk(KERN_ERR "%s No more PCIe resources for "
@@ -252,7 +270,8 @@ static int sc0710_dev_setup(struct sc0710_dev *dev)
 		dev->lmmio[0] = NULL;
 		dev->lmmio[1] = NULL;
 		release_mem_region(pci_resource_start(dev->pci, 0), pci_resource_len(dev->pci, 0));
-		release_mem_region(pci_resource_start(dev->pci, bar1_idx), pci_resource_len(dev->pci, bar1_idx));
+		release_mem_region(pci_resource_start(dev->pci, bar1_idx),
+				   pci_resource_len(dev->pci, bar1_idx));
 		ida_free(&sc0710_nr_ida, dev->nr);
 		return -ENOMEM;
 	}
@@ -263,29 +282,51 @@ static int sc0710_dev_setup(struct sc0710_dev *dev)
 	       dev->board, card[dev->nr] == dev->board ?
 	       "insmod option" : "autodetected");
 
-	/* Initialize software scaler mode for eligible boards */
-	if (sc0710_software_scaler_allowed(dev) && scaler_mode <= 2)
-		dev->scaler_mode = (enum sc0710_scaler_mode)scaler_mode;
-	else
-		dev->scaler_mode = SCALER_MODE_DISABLED;
-
 	return 0;
+}
+
+/* One interrupt per completed chain (the Completed bit on each chain's last
+ * descriptor): count it, sample-and-clear the engine status sources (the
+ * read-to-clear deasserts the request so the next event can fire; completion
+ * detection itself is writeback-based and derives nothing from them) and
+ * wake the DMA service thread. */
+static irqreturn_t sc0710_irq(int irq, void *dev_id)
+{
+	struct sc0710_dev *dev = dev_id;
+
+	if (!dev->irq_requested)
+		return IRQ_NONE;
+
+	dev->irq_count++;
+	dev->irq_status_seen |= sc_read(dev, 1, 0x1044);
+	dev->irq_status_seen |= sc_read(dev, 1, 0x1144);
+
+	if (dev->irq_service_active) {
+		atomic_set(&dev->dma_irq_pending, 1);
+		wake_up(&dev->dma_wq);
+	}
+	return IRQ_HANDLED;
 }
 
 static void sc0710_dev_unregister(struct sc0710_dev *dev)
 {
 	int bar1_idx = sc0710_boards[dev->board].bar1_index;
 
-	release_mem_region(pci_resource_start(dev->pci, 0), pci_resource_len(dev->pci, 0));
-	release_mem_region(pci_resource_start(dev->pci, bar1_idx), pci_resource_len(dev->pci, bar1_idx));
-
-	if (!atomic_dec_and_test(&dev->refcount))
-		return;
+	/* Before the BARs unmap: the probe handler reads them. */
+	if (dev->irq_requested) {
+		dev->irq_requested = false;
+		pci_free_irq(dev->pci, 0, dev);
+		pci_free_irq_vectors(dev->pci);
+	}
 
 	sc0710_dma_channels_free(dev);
 
 	iounmap(dev->lmmio[0]);
 	iounmap(dev->lmmio[1]);
+
+	release_mem_region(pci_resource_start(dev->pci, 0), pci_resource_len(dev->pci, 0));
+	release_mem_region(pci_resource_start(dev->pci, bar1_idx),
+			   pci_resource_len(dev->pci, bar1_idx));
 
 	/* Single nr release point: probe failure and remove both land here
 	 * exactly once per device. */
@@ -308,13 +349,18 @@ static int sc0710_proc_state_show(struct seq_file *m, void *v)
 		dev = list_entry(list, struct sc0710_dev, devlist);
 
 		seq_printf(m, "%s\n", dev->name);
-		seq_printf(m, "  dma status: %d\n", dma_status);
+
+		if (dev->irq_requested)
+			seq_printf(m, "         irq: delivered %llu, missed %llu, completions %llu, status %08x%s\n",
+				dev->irq_count, dev->irq_missed, dev->dma_completions,
+				dev->irq_status_seen,
+				dev->irq_dead ? " [IRQ LOST - polling]" : "");
 
 		/* Cached state only: this file is world-readable, so its read path
 		 * must not run I2C or trigger a DMA reconfig; the HDMI poll
 		 * thread keeps the cache fresh. signalMutex is held until after
-		 * the scaler block: everything up to there reads dev->fmt or
-		 * fields the HDMI thread rewrites. */
+		 * the timing-mode block: everything up to there reads dev->fmt
+		 * or fields the HDMI thread rewrites. */
 		mutex_lock(&dev->signalMutex);
 		seq_printf(m, "         fmt: %p\n", dev->fmt);
 	        if (dev->locked) {
@@ -324,7 +370,8 @@ static int sc0710_proc_state_show(struct seq_file *m, void *v)
 				dev->interlaced ? 'i' : 'p',
 				dev->pixelLineH, dev->pixelLineV);
 			if (dev->fmt) {
-				seq_printf(m, "   framesize: %d\n", dev->fmt->framesize);
+				seq_printf(m, "   framesize: %d\n",
+					sc0710_framesize(dev, dev->fmt));
 			}
 		} else {
 			seq_printf(m, "        HDMI: no signal\n");
@@ -337,39 +384,17 @@ static int sc0710_proc_state_show(struct seq_file *m, void *v)
 		seq_printf(m, "     procamp: saturation  %d\n", dev->saturation);
 		seq_printf(m, "     procamp: hue         %d\n", dev->hue);
 
-		/* Software scaler state */
-		if (sc0710_software_scaler_allowed(dev)) {
-			seq_printf(m, "      scaler: %s\n",
-				sc0710_scaler_mode_name(dev->scaler_mode));
-			if (dev->scaler_mode != SCALER_MODE_DISABLED && dev->fmt) {
-				u32 out_w, out_h;
-				sc0710_scaler_get_output_size(dev,
-					dev->fmt->width, dev->fmt->height,
-					&out_w, &out_h);
-				seq_printf(m, "  scaled out: %ux%u -> %ux%u\n",
-					dev->fmt->width, dev->fmt->height,
-					out_w, out_h);
-			}
-			seq_printf(m, " auto scaler: %s\n", dev->auto_scaler_active ? "ON (Prevented Kernel Panic)" : "OFF");
-			seq_printf(m, " auto scaler cfg: %s\n", auto_scaler ? "ENABLED" : "DISABLED");
-			switch (procedural_timings) {
-			case TIMING_MODE_PROCEDURAL_ONLY:
-				seq_printf(m, " timing calc: PROCEDURAL_ONLY\n");
-				break;
-			case TIMING_MODE_STATIC_ONLY:
-				seq_printf(m, " timing calc: STATIC_ONLY\n");
-				break;
-			case TIMING_MODE_MERGE:
-			default:
-				seq_printf(m, " timing calc: MERGE\n");
-				break;
-			}
-			{
-				int dyn_active = (!auto_scaler &&
-						  dev->scaler_mode == SCALER_MODE_DISABLED);
-				seq_printf(m, " dynamic res: %s\n",
-					dyn_active ? "ACTIVE" : "INACTIVE");
-			}
+		switch (procedural_timings) {
+		case TIMING_MODE_PROCEDURAL_ONLY:
+			seq_printf(m, " timing calc: PROCEDURAL_ONLY\n");
+			break;
+		case TIMING_MODE_STATIC_ONLY:
+			seq_printf(m, " timing calc: STATIC_ONLY\n");
+			break;
+		case TIMING_MODE_MERGE:
+		default:
+			seq_printf(m, " timing calc: MERGE\n");
+			break;
 		}
 		mutex_unlock(&dev->signalMutex);
 
@@ -386,6 +411,14 @@ static int sc0710_proc_state_show(struct seq_file *m, void *v)
 				sc0710_things_per_second_query(&ch->bitsPerSecond) / 1000000 / 8);
 			seq_printf(m, "    descr ps: %lld\n",
 				sc0710_things_per_second_query(&ch->descPerSecond));
+
+			if (zero_copy && ch->mediatype == CHTYPE_VIDEO) {
+				seq_printf(m, "   zc frames: %llu direct, %llu copied\n",
+					ch->zc_frames_direct, ch->zc_frames_copied);
+				seq_printf(m, "    zc flips: %llu, stale events: %llu, stale descriptors: %llu%s\n",
+					ch->zc_wbm_flips, ch->zc_stale_events, ch->zc_stale_descs,
+					ch->zc_stale_trip ? " [TRIPPED - zero-copy disabled]" : "");
+			}
 
 			if (ch->mediatype == CHTYPE_AUDIO) {
 				seq_printf(m, "  aud sam ps: %lld\n",
@@ -535,6 +568,8 @@ static int sc0710_thread_dma_function(void *data)
 	struct sc0710_dev *dev = data;
 	int need_dma_resync;
 	int tear_requested_resync;
+	bool was_inactive = false;
+	int missed_streak = 0;
 	int i;
 
 	dprintk(1, "%s() Started\n", __func__);
@@ -544,23 +579,42 @@ static int sc0710_thread_dma_function(void *data)
 	set_freezable();
 
 	while (1) {
-		/* The param is root-writable at runtime; 0 would busy-loop this
-		 * thread. */
-		msleep_interruptible(max_t(unsigned int, thread_dma_poll_interval_ms, 1));
+		unsigned int ms = thread_dma_poll_interval_ms;
+		bool from_irq;
+		int consumed;
+
+		/* 0 = auto: watchdog duty while the interrupt-driven service
+		 * is healthy, classic completion polling otherwise. An explicit
+		 * value always wins (the runtime workaround knob if interrupts
+		 * misbehave); the >=1 clamp keeps a written 0 from busy-looping
+		 * this thread. */
+		if (ms == 0)
+			ms = (dev->irq_service_active && !dev->irq_dead) ? 100 : 2;
+		wait_event_freezable_timeout(dev->dma_wq,
+			atomic_read(&dev->dma_irq_pending) || kthread_should_stop(),
+			msecs_to_jiffies(max_t(unsigned int, ms, 1)));
+
+		/* Always consume the wake flag, even on paused or exiting
+		 * passes - a set flag would turn the wait into a busy loop.
+		 * The xchg is a full barrier: the clear is ordered before the
+		 * completion reads below, so a completion that raced the flag
+		 * can't lose its wake. */
+		from_irq = atomic_xchg(&dev->dma_irq_pending, 0);
 
 		if (kthread_should_stop())
 			break;
 
-		try_to_freeze();
-
-		if (thread_dma_active == 0)
+		if (thread_dma_active == 0) {
+			was_inactive = true;
 			continue;
+		}
 
 		need_dma_resync = 0;
 		tear_requested_resync = 0;
+		consumed = 0;
 		mutex_lock(&dev->kthread_dma_lock);
 		if (!dev->reconfig_in_progress) {
-			sc0710_dma_channels_service(dev);
+			consumed = sc0710_dma_channels_service(dev);
 			need_dma_resync = sc0710_dma_watchdog_check_locked(dev);
 			if (!need_dma_resync && dev->tear_resync_pending) {
 				dev->tear_resync_pending = 0;
@@ -571,6 +625,36 @@ static int sc0710_thread_dma_function(void *data)
 			}
 		}
 		mutex_unlock(&dev->kthread_dma_lock);
+
+		if (consumed > 0)
+			dev->dma_completions += consumed;
+
+		/* Interrupt-loss tripwire: a timeout pass that still found
+		 * completed work means the interrupt for that work never
+		 * arrived. Only meaningful on the auto watchdog cadence (an
+		 * explicit fast interval races interrupts legitimately), not
+		 * on the first pass after a pause (backlog is expected), and
+		 * not when the interrupt announced itself while the pass was
+		 * already consuming its work (pending set now - the wait will
+		 * wake right back up and find nothing, which is fine). Three
+		 * consecutive strikes: stop trusting interrupts and poll for
+		 * the rest of the session. */
+		if (dev->irq_service_active && !dev->irq_dead &&
+		    thread_dma_poll_interval_ms == 0 &&
+		    consumed > 0 && !from_irq && !was_inactive &&
+		    !atomic_read(&dev->dma_irq_pending)) {
+			dev->irq_missed++;
+			printk_ratelimited(KERN_WARNING "%s: completed DMA work found by the watchdog, not an interrupt (missed %llu)\n",
+				dev->name, dev->irq_missed);
+			if (++missed_streak >= 3) {
+				dev->irq_dead = true;
+				printk(KERN_ERR "%s: interrupt delivery lost - falling back to 2 ms polling for this session\n",
+					dev->name);
+			}
+		} else if (from_irq || consumed == 0) {
+			missed_streak = 0;
+		}
+		was_inactive = false;
 
 		if (need_dma_resync) {
 			if (!tear_requested_resync) {
@@ -632,27 +716,26 @@ static int sc0710_thread_hdmi_function(void *data)
 		//sc0710_i2c_read_status2(dev);
 		//sc0710_i2c_read_status3(dev);
 
-		/* Sync software scaler mode from module parameter.
-		 * This allows runtime toggling via:
-		 *   echo N > /sys/module/sc0710/parameters/scaler_mode
-		 * where N = 0 (disabled), 1 (upscale to 4K), 2 (downscale to 1080P).
-		 */
-		if (sc0710_software_scaler_allowed(dev) && scaler_mode <= 2) {
-			enum sc0710_scaler_mode new_mode = (enum sc0710_scaler_mode)scaler_mode;
-			if (dev->scaler_mode != new_mode) {
-				printk(KERN_INFO "%s: Software scaler mode changed: %s -> %s\n",
-					dev->name,
-					sc0710_scaler_mode_name(dev->scaler_mode),
-					sc0710_scaler_mode_name(new_mode));
-				dev->scaler_mode = new_mode;
-			}
-		}
-
 		mutex_unlock(&dev->kthread_hdmi_lock);
 	}
 
 	dprintk(1, "%s() Stopped\n", __func__);
 	return 0;
+}
+
+/* Runs when the last reference to the v4l2_device drops: at remove when no
+ * file handles remain, otherwise at the true last close of a node. Everything
+ * an open file handle can still reach (channels, queues, locks, the control
+ * handler) is embedded in dev, so this is the only safe point to free it. */
+static void sc0710_dev_release(struct v4l2_device *v4l2_dev)
+{
+	struct sc0710_dev *dev = container_of(v4l2_dev, struct sc0710_dev, v4l2_dev);
+
+	/* No-op unless the handler was initialized (4K Pro only); freed here
+	 * because open file handles unsubscribe control events through it. */
+	v4l2_ctrl_handler_free(&dev->ctrl_handler);
+	pci_dev_put(dev->pci);
+	kfree(dev);
 }
 
 static int sc0710_initdev(struct pci_dev *pci_dev,
@@ -670,9 +753,16 @@ static int sc0710_initdev(struct pci_dev *pci_dev,
 		printk(KERN_ERR "sc0710: v4l2_device_register failed (%d)\n", err);
 		goto fail_free;
 	}
+	/* From here on dev is freed only by sc0710_dev_release, when the last
+	 * reference drops (v4l2_device_put on the failure paths and at remove;
+	 * the v4l2 core holds a reference per registered node spanning every
+	 * open file handle's lifetime). */
+	dev->v4l2_dev.release = sc0710_dev_release;
 
-	/* pci init */
-	dev->pci = pci_dev;
+	/* pci init. The reference keeps the pci_dev (vb2's dma device, the
+	 * querycap bus_info source) valid for file handles that outlive a
+	 * remove; dropped in sc0710_dev_release. */
+	dev->pci = pci_dev_get(pci_dev);
 	if (pci_enable_device(pci_dev)) {
 		err = -EIO;
 		goto fail_v4l2;
@@ -703,6 +793,11 @@ static int sc0710_initdev(struct pci_dev *pci_dev,
 		goto fail_disable;
 	}
 
+	/* The PCI core defaults max_segment_size to 64 KiB, which would shred a
+	 * mapped video buffer into hundreds of segments; the XDMA has no such
+	 * limit (28-bit per-descriptor length). Only zero-copy buffers map SG. */
+	dma_set_max_seg_size(&pci_dev->dev, UINT_MAX);
+
 	/* MAP the PCIe space, register i2c, program any PCIe quirks.
 	 * Self-cleaning on failure: releases its own regions/mappings. */
 	if (sc0710_dev_setup(dev) < 0) {
@@ -710,10 +805,25 @@ static int sc0710_initdev(struct pci_dev *pci_dev,
 		goto fail_disable;
 	}
 
-	/* The card's interrupt line is never requested: the vendor design is
-	 * pure polling (the XDMA interrupt-enable masks are never armed, and
-	 * no interrupt was ever observed on hardware), so a handler would
-	 * only invite the spurious-IRQ detector on a shared INTx line. */
+	/* The vendor design is pure polling and never arms the XDMA IRQ block,
+	 * but the hardware delivers MSI once the block is armed: the
+	 * interrupt-driven service wakes the DMA thread per completed chain
+	 * and demotes polling to a watchdog tick. MSI only - a shared INTx
+	 * line with a wake-only handler would mask co-devices. */
+	if (irq_service) {
+		if (pci_alloc_irq_vectors(pci_dev, 1, 1, PCI_IRQ_MSI) == 1 &&
+		    pci_request_irq(pci_dev, 0, sc0710_irq, NULL, dev,
+				    "%s", dev->name) == 0) {
+			dev->irq_requested = true;
+			dev->irq_service_active = true;
+			printk(KERN_INFO "%s: interrupt-driven DMA service: MSI, irq %d\n",
+				dev->name, pci_irq_vector(pci_dev, 0));
+		} else {
+			pci_free_irq_vectors(pci_dev);
+			printk(KERN_WARNING "%s: could not request the interrupt line (MSI), falling back to polling\n",
+				dev->name);
+		}
+	}
 
 	/* Card specific tweaks with subsystems etc. On the 4K Pro this
 	 * includes programming the ECP5 video-frontend FPGA; if that fails,
@@ -793,7 +903,11 @@ fail_disable:
 	pci_disable_device(pci_dev);
 fail_v4l2:
 	v4l2_device_unregister(&dev->v4l2_dev);
+	v4l2_device_put(&dev->v4l2_dev);
+	return err;
 fail_free:
+	/* v4l2_device_register itself failed: no release callback is set,
+	 * no reference exists, free directly. */
 	kfree(dev);
 	return err;
 }
@@ -801,6 +915,7 @@ fail_free:
 static void sc0710_finidev(struct pci_dev *pci_dev)
 {
 	struct sc0710_dev *dev = pci_get_drvdata(pci_dev);
+	int i;
 
 	if (dev->kthread_dma) {
 		kthread_stop(dev->kthread_dma);
@@ -812,24 +927,78 @@ static void sc0710_finidev(struct pci_dev *pci_dev)
 		dev->kthread_hdmi = NULL;
 	}
 
-	sc0710_shutdown(dev);
+	/* Disconnect and quiesce in one kthread_dma_lock section: a racing
+	 * STREAMOFF/close either finishes its own stop-and-untarget before
+	 * this takes the lock, or blocks on it and then sees the flag with
+	 * the engines stopped and every chain pointed back at scratch, so
+	 * the vb2 teardown it goes on to run frees client buffers no
+	 * descriptor references. Every other file-handle-reachable hardware
+	 * path re-checks the flag after taking its serializing mutex and
+	 * bails with -ENODEV. */
+	mutex_lock(&dev->kthread_dma_lock);
+	WRITE_ONCE(dev->disconnected, true);
 
 	/* Stop the DMA engines explicitly rather than relying on
 	 * pci_disable_device clearing bus-master while they still run. */
 	sc0710_dma_channels_stop(dev);
 
-	pci_disable_device(pci_dev);
+	/* With the engines stopped and drained, return any zero-copy-targeted
+	 * buffers and point the chains back at the scratch ring, ahead of
+	 * anything that frees client buffers or the rings. */
+	for (i = 0; i < SC0710_MAX_CHANNELS; i++) {
+		struct sc0710_dma_channel *ch = &dev->channel[i];
 
+		if (ch->enabled && ch->mediatype == CHTYPE_VIDEO)
+			sc0710_dma_channel_untarget_all(ch);
+	}
+	mutex_unlock(&dev->kthread_dma_lock);
+
+	/* Unlink first: the /proc readers walk this list and read registers. */
 	mutex_lock(&devlist);
 	list_del(&dev->devlist);
 	mutex_unlock(&devlist);
 
+	/* Take the user-facing nodes down before any hardware teardown,
+	 * mirroring the probe's register-last order. */
+	for (i = 0; i < SC0710_MAX_CHANNELS; i++) {
+		struct sc0710_dma_channel *ch = &dev->channel[i];
+
+		if (!ch->enabled)
+			continue;
+		if (ch->mediatype == CHTYPE_VIDEO)
+			sc0710_video_unregister(ch);
+		else if (ch->mediatype == CHTYPE_AUDIO)
+			sc0710_audio_unregister(dev);
+	}
+
+	/* Drain barrier: the remaining file-handle-reachable hardware paths
+	 * serialize on signalMutex and re-check the disconnected flag after
+	 * acquiring it (the kthread_dma_lock paths were drained by the
+	 * disconnect section above). In-flight holders finish their
+	 * transaction against still-mapped BARs before we proceed; later
+	 * entrants bail; brand-new entries were already refused by the node
+	 * unregistration above. */
+	mutex_lock(&dev->signalMutex);
+	mutex_unlock(&dev->signalMutex);
+
+	/* Shut the frame timers down and wake blocked buffer waiters. */
+	for (i = 0; i < SC0710_MAX_CHANNELS; i++) {
+		struct sc0710_dma_channel *ch = &dev->channel[i];
+
+		if (ch->enabled && ch->mediatype == CHTYPE_VIDEO)
+			sc0710_video_disconnect(ch);
+	}
+
+	sc0710_shutdown(dev);
+
+	pci_disable_device(pci_dev);
+
 	sc0710_dev_unregister(dev);
 
-	/* Free software scaler staging buffer if allocated */
-	if (dev->scaler_staging_buf) {
-		vfree(dev->scaler_staging_buf);
-		dev->scaler_staging_buf = NULL;
+	/* Free frame staging buffers if allocated */
+	if (dev->frame_staging_buf) {
+		vfree(dev->frame_staging_buf);
+		dev->frame_staging_buf = NULL;
 	}
 	if (dev->weave_staging_buf) {
 		vfree(dev->weave_staging_buf);
@@ -837,7 +1006,10 @@ static void sc0710_finidev(struct pci_dev *pci_dev)
 	}
 
 	v4l2_device_unregister(&dev->v4l2_dev);
-	kfree(dev);
+
+	/* Drop the probe's reference. The release callback fires here when no
+	 * file handles remain, else at the true last close of a node. */
+	v4l2_device_put(&dev->v4l2_dev);
 }
 
 static struct pci_device_id sc0710_pci_tbl[] = {
@@ -877,6 +1049,7 @@ static int __init sc0710_init(void)
 	printk(KERN_INFO "sc0710: snapshot date %04d-%02d-%02d\n",
 	       SNAPSHOT/10000, (SNAPSHOT/100)%100, SNAPSHOT%100);
 #endif
+
 #ifdef CONFIG_PROC_FS
 	ret = sc0710_proc_create();
 	if (ret < 0) {

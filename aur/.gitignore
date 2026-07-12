@@ -1,0 +1,7 @@
+# makepkg build/output artifacts
+/pkg/
+/src/
+/sc0710/
+*.pkg.tar.*
+*.src.tar.*
+*.log
