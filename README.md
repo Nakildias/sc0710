@@ -243,6 +243,18 @@ An RGB-only EDID (color-encoding bits `00`, no YCbCr flags) makes the source out
 4:4:4 — the wire to pair with `BGR24` for bit-accurate 4:4:4 capture. The source
 renegotiates ~8–10 s after a write (a brief re-detect of the old mode first is normal).
 
+### Low-latency capture
+
+* **Interrupt-driven completion (`irq_service=1`, default)** — the card's MSI wakes
+  the DMA service when a frame completes, replacing the 2 ms completion polling;
+  completion latency drops to interrupt latency and the idle polling load goes away.
+  Polling survives as a 100 ms watchdog tick: completed work the watchdog finds that
+  no interrupt announced is logged and counted (`irq:` line in `/proc/sc0710-state`),
+  and three consecutive misses drop the session back to 2 ms polling with a KERN_ERR
+  in dmesg. `irq_service=0` restores classic polling; failed MSI allocation logs a
+  warning and falls back to polling. (`thread_dma_poll_interval_ms` remains as an
+  override for the service tick; the default auto-selects.)
+
 ## Troubleshooting
 
 | Problem | What to try |

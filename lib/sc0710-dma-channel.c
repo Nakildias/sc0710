@@ -576,6 +576,7 @@ int sc0710_dma_channel_service(struct sc0710_dma_channel *ch)
 	u32 cached_interlaced;
 	u32 wbm[2];
 	u32 v;
+	int consumed = 0;
 	int i;
 
 	mutex_lock(&ch->lock);
@@ -639,6 +640,7 @@ int sc0710_dma_channel_service(struct sc0710_dma_channel *ch)
 		 * need to process a complete video/audio transfer.
 		 */
 		if (wbm[0] && wbm[1]) {
+			consumed++;
 
 			if (sc0710_debug_mode > 2) {
 				printk("%s ch#%d    [%02d] %08x - wbm %08x %08x (DQ) segs: %d\n",
@@ -678,7 +680,7 @@ int sc0710_dma_channel_service(struct sc0710_dma_channel *ch)
 	}
 
 	mutex_unlock(&ch->lock);
-	return 0; /* Success */
+	return consumed;
 }
 
 /* Build the scatter gather table chaining all of the chains and decriptors together. */
@@ -713,7 +715,15 @@ static int sc0710_dma_channel_chains_link(struct sc0710_dma_channel *ch)
 				dca->desc->next_h = ((u64)curr_tbl + sizeof(struct sc0710_dma_descriptor)) >> 32;
 			}
 
+			/* The Completed control bit - which the vendor never uses -
+			 * makes the engine raise a completion event (with the IRQ
+			 * block armed, an interrupt) for the descriptor. The
+			 * interrupt-driven service wants one per chain, so the
+			 * last descriptor carries it. */
 			dca->desc->control     = 0xAD4B0000;
+			if (ch->dev->irq_service_active &&
+			    j + 1 == chain->numAllocations)
+				dca->desc->control |= 0x02;
 			dca->desc->lengthBytes = dca->buf_size;
 			dca->desc->src_l       = (u64)curr_wbm;
 			dca->desc->src_h       = (u64)curr_wbm >> 32;
@@ -1022,6 +1032,21 @@ int sc0710_dma_channel_start(struct sc0710_dma_channel *ch)
 {
 	if (ch->state == STATE_RUNNING)
 		return 0;
+
+	/* Engine-level interrupt enables are already set at prep, but the
+	 * vendor never arms the IRQ block's channel mask (0x2010, W1S 0x2014
+	 * / W1C 0x2018) or the vector mapping (0x20a0/0x20a4). Arm the block
+	 * for the interrupt-driven service; clear it otherwise so reloads
+	 * never inherit it. */
+	if (ch->mediatype == CHTYPE_VIDEO) {
+		if (ch->dev->irq_service_active) {
+			sc_write(ch->dev, 1, 0x20a0, 0);
+			sc_write(ch->dev, 1, 0x20a4, 0);
+			sc_write(ch->dev, 1, 0x2014, 0xff);
+		} else {
+			sc_write(ch->dev, 1, 0x2018, 0xff);
+		}
+	}
 
 	sc_write(ch->dev, 1, ch->reg_dma_control_w1s, 0x00000001);
 

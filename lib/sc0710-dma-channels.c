@@ -151,20 +151,21 @@ int sc0710_dma_channels_start(struct sc0710_dev *dev)
 	return 0;
 }
 
-/* Called every 2m in polled DMA mode, check
- * each dma channel. If writeback metadata suggests a transfer
+/* Check each dma channel. If writeback metadata suggests a transfer
  * has completed, process it and hand the audio/video to linux
- * subsystems.
+ * subsystems. Returns the number of chain completions consumed.
  */
 int sc0710_dma_channels_service(struct sc0710_dev *dev)
 {
-	int i, ret;
+	int i, ret, consumed = 0;
 
 	for (i = 0; i < SC0710_MAX_CHANNELS; i++) {
 		if (!dev->channel[i].enabled)
 			continue;
 		ret = sc0710_dma_channel_service(&dev->channel[i]);
+		if (ret > 0)
+			consumed += ret;
 	}
 
-	return 0;
+	return consumed;
 }

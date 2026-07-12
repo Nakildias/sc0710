@@ -75,8 +75,7 @@ load: all
 	# with "Unknown symbol in module". Load exactly the modules modpost recorded in the
 	# built .ko's "depends" field (videodev, videobuf2-*, snd, snd-pcm).
 	D=$$(modinfo -F depends ./build/sc0710.ko | tr ',' ' '); [ -z "$$D" ] || sudo modprobe -a $$D
-	sudo insmod ./build/sc0710.ko \
-		thread_dma_poll_interval_ms=2
+	sudo insmod ./build/sc0710.ko
 
 unload:
 	# Plain rmmod refuses while something holds /dev/video* open - that refusal

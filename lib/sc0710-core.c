@@ -25,6 +25,7 @@
 #include <linux/vmalloc.h>
 #include <linux/module.h>
 #include <linux/idr.h>
+#include <linux/interrupt.h>
 #include "sc0710.h"
 
 MODULE_DESCRIPTION("Elgato 4K60 Pro MK.2 / 4K Pro capture driver");
@@ -51,9 +52,20 @@ unsigned int thread_hdmi_poll_interval_ms = 200;
 module_param(thread_hdmi_poll_interval_ms, int, 0644);
 MODULE_PARM_DESC(thread_hdmi_poll_interval_ms, "have the kernel thread poll hdmi every N ms (def:200)");
 
-unsigned int thread_dma_poll_interval_ms = 2;
+unsigned int thread_dma_poll_interval_ms;
 module_param(thread_dma_poll_interval_ms, int, 0644);
-MODULE_PARM_DESC(thread_dma_poll_interval_ms, "have the kernel thread poll dma every N ms (def:2)");
+MODULE_PARM_DESC(thread_dma_poll_interval_ms,
+	"DMA service tick in ms. 0 (default) = auto: 100 (watchdog duty) while the "
+	"interrupt-driven service is active, 2 (completion polling) otherwise. An "
+	"explicit value always wins.");
+
+unsigned int irq_service = 1;
+module_param(irq_service, uint, 0444);
+MODULE_PARM_DESC(irq_service,
+	"Interrupt-driven DMA completion service (1=on, default): the card's MSI "
+	"wakes the service thread and polling drops to a watchdog tick. 0 = classic "
+	"completion polling. If MSI allocation fails, the driver falls back to "
+	"polling loudly.");
 
 unsigned int sc0710_debug_mode = 0;
 module_param(sc0710_debug_mode, int, 0644);
@@ -210,6 +222,8 @@ static int sc0710_dev_setup(struct sc0710_dev *dev)
 	/* The keepalive thread needs a mutex */
 	mutex_init(&dev->kthread_hdmi_lock);
 	mutex_init(&dev->kthread_dma_lock);
+	init_waitqueue_head(&dev->dma_wq);
+	atomic_set(&dev->dma_irq_pending, 0);
 	dev->pixfmt = &sc0710_pixfmts[0];
 
 	if (get_resources(dev) < 0) {
@@ -254,9 +268,39 @@ static int sc0710_dev_setup(struct sc0710_dev *dev)
 	return 0;
 }
 
+/* One interrupt per completed chain (the Completed bit on each chain's last
+ * descriptor): count it, sample-and-clear the engine status sources (the
+ * read-to-clear deasserts the request so the next event can fire; completion
+ * detection itself is writeback-based and derives nothing from them) and
+ * wake the DMA service thread. */
+static irqreturn_t sc0710_irq(int irq, void *dev_id)
+{
+	struct sc0710_dev *dev = dev_id;
+
+	if (!dev->irq_requested)
+		return IRQ_NONE;
+
+	dev->irq_count++;
+	dev->irq_status_seen |= sc_read(dev, 1, 0x1044);
+	dev->irq_status_seen |= sc_read(dev, 1, 0x1144);
+
+	if (dev->irq_service_active) {
+		atomic_set(&dev->dma_irq_pending, 1);
+		wake_up(&dev->dma_wq);
+	}
+	return IRQ_HANDLED;
+}
+
 static void sc0710_dev_unregister(struct sc0710_dev *dev)
 {
 	int bar1_idx = sc0710_boards[dev->board].bar1_index;
+
+	/* Before the BARs unmap: the probe handler reads them. */
+	if (dev->irq_requested) {
+		dev->irq_requested = false;
+		pci_free_irq(dev->pci, 0, dev);
+		pci_free_irq_vectors(dev->pci);
+	}
 
 	sc0710_dma_channels_free(dev);
 
@@ -288,6 +332,12 @@ static int sc0710_proc_state_show(struct seq_file *m, void *v)
 		dev = list_entry(list, struct sc0710_dev, devlist);
 
 		seq_printf(m, "%s\n", dev->name);
+
+		if (dev->irq_requested)
+			seq_printf(m, "         irq: delivered %llu, missed %llu, completions %llu, status %08x%s\n",
+				dev->irq_count, dev->irq_missed, dev->dma_completions,
+				dev->irq_status_seen,
+				dev->irq_dead ? " [IRQ LOST - polling]" : "");
 
 		/* Cached state only: this file is world-readable, so its read path
 		 * must not run I2C or trigger a DMA reconfig; the HDMI poll
@@ -493,6 +543,8 @@ static int sc0710_thread_dma_function(void *data)
 	struct sc0710_dev *dev = data;
 	int need_dma_resync;
 	int tear_requested_resync;
+	bool was_inactive = false;
+	int missed_streak = 0;
 	int i;
 
 	dprintk(1, "%s() Started\n", __func__);
@@ -502,23 +554,42 @@ static int sc0710_thread_dma_function(void *data)
 	set_freezable();
 
 	while (1) {
-		/* The param is root-writable at runtime; 0 would busy-loop this
-		 * thread. */
-		msleep_interruptible(max_t(unsigned int, thread_dma_poll_interval_ms, 1));
+		unsigned int ms = thread_dma_poll_interval_ms;
+		bool from_irq;
+		int consumed;
+
+		/* 0 = auto: watchdog duty while the interrupt-driven service
+		 * is healthy, classic completion polling otherwise. An explicit
+		 * value always wins (the runtime workaround knob if interrupts
+		 * misbehave); the >=1 clamp keeps a written 0 from busy-looping
+		 * this thread. */
+		if (ms == 0)
+			ms = (dev->irq_service_active && !dev->irq_dead) ? 100 : 2;
+		wait_event_freezable_timeout(dev->dma_wq,
+			atomic_read(&dev->dma_irq_pending) || kthread_should_stop(),
+			msecs_to_jiffies(max_t(unsigned int, ms, 1)));
+
+		/* Always consume the wake flag, even on paused or exiting
+		 * passes - a set flag would turn the wait into a busy loop.
+		 * The xchg is a full barrier: the clear is ordered before the
+		 * completion reads below, so a completion that raced the flag
+		 * can't lose its wake. */
+		from_irq = atomic_xchg(&dev->dma_irq_pending, 0);
 
 		if (kthread_should_stop())
 			break;
 
-		try_to_freeze();
-
-		if (thread_dma_active == 0)
+		if (thread_dma_active == 0) {
+			was_inactive = true;
 			continue;
+		}
 
 		need_dma_resync = 0;
 		tear_requested_resync = 0;
+		consumed = 0;
 		mutex_lock(&dev->kthread_dma_lock);
 		if (!dev->reconfig_in_progress) {
-			sc0710_dma_channels_service(dev);
+			consumed = sc0710_dma_channels_service(dev);
 			need_dma_resync = sc0710_dma_watchdog_check_locked(dev);
 			if (!need_dma_resync && dev->tear_resync_pending) {
 				dev->tear_resync_pending = 0;
@@ -529,6 +600,36 @@ static int sc0710_thread_dma_function(void *data)
 			}
 		}
 		mutex_unlock(&dev->kthread_dma_lock);
+
+		if (consumed > 0)
+			dev->dma_completions += consumed;
+
+		/* Interrupt-loss tripwire: a timeout pass that still found
+		 * completed work means the interrupt for that work never
+		 * arrived. Only meaningful on the auto watchdog cadence (an
+		 * explicit fast interval races interrupts legitimately), not
+		 * on the first pass after a pause (backlog is expected), and
+		 * not when the interrupt announced itself while the pass was
+		 * already consuming its work (pending set now - the wait will
+		 * wake right back up and find nothing, which is fine). Three
+		 * consecutive strikes: stop trusting interrupts and poll for
+		 * the rest of the session. */
+		if (dev->irq_service_active && !dev->irq_dead &&
+		    thread_dma_poll_interval_ms == 0 &&
+		    consumed > 0 && !from_irq && !was_inactive &&
+		    !atomic_read(&dev->dma_irq_pending)) {
+			dev->irq_missed++;
+			printk_ratelimited(KERN_WARNING "%s: completed DMA work found by the watchdog, not an interrupt (missed %llu)\n",
+				dev->name, dev->irq_missed);
+			if (++missed_streak >= 3) {
+				dev->irq_dead = true;
+				printk(KERN_ERR "%s: interrupt delivery lost - falling back to 2 ms polling for this session\n",
+					dev->name);
+			}
+		} else if (from_irq || consumed == 0) {
+			missed_streak = 0;
+		}
+		was_inactive = false;
 
 		if (need_dma_resync) {
 			if (!tear_requested_resync) {
@@ -674,10 +775,25 @@ static int sc0710_initdev(struct pci_dev *pci_dev,
 		goto fail_disable;
 	}
 
-	/* The card's interrupt line is never requested: the vendor design is
-	 * pure polling (the XDMA interrupt-enable masks are never armed, and
-	 * no interrupt was ever observed on hardware), so a handler would
-	 * only invite the spurious-IRQ detector on a shared INTx line. */
+	/* The vendor design is pure polling and never arms the XDMA IRQ block,
+	 * but the hardware delivers MSI once the block is armed: the
+	 * interrupt-driven service wakes the DMA thread per completed chain
+	 * and demotes polling to a watchdog tick. MSI only - a shared INTx
+	 * line with a wake-only handler would mask co-devices. */
+	if (irq_service) {
+		if (pci_alloc_irq_vectors(pci_dev, 1, 1, PCI_IRQ_MSI) == 1 &&
+		    pci_request_irq(pci_dev, 0, sc0710_irq, NULL, dev,
+				    "%s", dev->name) == 0) {
+			dev->irq_requested = true;
+			dev->irq_service_active = true;
+			printk(KERN_INFO "%s: interrupt-driven DMA service: MSI, irq %d\n",
+				dev->name, pci_irq_vector(pci_dev, 0));
+		} else {
+			pci_free_irq_vectors(pci_dev);
+			printk(KERN_WARNING "%s: could not request the interrupt line (MSI), falling back to polling\n",
+				dev->name);
+		}
+	}
 
 	/* Card specific tweaks with subsystems etc. On the 4K Pro this
 	 * includes programming the ECP5 video-frontend FPGA; if that fails,

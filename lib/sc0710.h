@@ -494,6 +494,17 @@ struct sc0710_dev {
 	int reconfig_in_progress;
 	int tear_resync_pending;
 
+	/* Interrupt-driven DMA service (irq_service) */
+	bool irq_requested;
+	bool irq_service_active;   /* line requested via MSI and service enabled */
+	bool irq_dead;             /* tripwire: interrupts lost, polling again */
+	wait_queue_head_t dma_wq;
+	atomic_t dma_irq_pending;
+	u64  irq_count;
+	u64  irq_missed;
+	u64  dma_completions;
+	u32  irq_status_seen;      /* OR of engine statuses sampled in the handler */
+
 	/* Debounce: require consecutive stable polls before triggering reconfig */
 	u32 timing_stable_count;
 	u32 pending_pixelLineH, pending_pixelLineV;
