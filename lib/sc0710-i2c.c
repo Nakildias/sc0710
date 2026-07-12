@@ -759,9 +759,6 @@ int sc0710_i2c_read_hdmi_status(struct sc0710_dev *dev)
 		}
 	}
 
-	if (was_locked && (!dev->locked || !dev->fmt))
-		sc0710_audio_on_signal_lost(dev);
-
 	mutex_unlock(&dev->signalMutex);
 	return 0; /* Success */
 
@@ -913,8 +910,6 @@ confirmed_timing_change:
 	}
 
 	sc0710_video_notify_source_change(dev);
-
-	sc0710_audio_on_signal_restored(dev);
 
 	return 0;
 }

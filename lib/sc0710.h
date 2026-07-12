@@ -383,7 +383,7 @@ struct sc0710_audio_dev
 	snd_pcm_uframes_t          buffer_ptr;
 	snd_pcm_uframes_t          period_pos;
 	bool                       running;
-	bool                       silence_active;
+	unsigned long              last_sample_jiffies; /* Last real-sample delivery */
 	struct delayed_work        silence_work;
 };
 
@@ -583,5 +583,3 @@ int  sc0710_audio_register(struct sc0710_dev *dev);
 void sc0710_audio_unregister(struct sc0710_dev *dev);
 int  sc0710_audio_deliver_samples(struct sc0710_dev *dev, struct sc0710_dma_channel *ch,
         const u8 *buf, int bitdepth, int strideBytes, int channels, int samplesPerChannel);
-void sc0710_audio_on_signal_lost(struct sc0710_dev *dev);
-void sc0710_audio_on_signal_restored(struct sc0710_dev *dev);

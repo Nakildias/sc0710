@@ -30,22 +30,14 @@ MODULE_PARM_DESC(audio_debug, "enable debug messages [audio]");
 #define SC0710_AUDIO_RATE_HZ        48000
 #define SC0710_AUDIO_SILENCE_MS       10
 #define SC0710_AUDIO_SILENCE_SAMPLES  ((SC0710_AUDIO_RATE_HZ * SC0710_AUDIO_SILENCE_MS) / 1000)
+/* Real-delivery pause before the watchdog starts feeding silence; must sit
+ * well above normal DMA completion jitter (single-digit ms). */
+#define SC0710_AUDIO_GAP_MS           100
 
 #define dprintk(level, fmt, arg...)\
 	do { if (audio_debug >= level)\
 		printk(KERN_DEBUG "%s/0: " fmt, dev->name, ## arg);\
 	} while (0)
-
-static bool sc0710_audio_hdmi_active(struct sc0710_dev *dev)
-{
-	bool active;
-
-	mutex_lock(&dev->signalMutex);
-	active = dev->locked && dev->fmt;
-	mutex_unlock(&dev->signalMutex);
-
-	return active;
-}
 
 static void sc0710_audio_push_frames(struct sc0710_audio_dev *chip,
 				     unsigned int samples, const u8 *src,
@@ -87,34 +79,52 @@ static void sc0710_audio_push_frames(struct sc0710_audio_dev *chip,
 	}
 }
 
-/* Runs in a kworker (process context), so it may take the sleeping
- * ch->lock / signalMutex -- unlike the old timer callback (softirq),
- * which caused the "scheduling while atomic" panic on signal loss. */
+/* Delivery-gap watchdog, armed for the whole capture session. The DMA
+ * path stops delivering samples on signal loss, across a resolution
+ * switch's DMA stop/restart, and while HDMI audio renegotiates after a
+ * mode change; a capture stream that makes no progress for 10 s is
+ * killed by the ALSA core (read returns -EIO) and takes the app's audio
+ * with it. Whenever real samples pause for longer than the gap
+ * threshold this feeds silence in their place, so the stream survives
+ * and real audio resumes seamlessly.
+ * Runs in a kworker (process context), so it may take the sleeping
+ * ch->lock -- unlike a timer callback (softirq), which caused a
+ * "scheduling while atomic" panic on signal loss. */
 static void sc0710_audio_silence_work_fn(struct work_struct *work)
 {
 	struct sc0710_audio_dev *chip =
 		container_of(work, struct sc0710_audio_dev, silence_work.work);
 	struct sc0710_dev *dev = chip->dev;
 	struct sc0710_dma_channel *ch = &dev->channel[1];
+	unsigned long deadline, now, next;
 
 	mutex_lock(&ch->lock);
-	if (!chip->running || !chip->substream || !chip->silence_active) {
+	if (!chip->running || !chip->substream) {
 		mutex_unlock(&ch->lock);
 		return;
 	}
 
-	if (sc0710_audio_hdmi_active(dev)) {
-		chip->silence_active = false;
-		mutex_unlock(&ch->lock);
-		return;
+	/* One jiffies sample for both the check and the sleep length: a
+	 * re-read racing past the deadline would wrap the subtraction. */
+	now = jiffies;
+	deadline = chip->last_sample_jiffies + msecs_to_jiffies(SC0710_AUDIO_GAP_MS);
+	if (time_after(now, deadline)) {
+		if (audio_debug)
+			printk_ratelimited(KERN_INFO "%s: audio delivery gap, feeding ALSA silence\n",
+				dev->name);
+		sc0710_audio_push_frames(chip, SC0710_AUDIO_SILENCE_SAMPLES, NULL, 0, true);
+		next = msecs_to_jiffies(SC0710_AUDIO_SILENCE_MS);
+	} else {
+		/* Healthy delivery: sleep until the gap threshold after the
+		 * most recent real samples, instead of ticking every period.
+		 * Real deliveries move the deadline forward; this wake just
+		 * re-checks it. */
+		next = deadline - now + 1;
 	}
-
-	sc0710_audio_push_frames(chip, SC0710_AUDIO_SILENCE_SAMPLES, NULL, 0, true);
 
 	/* re-check: running can be cleared via the ALSA trigger without ch->lock */
-	if (chip->silence_active && chip->running && chip->substream)
-		mod_delayed_work(system_wq, &chip->silence_work,
-				 msecs_to_jiffies(SC0710_AUDIO_SILENCE_MS));
+	if (chip->running && chip->substream)
+		mod_delayed_work(system_wq, &chip->silence_work, next);
 
 	mutex_unlock(&ch->lock);
 }
@@ -126,43 +136,7 @@ static void sc0710_audio_stop_silence(struct sc0710_audio_dev *chip)
 	if (!chip)
 		return;
 
-	chip->silence_active = false;
 	cancel_delayed_work_sync(&chip->silence_work);
-}
-
-void sc0710_audio_on_signal_lost(struct sc0710_dev *dev)
-{
-	struct sc0710_dma_channel *ch = &dev->channel[1];
-	struct sc0710_audio_dev *chip = ch->audio_dev;
-
-	if (!chip || !chip->running || !chip->substream || chip->silence_active)
-		return;
-
-	chip->silence_active = true;
-	mod_delayed_work(system_wq, &chip->silence_work,
-			 msecs_to_jiffies(SC0710_AUDIO_SILENCE_MS));
-
-	if (audio_debug)
-		printk(KERN_INFO "%s: HDMI signal lost, delivering ALSA silence\n", dev->name);
-}
-
-void sc0710_audio_on_signal_restored(struct sc0710_dev *dev)
-{
-	struct sc0710_dma_channel *ch = &dev->channel[1];
-	struct sc0710_audio_dev *chip = ch->audio_dev;
-
-	if (!chip || !chip->silence_active)
-		return;
-
-	if (!sc0710_audio_hdmi_active(dev))
-		return;
-
-	/* async cancel is enough -- the work re-checks and self-stops */
-	chip->silence_active = false;
-	cancel_delayed_work(&chip->silence_work);
-
-	if (audio_debug)
-		printk(KERN_INFO "%s: HDMI signal restored, resuming capture audio\n", dev->name);
 }
 
 static void sc0710_audio_init_silence_work(struct sc0710_audio_dev *chip)
@@ -196,6 +170,7 @@ int sc0710_audio_deliver_samples(struct sc0710_dev *dev, struct sc0710_dma_chann
 		return -1;
 
 	sc0710_audio_push_frames(chip, samplesPerChannel, buf, strideBytes, false);
+	chip->last_sample_jiffies = jiffies;
 
 	sc0710_things_per_second_update(&ch->audioSamplesPerSecond,
 					samplesPerChannel * 2);
@@ -342,17 +317,19 @@ static int snd_sc0710_capture_trigger(struct snd_pcm_substream *substream, int c
 
 	switch (cmd) {
 	case SNDRV_PCM_TRIGGER_START:
-		/* trigger runs under snd_pcm_stream_lock (atomic): read signal
-		 * state locklessly, never via the sleeping signalMutex. */
+		/* Baseline for the gap watchdog: with no signal at START the
+		 * first silence fill lands one gap threshold later. Trigger
+		 * runs under snd_pcm_stream_lock (atomic); mod_delayed_work
+		 * is safe there. */
+		chip->last_sample_jiffies = jiffies;
 		chip->running = true;
-		if (!(READ_ONCE(dev->locked) && READ_ONCE(dev->fmt)))
-			sc0710_audio_on_signal_lost(dev);
+		mod_delayed_work(system_wq, &chip->silence_work,
+				 msecs_to_jiffies(SC0710_AUDIO_GAP_MS));
 		return 0;
 
 	case SNDRV_PCM_TRIGGER_STOP:
 		/* atomic context: async cancel only; pcm_close() does the sync teardown */
 		chip->running = false;
-		chip->silence_active = false;
 		cancel_delayed_work(&chip->silence_work);
 		return 0;
 
@@ -451,7 +428,6 @@ int sc0710_audio_register(struct sc0710_dev *dev)
 	chip->dev = dev;
 	chip->buffer_ptr = 0;
 	chip->running = false;
-	chip->silence_active = false;
 	sc0710_audio_init_silence_work(chip);
 
 	err = snd_sc0710_pcm(chip, 0, "sc0710 HDMI");
