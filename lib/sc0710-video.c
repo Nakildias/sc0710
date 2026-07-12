@@ -316,24 +316,13 @@ void sc0710_video_free_status_frames(void)
 	mutex_unlock(&status_frames_lock);
 }
 
-/* Compute the effective output dimensions, accounting for the software scaler.
- * When the scaler is active, the output resolution differs
- * from the source resolution.  When disabled, output = source.
- */
+/* Compute the output dimensions and frame size for a detected format. */
 static void sc0710_get_effective_size(struct sc0710_dev *dev,
 	const struct sc0710_format *fmt, u32 *width, u32 *height, u32 *framesize)
 {
-	u32 w = fmt->width;
-	u32 h = fmt->height;
-
-	if (sc0710_software_scaler_allowed(dev) &&
-	    dev->scaler_mode != SCALER_MODE_DISABLED) {
-		sc0710_scaler_get_output_size(dev, w, h, &w, &h);
-	}
-
-	*width = w;
-	*height = h;
-	*framesize = w * 2 * h;
+	*width = fmt->width;
+	*height = fmt->height;
+	*framesize = fmt->width * 2 * fmt->height;
 }
 
 static void fill_frame(struct sc0710_dma_channel *ch,
@@ -1001,8 +990,6 @@ static int vidioc_subscribe_event(struct v4l2_fh *fh,
 /* VB2 buffer operations                                       */
 /* ----------------------------------------------------------- */
 
-#define SC0710_MAX_FRAME_SIZE (3840u * 2u * 2160u)
-
 static int sc0710_queue_setup(struct vb2_queue *q,
 	unsigned int *num_buffers, unsigned int *num_planes,
 	unsigned int sizes[], struct device *alloc_devs[])
@@ -1012,33 +999,23 @@ static int sc0710_queue_setup(struct vb2_queue *q,
 	struct sc0710_dev *dev = ch->dev;
 	const struct sc0710_format *fmt;
 	u32 eff_w, eff_h, eff_fs;
-	int dynamic_res_active;
 
 	/* Use real format if available, otherwise use lastfmt, then default */
 	fmt = dev->fmt ? dev->fmt : (dev->last_fmt ? dev->last_fmt : sc0710_get_default_format());
 
 	sc0710_get_effective_size(dev, fmt, &eff_w, &eff_h, &eff_fs);
 
-	dynamic_res_active = (!auto_scaler &&
-			      dev->scaler_mode == SCALER_MODE_DISABLED);
-
 	if (*num_buffers < 2)
 		*num_buffers = 2;
 
 	*num_planes = 1;
 
-	if (dynamic_res_active) {
-		/* Allocate at max resolution so any mid-stream resolution
-		 * change fits without killing the stream or truncating.
-		 */
-		sizes[0] = SC0710_MAX_FRAME_SIZE;
-		dprintk(2, "%s() dynamic res: buffer count=%d, size=%d (max 4K)\n",
-			__func__, *num_buffers, sizes[0]);
-	} else {
-		sizes[0] = eff_fs;
-		dprintk(2, "%s() buffer count=%d, size=%d\n",
-			__func__, *num_buffers, sizes[0]);
-	}
+	/* Negotiated size only. A mid-stream resolution change routes
+	 * through V4L2_EVENT_SOURCE_CHANGE and renegotiation, so buffers
+	 * never need to hold more than the negotiated frame. */
+	sizes[0] = eff_fs;
+	dprintk(2, "%s() buffer count=%d, size=%d\n",
+		__func__, *num_buffers, sizes[0]);
 
 	return 0;
 }
@@ -1058,16 +1035,13 @@ static int sc0710_buf_prepare(struct vb2_buffer *vb)
 
 	sc0710_get_effective_size(dev, fmt, &eff_w, &eff_h, &eff_fs);
 
-	/* When auto_scaler is active the dequeue path scales every frame
-	 * to match the client's stream resolution.  Buffers only need to
-	 * hold that scaled output, not the raw source frame.
-	 */
-	if (auto_scaler && client->stream_framesize &&
-	    client->stream_framesize < eff_fs) {
-		eff_w = client->stream_width;
-		eff_h = client->stream_height;
+	/* While streaming, delivery writes at most the locked stream size
+	 * (mismatched sources are skipped and placeholders clamp to the
+	 * buffer), so requeues validate against that; checking a newer,
+	 * larger detected format would break the client's QBUF loop
+	 * mid-stream. */
+	if (client->streaming && client->stream_framesize)
 		eff_fs = client->stream_framesize;
-	}
 
 	if (vb2_plane_size(vb, 0) < eff_fs) {
 		dprintk(0, "%s() buffer too small (%lu < %u)\n",
@@ -1110,8 +1084,9 @@ static int sc0710_start_streaming(struct vb2_queue *q, unsigned int count)
 		generate_status_frames_if_needed();
 
 	/* Record the resolution this client expects for its entire stream
-	 * lifetime.  Dynamic resolution mode uses this to scale frames
-	 * back to the client's expected size when the source changes.
+	 * lifetime.  Frames are delivered only while the source still
+	 * matches it; after a source change the client is expected to
+	 * restart streaming (V4L2_EVENT_SOURCE_CHANGE).
 	 */
 	{
 		const struct sc0710_format *sfmt;
@@ -1629,29 +1604,36 @@ static void sc0710_vid_timeout(struct timer_list *t)
 	struct sc0710_dev *dev = ch->dev;
 	struct sc0710_client *client;
 	const struct sc0710_format *fmt;
+	const struct sc0710_format *live_fmt;
 	unsigned long flags, buf_flags;
 	int any_streaming = 0;
+	int dma_active;
+	u32 live_w = 0, live_h = 0;
 	u32 eff_w, eff_h, eff_fs;
 
 	/* Use lastfmt for placeholder frames to render at last known resolution */
 	fmt = dev->last_fmt ? dev->last_fmt : sc0710_get_default_format();
 
-	/* Compute effective (possibly scaled) output dimensions */
 	sc0710_get_effective_size(dev, fmt, &eff_w, &eff_h, &eff_fs);
 
-	/* If we have real signal and the channel is running, DMA is handling
-	 * frame delivery, just reschedule.
+	/* With a live signal and a running channel, DMA is delivering to
+	 * every client whose locked resolution matches the detected format;
+	 * those are skipped below, and placeholders go only to clients
+	 * pending renegotiation after a source change.
 	 * The state check keeps a stopped channel (failed DMA reconfigure with
-	 * signal still locked) on the placeholder path below.
-	 * ch->state is read unlocked; staleness costs one placeholder frame. */
-	if (dev->fmt != NULL && dev->locked && ch->state == STATE_RUNNING) {
-		/* Re-set the buffer timeout for DMA monitoring */
-		if (atomic_read(&ch->streaming_refcount) > 0)
-			mod_timer(&ch->timeout, jiffies + VBUF_TIMEOUT);
-		return;
+	 * signal still locked) on the placeholder path.
+	 * dev->fmt, dev->locked and ch->state are read unlocked; staleness
+	 * costs one placeholder frame. The fmt pointer is snapshotted once:
+	 * the HDMI thread NULLs it on signal loss, and a stale pointer stays
+	 * valid (static tables, double-buffered dynamic slots) where a second
+	 * read would not. */
+	live_fmt = READ_ONCE(dev->fmt);
+	dma_active = (live_fmt != NULL && dev->locked && ch->state == STATE_RUNNING);
+	if (dma_active) {
+		live_w = live_fmt->width;
+		live_h = live_fmt->height;
 	}
 
-	/* No signal - deliver placeholder frames to all streaming clients */
 	dprintk(0, "%s(ch#%d) - delivering placeholder frames\n", __func__, ch->nr);
 
 	spin_lock_irqsave(&ch->client_list_lock, flags);
@@ -1663,6 +1645,11 @@ static void sc0710_vid_timeout(struct timer_list *t)
 			continue;
 
 		any_streaming = 1;
+
+		if (dma_active &&
+		    client->stream_width == live_w &&
+		    client->stream_height == live_h)
+			continue;
 
 		spin_lock_irqsave(&client->buffer_lock, buf_flags);
 
@@ -1743,8 +1730,7 @@ void sc0710_video_notify_source_change(struct sc0710_dev *dev)
 		v4l2_event_queue(&ch->vdev, &ev);
 	}
 
-	printk(KERN_INFO "%s: SOURCE_CHANGE event queued — stream kept alive\n",
-		dev->name);
+	printk(KERN_INFO "%s: SOURCE_CHANGE event queued\n", dev->name);
 }
 
 void sc0710_video_unregister(struct sc0710_dma_channel *ch)

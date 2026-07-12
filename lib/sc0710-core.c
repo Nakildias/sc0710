@@ -64,14 +64,6 @@ module_param(sc0710_debug_mode, int, 0644);
 MODULE_PARM_DESC(sc0710_debug_mode, "Enable debug logging (0=off, 1=on)");
 EXPORT_SYMBOL(sc0710_debug_mode);
 
-unsigned int scaler_mode = 0;
-module_param(scaler_mode, int, 0644);
-MODULE_PARM_DESC(scaler_mode, "Software scaler: 0=disabled, 1=upscale 4K, 2=downscale 1080P");
-
-unsigned int auto_scaler = 1;
-module_param(auto_scaler, int, 0644);
-MODULE_PARM_DESC(auto_scaler, "Automatic safety scaler on mismatch: 0=off, 1=on");
-
 unsigned int procedural_timings = TIMING_MODE_MERGE;
 module_param(procedural_timings, int, 0644);
 MODULE_PARM_DESC(procedural_timings,
@@ -263,12 +255,6 @@ static int sc0710_dev_setup(struct sc0710_dev *dev)
 	       dev->board, card[dev->nr] == dev->board ?
 	       "insmod option" : "autodetected");
 
-	/* Initialize software scaler mode for eligible boards */
-	if (sc0710_software_scaler_allowed(dev) && scaler_mode <= 2)
-		dev->scaler_mode = (enum sc0710_scaler_mode)scaler_mode;
-	else
-		dev->scaler_mode = SCALER_MODE_DISABLED;
-
 	return 0;
 }
 
@@ -313,8 +299,8 @@ static int sc0710_proc_state_show(struct seq_file *m, void *v)
 		/* Cached state only: this file is world-readable, so its read path
 		 * must not run I2C or trigger a DMA reconfig; the HDMI poll
 		 * thread keeps the cache fresh. signalMutex is held until after
-		 * the scaler block: everything up to there reads dev->fmt or
-		 * fields the HDMI thread rewrites. */
+		 * the timing-mode block: everything up to there reads dev->fmt
+		 * or fields the HDMI thread rewrites. */
 		mutex_lock(&dev->signalMutex);
 		seq_printf(m, "         fmt: %p\n", dev->fmt);
 	        if (dev->locked) {
@@ -337,39 +323,17 @@ static int sc0710_proc_state_show(struct seq_file *m, void *v)
 		seq_printf(m, "     procamp: saturation  %d\n", dev->saturation);
 		seq_printf(m, "     procamp: hue         %d\n", dev->hue);
 
-		/* Software scaler state */
-		if (sc0710_software_scaler_allowed(dev)) {
-			seq_printf(m, "      scaler: %s\n",
-				sc0710_scaler_mode_name(dev->scaler_mode));
-			if (dev->scaler_mode != SCALER_MODE_DISABLED && dev->fmt) {
-				u32 out_w, out_h;
-				sc0710_scaler_get_output_size(dev,
-					dev->fmt->width, dev->fmt->height,
-					&out_w, &out_h);
-				seq_printf(m, "  scaled out: %ux%u -> %ux%u\n",
-					dev->fmt->width, dev->fmt->height,
-					out_w, out_h);
-			}
-			seq_printf(m, " auto scaler: %s\n", dev->auto_scaler_active ? "ON (Prevented Kernel Panic)" : "OFF");
-			seq_printf(m, " auto scaler cfg: %s\n", auto_scaler ? "ENABLED" : "DISABLED");
-			switch (procedural_timings) {
-			case TIMING_MODE_PROCEDURAL_ONLY:
-				seq_printf(m, " timing calc: PROCEDURAL_ONLY\n");
-				break;
-			case TIMING_MODE_STATIC_ONLY:
-				seq_printf(m, " timing calc: STATIC_ONLY\n");
-				break;
-			case TIMING_MODE_MERGE:
-			default:
-				seq_printf(m, " timing calc: MERGE\n");
-				break;
-			}
-			{
-				int dyn_active = (!auto_scaler &&
-						  dev->scaler_mode == SCALER_MODE_DISABLED);
-				seq_printf(m, " dynamic res: %s\n",
-					dyn_active ? "ACTIVE" : "INACTIVE");
-			}
+		switch (procedural_timings) {
+		case TIMING_MODE_PROCEDURAL_ONLY:
+			seq_printf(m, " timing calc: PROCEDURAL_ONLY\n");
+			break;
+		case TIMING_MODE_STATIC_ONLY:
+			seq_printf(m, " timing calc: STATIC_ONLY\n");
+			break;
+		case TIMING_MODE_MERGE:
+		default:
+			seq_printf(m, " timing calc: MERGE\n");
+			break;
 		}
 		mutex_unlock(&dev->signalMutex);
 
@@ -632,22 +596,6 @@ static int sc0710_thread_hdmi_function(void *data)
 		//sc0710_i2c_read_status2(dev);
 		//sc0710_i2c_read_status3(dev);
 
-		/* Sync software scaler mode from module parameter.
-		 * This allows runtime toggling via:
-		 *   echo N > /sys/module/sc0710/parameters/scaler_mode
-		 * where N = 0 (disabled), 1 (upscale to 4K), 2 (downscale to 1080P).
-		 */
-		if (sc0710_software_scaler_allowed(dev) && scaler_mode <= 2) {
-			enum sc0710_scaler_mode new_mode = (enum sc0710_scaler_mode)scaler_mode;
-			if (dev->scaler_mode != new_mode) {
-				printk(KERN_INFO "%s: Software scaler mode changed: %s -> %s\n",
-					dev->name,
-					sc0710_scaler_mode_name(dev->scaler_mode),
-					sc0710_scaler_mode_name(new_mode));
-				dev->scaler_mode = new_mode;
-			}
-		}
-
 		mutex_unlock(&dev->kthread_hdmi_lock);
 	}
 
@@ -826,10 +774,10 @@ static void sc0710_finidev(struct pci_dev *pci_dev)
 
 	sc0710_dev_unregister(dev);
 
-	/* Free software scaler staging buffer if allocated */
-	if (dev->scaler_staging_buf) {
-		vfree(dev->scaler_staging_buf);
-		dev->scaler_staging_buf = NULL;
+	/* Free frame staging buffers if allocated */
+	if (dev->frame_staging_buf) {
+		vfree(dev->frame_staging_buf);
+		dev->frame_staging_buf = NULL;
 	}
 	if (dev->weave_staging_buf) {
 		vfree(dev->weave_staging_buf);

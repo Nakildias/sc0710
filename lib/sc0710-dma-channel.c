@@ -278,18 +278,6 @@ static bool sc0710_detect_horizontal_tear(const u8 *buf, u32 width, u32 height, 
  *    to perform transfers.
  */
 
-/* Shared bounds check for the scaler branches, which write a full output
- * frame with no truncation; `what` tags the log line per branch. */
-static bool sc0710_vb_fits(struct sc0710_dev *dev, const char *what,
-	u32 need, unsigned long have)
-{
-	if (need <= have)
-		return true;
-	printk_ratelimited(KERN_ERR "%s: V4L2 buffer %lu too small for %s frame %u\n",
-		dev->name, have, what, need);
-	return false;
-}
-
 /* Copy the contains of the video chain into a video4linux buffer.
  * Return < 0 on error
  * Return number of buffers we copyinto from dma into user buffers.
@@ -307,15 +295,11 @@ static void sc0710_dma_dequeue_video(struct sc0710_dma_channel *ch,
 	struct sc0710_dev *dev = ch->dev;
 	struct sc0710_client *client;
 	unsigned long flags;
-	int scaler_active = 0;
-	u32 src_w = 0, src_h = 0;
-	u32 dst_w = 0, dst_h = 0;
-	u32 scaled_framesize = 0;
 	u32 source_framesize = cached_framesize;
 	u32 source_w = cached_width, source_h = cached_height;
-	int any_auto_scaler = 0;
-	int auto_scaler_gathered = 0;
-	int sw_scaler_allowed = sc0710_software_scaler_allowed(dev);
+	int frame_gathered = 0;
+	int delivered = 0;
+	int stale_clients = 0;
 	const u8 *woven_frame = NULL;
 	u32 streak_required = dma_resync_tear_streak_required ?
 		dma_resync_tear_streak_required : 1;
@@ -335,43 +319,32 @@ static void sc0710_dma_dequeue_video(struct sc0710_dma_channel *ch,
 	/* During resolution transitions the detected format (cached_framesize)
 	 * may differ from the DMA chain allocation (total_transfer_size) because
 	 * the channel cannot be resized while STATE_RUNNING.
-	 *
-	 * With auto_scaler enabled we keep delivering frames using the NEW
-	 * detected resolution as the true data size.  The DMA buffer is at
-	 * least as large as the new frame (it was allocated for the old,
-	 * larger resolution), so reading cached_framesize bytes is safe.
-	 *
-	 * With auto_scaler disabled we drop, as delivering mis-sized raw
-	 * data would corrupt the image.
+	 * Delivering mis-sized raw data would corrupt the image, so drop;
+	 * clients renegotiate on the V4L2_EVENT_SOURCE_CHANGE they were sent.
 	 */
 	if (chain->total_transfer_size > 0 &&
 	    cached_framesize != (u32)chain->total_transfer_size) {
-		if (auto_scaler && cached_framesize <= (u32)chain->total_transfer_size) {
-			dprintk(1, "%s() transition: fmt=%u DMA=%d, using detected size %ux%u\n",
-				__func__, cached_framesize, chain->total_transfer_size,
-				source_w, source_h);
-		} else {
-			dprintk(1, "%s() frame size mismatch (%u vs DMA %d) - dropping\n",
-				__func__, cached_framesize, chain->total_transfer_size);
-			return;
-		}
+		dprintk(1, "%s() frame size mismatch (%u vs DMA %d) - dropping\n",
+			__func__, cached_framesize, chain->total_transfer_size);
+		return;
 	}
 
 	/* Pre-allocate staging buffer outside of spinlock context.
 	 * vzalloc/vfree are sleeping calls that must not be called
 	 * while holding spinlocks.  We size the buffer once here for
-	 * the explicit scaler, auto-scaler, and interlaced weaving paths.
+	 * the tear-validation and interlaced weaving paths.
 	 */
-	if ((sw_scaler_allowed || cached_interlaced) &&
-	    (!dev->scaler_staging_buf ||
-	     dev->scaler_staging_size < source_framesize)) {
-		u8 *old = dev->scaler_staging_buf;
-		dev->scaler_staging_buf = vzalloc(source_framesize);
-		if (dev->scaler_staging_buf) {
-			dev->scaler_staging_size = source_framesize;
+	if ((cached_interlaced || ch->tear_validation_frames_left > 0) &&
+	    (!dev->frame_staging_buf ||
+	     dev->frame_staging_size < source_framesize)) {
+		u8 *old = dev->frame_staging_buf;
+
+		dev->frame_staging_buf = vzalloc(source_framesize);
+		if (dev->frame_staging_buf) {
+			dev->frame_staging_size = source_framesize;
 		} else {
-			dev->scaler_staging_size = 0;
-			printk_ratelimited(KERN_ERR "%s: Failed to allocate scaler staging buffer (%u bytes)\n",
+			dev->frame_staging_size = 0;
+			printk_ratelimited(KERN_ERR "%s: Failed to allocate frame staging buffer (%u bytes)\n",
 				dev->name, source_framesize);
 		}
 		if (old)
@@ -382,6 +355,7 @@ static void sc0710_dma_dequeue_video(struct sc0710_dma_channel *ch,
 	    (!dev->weave_staging_buf ||
 	     dev->weave_staging_size < source_framesize)) {
 		u8 *old = dev->weave_staging_buf;
+
 		dev->weave_staging_buf = vzalloc(source_framesize);
 		if (dev->weave_staging_buf) {
 			dev->weave_staging_size = source_framesize;
@@ -398,17 +372,17 @@ static void sc0710_dma_dequeue_video(struct sc0710_dma_channel *ch,
 	 * resync when a persistent tear seam is detected.
 	 */
 	if (ch->tear_validation_frames_left > 0) {
-		if (dev->scaler_staging_buf &&
-		    dev->scaler_staging_size >= source_framesize) {
+		if (dev->frame_staging_buf &&
+		    dev->frame_staging_size >= source_framesize) {
 			int gathered = sc0710_dma_chain_dq_to_ptr(ch, chain,
-				dev->scaler_staging_buf, source_framesize);
+				dev->frame_staging_buf, source_framesize);
 			int tear_line = -1;
 			bool tear_detected = false;
 
 			if (gathered == (int)source_framesize) {
-				auto_scaler_gathered = 1;
+				frame_gathered = 1;
 				tear_detected = sc0710_detect_horizontal_tear(
-					dev->scaler_staging_buf, source_w, source_h, &tear_line);
+					dev->frame_staging_buf, source_w, source_h, &tear_line);
 			}
 
 			if (tear_detected) {
@@ -443,41 +417,21 @@ static void sc0710_dma_dequeue_video(struct sc0710_dma_channel *ch,
 		}
 	}
 
-	/* Check if software scaler is active */
-	if (sw_scaler_allowed &&
-	    dev->scaler_mode != SCALER_MODE_DISABLED &&
-	    source_w && source_h) {
-		src_w = source_w;
-		src_h = source_h;
-		sc0710_scaler_get_output_size(dev, src_w, src_h, &dst_w, &dst_h);
-
-		if (dst_w != src_w || dst_h != src_h) {
-			scaled_framesize = dst_w * 2 * dst_h;
-
-			if (dev->scaler_staging_buf) {
-				int gathered = sc0710_dma_chain_dq_to_ptr(ch, chain,
-					dev->scaler_staging_buf, source_framesize);
-				if (gathered > 0)
-					scaler_active = 1;
-			}
-		}
-	}
-
 	/* For interlaced content the hardware delivers two fields stacked
 	 * vertically (Field 1 on top, Field 2 on bottom).  Weave them into
 	 * a proper interleaved frame before delivering to clients.
 	 */
 	if (cached_interlaced && source_h >= 2 &&
-	    dev->scaler_staging_buf && dev->scaler_staging_size >= source_framesize &&
+	    dev->frame_staging_buf && dev->frame_staging_size >= source_framesize &&
 	    dev->weave_staging_buf && dev->weave_staging_size >= source_framesize) {
-		if (!auto_scaler_gathered && !scaler_active) {
+		if (!frame_gathered) {
 			int gathered = sc0710_dma_chain_dq_to_ptr(ch, chain,
-				dev->scaler_staging_buf, source_framesize);
+				dev->frame_staging_buf, source_framesize);
 			if (gathered == (int)source_framesize)
-				auto_scaler_gathered = 1;
+				frame_gathered = 1;
 		}
-		if (auto_scaler_gathered || scaler_active) {
-			sc0710_weave_fields(dev->scaler_staging_buf,
+		if (frame_gathered) {
+			sc0710_weave_fields(dev->frame_staging_buf,
 				dev->weave_staging_buf, source_w, source_h);
 			woven_frame = dev->weave_staging_buf;
 		}
@@ -493,6 +447,16 @@ static void sc0710_dma_dequeue_video(struct sc0710_dma_channel *ch,
 
 		if (!client->streaming)
 			continue;
+
+		/* A client still locked to a different resolution gets nothing:
+		 * it was told to renegotiate via V4L2_EVENT_SOURCE_CHANGE, and
+		 * mis-sized raw delivery would corrupt the image. */
+		if (client->stream_width && client->stream_height &&
+		    (client->stream_width != source_w ||
+		     client->stream_height != source_h)) {
+			stale_clients++;
+			continue;
+		}
 
 		spin_lock_irqsave(&client->buffer_lock, buf_flags);
 
@@ -510,76 +474,7 @@ static void sc0710_dma_dequeue_video(struct sc0710_dma_channel *ch,
 			continue;
 		}
 
-		if (scaler_active) {
-			const u8 *scale_src = woven_frame ? woven_frame : dev->scaler_staging_buf;
-			if (!sc0710_vb_fits(dev, "scaled", scaled_framesize, buffer_size)) {
-				spin_unlock_irqrestore(&client->buffer_lock, buf_flags);
-				continue;
-			}
-			sc0710_scaler_scale_frame(scale_src,
-				src_w, src_h, dst, dst_w, dst_h);
-			vb2_set_plane_payload(&vb_buf->vb.vb2_buf, 0, scaled_framesize);
-		} else if (auto_scaler &&
-			   source_w && source_h &&
-			   client->stream_width && client->stream_height &&
-			   (source_w != client->stream_width ||
-			    source_h != client->stream_height) &&
-			   sw_scaler_allowed) {
-			u32 adapt_dst_w = client->stream_width;
-			u32 adapt_dst_h = client->stream_height;
-			u32 adapt_fs = adapt_dst_w * 2 * adapt_dst_h;
-			const u8 *scale_src;
-
-			if (!sc0710_vb_fits(dev, "adapted", adapt_fs, buffer_size)) {
-				spin_unlock_irqrestore(&client->buffer_lock, buf_flags);
-				continue;
-			}
-			if (!dev->scaler_staging_buf) {
-				spin_unlock_irqrestore(&client->buffer_lock, buf_flags);
-				continue;
-			}
-			if (!auto_scaler_gathered) {
-				sc0710_dma_chain_dq_to_ptr(ch, chain,
-					dev->scaler_staging_buf, source_framesize);
-				auto_scaler_gathered = 1;
-			}
-			scale_src = woven_frame ? woven_frame : dev->scaler_staging_buf;
-			sc0710_scaler_scale_frame(scale_src,
-				source_w, source_h,
-				dst, adapt_dst_w, adapt_dst_h);
-			vb2_set_plane_payload(&vb_buf->vb.vb2_buf, 0, adapt_fs);
-			any_auto_scaler = 1;
-		} else if (!auto_scaler &&
-			   dev->scaler_mode == SCALER_MODE_DISABLED &&
-			   source_w && source_h &&
-			   client->stream_width && client->stream_height &&
-			   (source_w != client->stream_width ||
-			    source_h != client->stream_height) &&
-			   sw_scaler_allowed) {
-			u32 dyn_dst_w = client->stream_width;
-			u32 dyn_dst_h = client->stream_height;
-			u32 dyn_fs = dyn_dst_w * 2 * dyn_dst_h;
-			const u8 *scale_src;
-
-			if (!sc0710_vb_fits(dev, "dynamic-res", dyn_fs, buffer_size)) {
-				spin_unlock_irqrestore(&client->buffer_lock, buf_flags);
-				continue;
-			}
-			if (!dev->scaler_staging_buf) {
-				spin_unlock_irqrestore(&client->buffer_lock, buf_flags);
-				continue;
-			}
-			if (!auto_scaler_gathered) {
-				sc0710_dma_chain_dq_to_ptr(ch, chain,
-					dev->scaler_staging_buf, source_framesize);
-				auto_scaler_gathered = 1;
-			}
-			scale_src = woven_frame ? woven_frame : dev->scaler_staging_buf;
-			sc0710_scaler_scale_frame(scale_src,
-				source_w, source_h,
-				dst, dyn_dst_w, dyn_dst_h);
-			vb2_set_plane_payload(&vb_buf->vb.vb2_buf, 0, dyn_fs);
-		} else if (woven_frame) {
+		if (woven_frame) {
 			if (source_framesize <= buffer_size) {
 				memcpy(dst, woven_frame, source_framesize);
 				vb2_set_plane_payload(&vb_buf->vb.vb2_buf, 0, source_framesize);
@@ -605,15 +500,22 @@ static void sc0710_dma_dequeue_video(struct sc0710_dma_channel *ch,
 
 		list_del(&vb_buf->list);
 		vb2_buffer_done(&vb_buf->vb.vb2_buf, VB2_BUF_STATE_DONE);
+		delivered = 1;
 
 		spin_unlock_irqrestore(&client->buffer_lock, buf_flags);
 	}
-	dev->auto_scaler_active = any_auto_scaler;
 	ch->frame_sequence++;
 	spin_unlock_irqrestore(&ch->client_list_lock, flags);
 
-	/* Re-set the buffer timeout */
-	mod_timer(&ch->timeout, jiffies + VBUF_TIMEOUT);
+	/* Re-set the buffer timeout. The placeholder deadline is pushed
+	 * forward only when every streaming client got this frame: while any
+	 * client is still locked to a stale resolution the pending timer is
+	 * left alone, so it fires and keeps those clients fed with
+	 * placeholders until they renegotiate (the timeout handler skips the
+	 * live-resolution clients and re-arms itself). A dead timer (the
+	 * resync stop deletes it) is still re-armed. */
+	if ((delivered && !stale_clients) || !timer_pending(&ch->timeout))
+		mod_timer(&ch->timeout, jiffies + VBUF_TIMEOUT);
 }
 
 

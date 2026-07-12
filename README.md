@@ -163,14 +163,12 @@ Installed by the automatic installer, the AUR package, and the NixOS module. Pro
 
 | Command | Alias | Description |
 |---------|-------|-------------|
-| `--status` | `-s` | Module state, card info, signal format, scaler, ECP5 status (4K Pro), DKMS or build service status |
+| `--status` | `-s` | Module state, card info, signal format, ECP5 status (4K Pro), DKMS or build service status |
 | `--load` | `-l` | Load the module. On 4K Pro, verifies ECP5 programming after load |
 | `--unload` | `-u` | Unload the module (stops PipeWire consumers if the module is busy) |
 | `--restart` | | Full reload. On 4K Pro, runs ECP5 programming with retries |
 | `--debug` | `-d` | Toggle verbose `dmesg` logging |
 | `--image-toggle` | `-it` | Toggle No Signal images vs colorbars |
-| `--software-scaler` | `-ss` | Toggle software scaler modes (all cards) |
-| `--toggle-auto-scalar` | `-as` | Toggle automatic safety scaler |
 | `--procedural-timings` | `-pt` | Cycle timing mode: merge → procedural-only → static-only |
 | `--update` | `-U` | Pull latest source, rebuild, reload. On 4K Pro, re-runs ECP5 programming with retries |
 | `--rebuild` | | *(Atomic only)* Force rebuild the module for the running kernel |
@@ -198,8 +196,7 @@ Same command as above — checks module, DKMS, CLI, systemd units, config files,
 * **Status images** — storage-efficient No Signal / No Device screens
 * **Connection sensing** — distinguishes unplugged cables from signal loss (not 100% reliable)
 * **Video formats** — 4K60, 1440p144, 1080p240. **EDID Source control (Internal/Display/Merged) on both cards** via the `EDID Source` V4L2 control (`v4l2-ctl --set-ctrl=edid_source=N`). **Custom EDID read/write on both cards** via `VIDIOC_G_EDID`/`VIDIOC_S_EDID` — the 4K Pro through its EEPROM (`edid=` boot param, profiles from `scripts/extract-firmware.sh`), the MK.2 through its MCU (runtime only). The graphical **EDID Config app** (`sc0710-cli --edid-config`) manages this for both cards and can fetch Elgato's official EDID profiles
-* **Mode-switch stability** — DMA resync, restart validation, and watchdog recovery during resolution/refresh changes
-* **Safety scaling** — auto-scaler and dynamic-resolution paths reduce crash-prone transitions
+* **Mode-switch stability** — DMA resync, restart validation, and watchdog recovery during resolution/refresh changes; apps are told to renegotiate via `V4L2_EVENT_SOURCE_CHANGE`
 * **Timing controls** — runtime modes (`merge`, `procedural-only`, `static-only`) via CLI
 * **Debug dumps** — `sc0710-cli --dump` collects distro, kernel, `lspci`, driver version, and service state for issue reports
 

@@ -1005,8 +1005,6 @@ echo -e "      ${BOLD}sc0710-cli -u${NC}  or  ${BOLD}--unload${NC}   Unload driv
 echo -e "      ${BOLD}sc0710-cli --restart${NC}        Reload driver"
 echo -e "      ${BOLD}sc0710-cli -d${NC}  or  ${BOLD}--debug${NC}    Toggle debug output"
 echo -e "      ${BOLD}sc0710-cli -it${NC} or  ${BOLD}--image-toggle${NC}  Toggle status images"
-echo -e "      ${BOLD}sc0710-cli -ss${NC} or  ${BOLD}--software-scaler${NC} Toggle software scaler (all cards)"
-echo -e "      ${BOLD}sc0710-cli -as${NC} or ${BOLD}--toggle-auto-scalar${NC} Toggle automatic safety scaler"
 echo -e "      ${BOLD}sc0710-cli -pt${NC} or ${BOLD}--procedural-timings${NC} Toggle timing calculation mode"
 echo -e ""
 echo -e "      ${BOLD}sc0710-cli --rebuild${NC}        Force rebuild for current kernel"
