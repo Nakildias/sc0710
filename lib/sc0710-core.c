@@ -80,7 +80,9 @@ MODULE_PARM_DESC(procedural_timings,
 char *sc0710_edid_profile = "";
 module_param_named(edid, sc0710_edid_profile, charp, 0444);
 MODULE_PARM_DESC(edid,
-	"EDID profile presented to the HDMI source, e.g. \"1440p\" (4K Pro only). Loads "
+	"EDID profile presented to the HDMI source, e.g. \"1440p\" (4K Pro only; "
+	"on the MK.2 set a custom EDID at runtime via VIDIOC_S_EDID or "
+	"sc0710-cli --edid-config). Loads "
 	"/lib/firmware/sc0710/edid/<name>.bin, installed by scripts/extract-firmware.sh; "
 	"empty = factory default.");
 

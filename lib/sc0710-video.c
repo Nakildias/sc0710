@@ -1452,7 +1452,8 @@ static const struct v4l2_file_operations video_fops = {
 /* VIDIOC_G/S_EDID: expose the card's source-facing EDID (the EEPROM image
  * the MCU presents to the HDMI source in Internal mode) through the standard
  * V4L2 ioctls, complementing the load-time edid= param. The v4l2 core copies
- * the edid->edid payload for us. 4K Pro only. */
+ * the edid->edid payload for us. The 4K Pro reads its EEPROM; the MK2 reads
+ * the MCU-served internal image (see sc0710_mk2_read_edid in sc0710-i2c.c). */
 static int vidioc_g_edid(struct file *file, void *_fh, struct v4l2_edid *edid)
 {
 	struct sc0710_dma_channel *ch = video_drvdata(file);
@@ -1569,7 +1570,7 @@ static int sc0710_s_ctrl(struct v4l2_ctrl *ctrl)
 
 	switch (ctrl->id) {
 	case SC0710_CID_EDID_SOURCE:
-		return sc0710_4kp_set_edid_source(dev, ctrl->val);
+		return sc0710_set_edid_source(dev, ctrl->val);
 	}
 	return -EINVAL;
 }
@@ -1586,10 +1587,11 @@ static const char * const sc0710_edid_source_menu[] = {
 };
 
 /* The MCU offers no readback for the EDID source, so the reported value is
- * the last one set through this control.
+ * the last one set through this control. Both boards: the MK2 driver
+ * forces internal at probe, so the default is truthful there too.
  * EXECUTE_ON_WRITE lets a rewrite of the current value resend the call to
  * force a known state. */
-static const struct v4l2_ctrl_config sc0710_4kp_edid_source_ctrl = {
+static const struct v4l2_ctrl_config sc0710_edid_source_ctrl = {
 	.ops   = &sc0710_ctrl_ops,
 	.id    = SC0710_CID_EDID_SOURCE,
 	.name  = "EDID Source",
@@ -1807,12 +1809,13 @@ int sc0710_video_register(struct sc0710_dma_channel *ch)
 #endif
 	strscpy(ch->vdev.name, "sc0710 video", sizeof(ch->vdev.name));
 
-	/* The EDID EEPROM protocol and the EDID source selector are 4K Pro-specific.
-	 * This branch is the single board-scope gate for the whole EDID surface
-	 * (the page writer additionally refuses other boards outright). */
-	if (dev->board == SC0710_BOARD_ELGATEO_4KP) {
+	/* The EDID source selector works on both supported boards: the MK2 MCU
+	 * speaks the same fn-call protocol with the same ack signatures,
+	 * verified on real hardware (see the MK2 notes in sc0710-i2c.c). */
+	if (dev->board == SC0710_BOARD_ELGATEO_4KP ||
+	    dev->board == SC0710_BOARD_ELGATEO_4KP60_MK2) {
 		v4l2_ctrl_handler_init(&dev->ctrl_handler, 1);
-		v4l2_ctrl_new_custom(&dev->ctrl_handler, &sc0710_4kp_edid_source_ctrl, NULL);
+		v4l2_ctrl_new_custom(&dev->ctrl_handler, &sc0710_edid_source_ctrl, NULL);
 		if (dev->ctrl_handler.error) {
 			err = dev->ctrl_handler.error;
 			printk(KERN_ERR "%s: can't register the EDID source control\n", dev->name);
@@ -1820,7 +1823,13 @@ int sc0710_video_register(struct sc0710_dma_channel *ch)
 			return err;
 		}
 		ch->vdev.ctrl_handler = &dev->ctrl_handler;
-	} else {
+	}
+	/* EDID: the 4K Pro reads/writes its EEPROM directly; the MK2 reads the
+	 * MCU-served internal image (ReadEDID protocol, all on the safe 0x33
+	 * port) and gets S_EDID too. Both supported boards get G_EDID and
+	 * S_EDID; other boards get neither. */
+	if (dev->board != SC0710_BOARD_ELGATEO_4KP &&
+	    dev->board != SC0710_BOARD_ELGATEO_4KP60_MK2) {
 		v4l2_disable_ioctl(&ch->vdev, VIDIOC_G_EDID);
 		v4l2_disable_ioctl(&ch->vdev, VIDIOC_S_EDID);
 	}

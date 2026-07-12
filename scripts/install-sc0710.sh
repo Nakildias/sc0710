@@ -957,6 +957,31 @@ else
     warning "scripts/sc0710-cli.sh not found in source. CLI not installed."
 fi
 
+# EDID configuration GUI (launched by `sc0710-cli --edid-config`)
+if [[ -f "$SOURCE/scripts/sc0710-edid-config" ]]; then
+    cp "$SOURCE/scripts/sc0710-edid-config" /usr/local/bin/sc0710-edid-config
+    chmod +x /usr/local/bin/sc0710-edid-config
+    # Bundle Elgato's EDID profiles so the library is populated out of the box
+    # (optional; the GUI can also download them at runtime).
+    if [[ -d "$SOURCE/4KCaptureUtility" ]]; then
+        mkdir -p /usr/share/sc0710/edid
+        find "$SOURCE/4KCaptureUtility" -maxdepth 1 -iname '*.bin' \
+            -exec cp -n {} /usr/share/sc0710/edid/ \; 2>/dev/null || true
+    fi
+else
+    warning "scripts/sc0710-edid-config not found. EDID GUI not installed."
+fi
+
+# Raw EDID writer helper — compiled here (never shipped as a binary).
+if [[ -f "$SOURCE/scripts/mk2-set-edid.c" ]]; then
+    if { command -v cc >/dev/null 2>&1 && cc -O2 -o /usr/local/bin/mk2-set-edid "$SOURCE/scripts/mk2-set-edid.c"; } \
+       || { command -v gcc >/dev/null 2>&1 && gcc -O2 -o /usr/local/bin/mk2-set-edid "$SOURCE/scripts/mk2-set-edid.c"; }; then
+        chmod +x /usr/local/bin/mk2-set-edid
+    else
+        warning "could not compile mk2-set-edid (no C compiler?); skipping the raw EDID writer."
+    fi
+fi
+
 
 # --- Final Success Message ---
 log "=== Installation completed successfully ==="
