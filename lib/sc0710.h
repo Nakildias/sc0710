@@ -86,6 +86,14 @@ extern unsigned int refresh_rate_resync_delay_ms;
 /* EDID profile to present to the HDMI source (edid= module param); empty = factory default. */
 extern char *sc0710_edid_profile;
 
+/* Zero-copy capture (zero_copy= module param, load-time only): DMA directly
+ * into the single streaming client's buffers. */
+extern unsigned int zero_copy;
+
+/* Zero-copy scratch split (zc_split= module param, load-time only):
+ * descriptors per video chain; 0 = keep the default 4 MiB segmenting. */
+extern unsigned int zc_split;
+
 #define SC0710_MAX_CHANNELS 2
 
 /* A chain contains 1..SC0710_MAX_CHAIN_DESCRIPTORS descriptors,
@@ -93,7 +101,7 @@ extern char *sc0710_edid_profile;
  * target the buffer pieces.
  */
 #define SC0710_MAX_CHANNEL_DESCRIPTOR_CHAINS 4
-#define SC0710_MAX_CHAIN_DESCRIPTORS 8
+#define SC0710_MAX_CHAIN_DESCRIPTORS 32
 
 #define UNSET (-1U)
 
@@ -163,6 +171,15 @@ struct sc0710_buffer
 	/* sc0710 specific */
 	const struct sc0710_format *fmt;
 	u32 expected_framesize;
+
+	/* Zero-copy: DMA-segment snapshot of the mapped plane, taken at
+	 * buf_prepare. zc_nsegs == 0 means the plane is not directly
+	 * DMA-addressable (non-zero-copy queue, or mapping failed). */
+	u32 zc_nsegs;
+	struct {
+		dma_addr_t addr;
+		u32        len;
+	} zc_seg[SC0710_MAX_CHAIN_DESCRIPTORS];
 };
 
 struct sc0710_dmaqueue {
@@ -209,6 +226,9 @@ enum sc0710_channel_state_e
  * 4K = 16588800
  * allocations = 4K / allocsegment
  */
+struct sc0710_client;
+struct sc0710_buffer;
+
 struct sc0710_dma_descriptor_chain
 {
 	int enabled;
@@ -223,7 +243,18 @@ struct sc0710_dma_descriptor_chain
 		u64                          *buf_cpu;  /* Virtual address */
 		dma_addr_t                    buf_dma;  /* Physical address - accessible to the PCIe endpoint */
 		u32                          *wbm[2];   /* Write back metadata where we can monitor descriptor completion */
+		u32                          *wbm_cpu;  /* Writeback base; wbm[] picks the active half */
+		dma_addr_t                    wbm_dma;  /* Writeback slot base (device) */
 	} allocations[SC0710_MAX_CHAIN_DESCRIPTORS];
+
+	/* Zero-copy: non-NULL while the chain's descriptors point at a client's
+	 * buffer instead of the coherent scratch allocations above. Written only
+	 * under ch->lock. */
+	struct sc0710_buffer *target_buf;
+	struct sc0710_client *target_client;
+	/* Which half of each descriptor's 16-byte writeback area is active;
+	 * flipped alongside every chain rewrite (staleness sentinel). */
+	u32 wbm_phase;
 };
 
 /* Forward declaration for multi-client support */
@@ -320,6 +351,20 @@ struct sc0710_dma_channel
 	u32                          tear_streak_count;
 	int                          tear_last_line;
 	u32                          tear_resync_retries_left;
+
+	/* Zero-copy delivery counters (frames DMA'd straight into a client
+	 * buffer vs. delivered through the copy path while zero_copy=1). */
+	u64                          zc_frames_direct;
+	u64                          zc_frames_copied;
+
+	/* Staleness sentinel: every chain rewrite moves the descriptors'
+	 * writeback to the other half of their slots, so a write landing in
+	 * the retired half proves the device consumed a pre-rewrite (stale)
+	 * descriptor. A trip permanently forces the copy path. */
+	bool                         zc_stale_trip;
+	u64                          zc_wbm_flips;
+	u64                          zc_stale_events;
+	u64                          zc_stale_descs;
 
 	/* Channel 1 */
 	struct sc0710_audio_dev     *audio_dev;
@@ -594,6 +639,7 @@ int  sc0710_dma_channel_service(struct sc0710_dma_channel *ch);
 int  sc0710_dma_channel_start_prep(struct sc0710_dma_channel *ch);
 int  sc0710_dma_channel_start(struct sc0710_dma_channel *ch);
 int  sc0710_dma_channel_stop(struct sc0710_dma_channel *ch);
+void sc0710_dma_channel_untarget_all(struct sc0710_dma_channel *ch);
 int  sc0710_dma_channel_resize(struct sc0710_dev *dev, u32 nr, enum sc0710_channel_dir_e direction, u32 baseaddr,
 	enum sc0710_channel_type_e mediatype);
 enum sc0710_channel_state_e sc0710_dma_channel_state(struct sc0710_dma_channel *ch);

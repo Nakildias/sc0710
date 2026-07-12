@@ -1136,6 +1136,41 @@ static int sc0710_buf_prepare(struct vb2_buffer *vb)
 		return -EINVAL;
 	}
 
+	if (zero_copy) {
+		struct sg_table *sgt = vb2_dma_sg_plane_desc(vb, 0);
+		struct scatterlist *sg;
+		unsigned int i;
+
+		/* Snapshot the plane's DMA segments for descriptor targeting.
+		 * A plane scattered across more segments than the frame chain
+		 * has descriptors can't be DMA'd into; refuse it rather than
+		 * silently degrade (strict mode). With an IOMMU the whole
+		 * plane typically maps as one segment. */
+		buf->zc_nsegs = 0;
+		for_each_sgtable_dma_sg(sgt, sg, i) {
+			if (i >= SC0710_MAX_CHAIN_DESCRIPTORS) {
+				buf->zc_nsegs = 0;
+				printk_ratelimited(KERN_WARNING
+					"%s: zero-copy: buffer memory too fragmented for direct DMA (more than %u segments), refusing buffer\n",
+					dev->name, SC0710_MAX_CHAIN_DESCRIPTORS);
+				return -EINVAL;
+			}
+			buf->zc_seg[i].addr = sg_dma_address(sg);
+			buf->zc_seg[i].len  = sg_dma_len(sg);
+			buf->zc_nsegs = i + 1;
+		}
+
+		dprintk(2, "%s() zero-copy buffer: %u DMA segment(s)\n",
+			__func__, buf->zc_nsegs);
+
+		/* Map the kernel view now, in process context: the copy
+		 * fallback and placeholder paths read the vaddr under
+		 * spinlocks/timer context, where dma-sg's lazy first
+		 * mapping must not happen. */
+		if (!vb2_plane_vaddr(vb, 0))
+			return -ENOMEM;
+	}
+
 	vb2_set_plane_payload(vb, 0, eff_fs);
 	buf->expected_framesize = eff_fs;
 	buf->fmt = fmt;
@@ -1153,6 +1188,25 @@ static void sc0710_buf_queue(struct vb2_buffer *vb)
 	/* Add buffer to this client's buffer list */
 	spin_lock_irqsave(&client->buffer_lock, flags);
 	list_add_tail(&buf->list, &client->buffer_list);
+	spin_unlock_irqrestore(&client->buffer_lock, flags);
+}
+
+/* Unwind a failed STREAMON: undo the streaming markers and hand every
+ * queued buffer back to vb2 (the start_streaming failure contract). */
+static void sc0710_start_streaming_unwind(struct sc0710_dma_channel *ch,
+	struct sc0710_client *client)
+{
+	struct sc0710_buffer *buf, *tmp;
+	unsigned long flags;
+
+	client->streaming = false;
+	atomic_dec(&ch->streaming_refcount);
+
+	spin_lock_irqsave(&client->buffer_lock, flags);
+	list_for_each_entry_safe(buf, tmp, &client->buffer_list, list) {
+		list_del(&buf->list);
+		vb2_buffer_done(&buf->vb.vb2_buf, VB2_BUF_STATE_QUEUED);
+	}
 	spin_unlock_irqrestore(&client->buffer_lock, flags);
 }
 
@@ -1196,6 +1250,17 @@ static int sc0710_start_streaming(struct vb2_queue *q, unsigned int count)
 	refcount = atomic_inc_return(&ch->streaming_refcount);
 	dprintk(1, "%s() streaming refcount now %d\n", __func__, refcount);
 
+	/* Zero-copy is strict single-client: frames DMA into one client's
+	 * buffers, and there is no copy pass to fan out to a second. The
+	 * refcount doubles as the race-free exclusivity check. */
+	if (zero_copy && refcount > 1) {
+		printk_ratelimited(KERN_WARNING
+			"%s: zero-copy: a client is already streaming, refusing a second\n",
+			dev->name);
+		sc0710_start_streaming_unwind(ch, client);
+		return -EBUSY;
+	}
+
 	/* Only start DMA if we're the first streaming client AND have signal.
 	 * kthread_dma_lock serializes this against the HDMI thread's resync:
 	 * without it a resync between the refcount increment and the resize
@@ -1212,18 +1277,7 @@ static int sc0710_start_streaming(struct vb2_queue *q, unsigned int count)
 		}
 		mutex_unlock(&dev->kthread_dma_lock);
 		if (ret < 0) {
-			struct sc0710_buffer *buf, *tmp;
-			unsigned long flags;
-
-			client->streaming = false;
-			atomic_dec(&ch->streaming_refcount);
-
-			spin_lock_irqsave(&client->buffer_lock, flags);
-			list_for_each_entry_safe(buf, tmp, &client->buffer_list, list) {
-				list_del(&buf->list);
-				vb2_buffer_done(&buf->vb.vb2_buf, VB2_BUF_STATE_QUEUED);
-			}
-			spin_unlock_irqrestore(&client->buffer_lock, flags);
+			sc0710_start_streaming_unwind(ch, client);
 			return ret;
 		}
 	} else if (dev->fmt == NULL) {
@@ -1266,8 +1320,15 @@ static void sc0710_stop_streaming(struct vb2_queue *q)
 		/* After a disconnect the remove path owns the hardware (the
 		 * engines are stopped, the BARs may be unmapped): only the
 		 * software teardown below remains ours. */
-		if (!READ_ONCE(dev->disconnected))
+		if (!READ_ONCE(dev->disconnected)) {
 			sc0710_dma_channels_stop(dev);
+			/* Point the chains back at the scratch ring: vb2 is
+			 * about to unmap the client's buffers, and no
+			 * descriptor may retain their DMA addresses (the stop
+			 * above quiesced the engine). */
+			if (zero_copy)
+				sc0710_dma_channel_untarget_all(ch);
+		}
 		timer_delete_sync(&ch->timeout);
 		mutex_unlock(&dev->kthread_dma_lock);
 	}
@@ -1337,7 +1398,15 @@ static int sc0710_video_open(struct file *file)
 	q->drv_priv = fh->client;  /* Point to client, not channel */
 	q->buf_struct_size = sizeof(struct sc0710_buffer);
 	q->ops = &sc0710_video_qops;
-	q->mem_ops = &vb2_vmalloc_memops;
+	/* Zero-copy needs DMA-mappable buffers the descriptors can target;
+	 * GFP_DMA32 matches the device's 32-bit DMA mask so driver-allocated
+	 * pages map without bounce buffering. */
+	if (zero_copy) {
+		q->mem_ops = &vb2_dma_sg_memops;
+		q->gfp_flags = GFP_DMA32;
+	} else {
+		q->mem_ops = &vb2_vmalloc_memops;
+	}
 	q->timestamp_flags = V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC;
 	q->min_queued_buffers = 2;
 	/* The node's ioctl lock: the v4l2 core holds it across every ioctl, so
@@ -1494,6 +1563,16 @@ static int sc0710_vidioc_querybuf(struct file *file, void *priv,
 	return vb2_querybuf(&fh->client->vb2_queue, p);
 }
 
+static int sc0710_vidioc_expbuf(struct file *file, void *priv,
+				struct v4l2_exportbuffer *p)
+{
+	struct sc0710_fh *fh = file->private_data;
+
+	if (!fh || !fh->client)
+		return -EINVAL;
+	return vb2_expbuf(&fh->client->vb2_queue, p);
+}
+
 static int sc0710_vidioc_qbuf(struct file *file, void *priv,
 			      struct v4l2_buffer *p)
 {
@@ -1643,6 +1722,7 @@ static const struct v4l2_ioctl_ops video_ioctl_ops =
 
 	.vidioc_reqbufs          = sc0710_vidioc_reqbufs,
 	.vidioc_querybuf         = sc0710_vidioc_querybuf,
+	.vidioc_expbuf           = sc0710_vidioc_expbuf,
 	.vidioc_qbuf             = sc0710_vidioc_qbuf,
 	.vidioc_dqbuf            = sc0710_vidioc_dqbuf,
 	.vidioc_streamon         = sc0710_vidioc_streamon,

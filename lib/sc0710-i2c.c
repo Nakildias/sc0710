@@ -408,6 +408,18 @@ void sc0710_reset_dma_frame_sync(struct sc0710_dev *dev)
 		}
 	}
 
+	/* Zero-copy chains may point at client buffers. With the engines
+	 * stopped and writebacks cleared, point them back at the scratch ring
+	 * and requeue the buffers before the resize frees or rebuilds anything
+	 * (this also covers the resize-failure bail below). */
+	if (zero_copy) {
+		for (ch_idx = 0; ch_idx < SC0710_MAX_CHANNELS; ch_idx++) {
+			ch = &dev->channel[ch_idx];
+			if (ch->enabled && ch->mediatype == CHTYPE_VIDEO)
+				sc0710_dma_channel_untarget_all(ch);
+		}
+	}
+
 	/* Phase 2: Resize DMA buffers for the new resolution.
 	 * On failure leave the channels stopped: restarting over a missing ring
 	 * would hand the engine a NULL descriptor pointer. The next timing

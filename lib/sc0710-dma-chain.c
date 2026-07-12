@@ -124,6 +124,16 @@ int sc0710_dma_chain_alloc(struct sc0710_dma_channel *ch, int nr, int total_tran
 	int size;
 	int segsize = 4 * 1048576;
 
+	/* Zero-copy: split video chains finer. More (smaller) descriptors per
+	 * chain keep a rewritten chain's ring slots beyond the device's
+	 * descriptor read-ahead, and shrink the contiguous pieces a client
+	 * buffer must provide to back a chain. */
+	if (zero_copy && zc_split && ch->mediatype == CHTYPE_VIDEO) {
+		u32 split = min_t(u32, zc_split, SC0710_MAX_CHAIN_DESCRIPTORS);
+
+		segsize = ALIGN(DIV_ROUND_UP(total_transfer_size, split), 4096);
+	}
+
 	chain->enabled = 1;
 	chain->total_transfer_size = total_transfer_size;
 	chain->numAllocations = 0;

@@ -254,6 +254,41 @@ renegotiates ~8–10 s after a write (a brief re-detect of the old mode first is
   in dmesg. `irq_service=0` restores classic polling; failed MSI allocation logs a
   warning and falls back to polling. (`thread_dma_poll_interval_ms` remains as an
   override for the service tick; the default auto-selects.)
+* **`zero_copy=1` (experimental)** — DMA frames straight into the capturing app's buffers, skipping
+  the per-frame copy (~1.5–3 ms at 4K). **Strict single-client mode**: one streaming
+  app per video node (a second gets `EBUSY`). Load-time only. The DMA descriptor fetcher is credit-gated in this mode —
+  early hardware testing caught it consuming stale (pre-rewrite) descriptors and
+  writing into already-delivered buffers; with credits a chain is only fetchable after
+  its rewrites, and a permanent writeback sentinel trips loudly (and falls back to the
+  copy path) if a stale fetch ever happens anyway. Validated on hardware: a userspace
+  mutation checker (checksumming app-owned buffers) runs clean, with zero sentinel
+  events across long captures. For full engagement keep more buffers queued than the
+  DMA ring has chains (5+, e.g. `--stream-mmap=8`; most players do) — a thin queue
+  routes starved laps through the copy path (`zc frames:` in `/proc/sc0710-state`
+  shows the direct/copied split). Buffers can be exported as dmabufs
+  (`VIDIOC_EXPBUF`) for GPU-direct consumers. `zero_copy=0` (the default) keeps the
+  vendor's free-running ring, byte-identical.
+
+**Zero-copy buffer eligibility:** a frame is DMA'd directly into a buffer when the
+buffer's DMA segments fit the chain's descriptor budget (`zc_split=`, default 8, max
+32); the frame is tiled across the buffer's own segments, so fragmentation within the
+budget is fine. Buffers over the 32-segment hard limit are refused at QBUF with a
+`zero-copy: buffer memory too fragmented` dmesg line; buffers between the budget and
+the limit are accepted but served through the copy path (visible in the `zc frames:`
+split — raise `zc_split=` to widen the budget). If buffers are too fragmented, fixes,
+best first:
+
+```bash
+# Give ONLY the capture card a translating IOMMU domain (runtime, reversible,
+# no reboot; resets to the boot default on reboot). VFIO passthrough and every
+# other host device are unaffected.
+G=$(basename $(readlink /sys/bus/pci/devices/<BDF>/iommu_group))
+echo <BDF> | sudo tee /sys/bus/pci/devices/<BDF>/driver/unbind
+echo DMA-FQ | sudo tee /sys/kernel/iommu_groups/$G/type
+echo <BDF> | sudo tee /sys/bus/pci/drivers_probe
+# or: defragment and retry
+sudo sh -c 'echo 1 > /proc/sys/vm/compact_memory'
+```
 
 ## Troubleshooting
 

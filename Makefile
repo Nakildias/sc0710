@@ -75,7 +75,12 @@ load: all
 	# with "Unknown symbol in module". Load exactly the modules modpost recorded in the
 	# built .ko's "depends" field (videodev, videobuf2-*, snd, snd-pcm).
 	D=$$(modinfo -F depends ./build/sc0710.ko | tr ',' ' '); [ -z "$$D" ] || sudo modprobe -a $$D
-	sudo insmod ./build/sc0710.ko
+	sudo insmod ./build/sc0710.ko $(LOAD_ARGS)
+
+# The low-latency test configuration: DMA straight into the client's buffers,
+# completion service woken by the card's interrupt (the default).
+load-zc: LOAD_ARGS = zero_copy=1
+load-zc: load
 
 unload:
 	# Plain rmmod refuses while something holds /dev/video* open - that refusal

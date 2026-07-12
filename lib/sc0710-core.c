@@ -86,6 +86,23 @@ MODULE_PARM_DESC(edid,
 	"/lib/firmware/sc0710/edid/<name>.bin, installed by scripts/extract-firmware.sh; "
 	"empty = factory default.");
 
+unsigned int zero_copy;
+module_param(zero_copy, uint, 0444);
+MODULE_PARM_DESC(zero_copy,
+	"Experimental: capture DMA writes directly into the streaming client's buffers, "
+	"skipping the per-frame copy (0=off, 1=on). Strict single-client mode: one "
+	"streaming client per video node, buffers whose memory is too fragmented for "
+	"the DMA chain's descriptor budget are refused.");
+
+unsigned int zc_split = 8;
+module_param(zc_split, uint, 0444);
+MODULE_PARM_DESC(zc_split,
+	"With zero_copy=1: split each video DMA chain's scratch into "
+	"this many descriptors (1-32, default 8) instead of 4 MiB segments - smaller "
+	"pieces shrink the contiguity a client buffer must provide and make the "
+	"coherent scratch allocations more reliable. 0 = keep the vendor 4 MiB "
+	"segmenting.");
+
 unsigned int dma_resync_validate_frames = 8;
 module_param(dma_resync_validate_frames, int, 0644);
 MODULE_PARM_DESC(dma_resync_validate_frames,
@@ -394,6 +411,14 @@ static int sc0710_proc_state_show(struct seq_file *m, void *v)
 				sc0710_things_per_second_query(&ch->bitsPerSecond) / 1000000 / 8);
 			seq_printf(m, "    descr ps: %lld\n",
 				sc0710_things_per_second_query(&ch->descPerSecond));
+
+			if (zero_copy && ch->mediatype == CHTYPE_VIDEO) {
+				seq_printf(m, "   zc frames: %llu direct, %llu copied\n",
+					ch->zc_frames_direct, ch->zc_frames_copied);
+				seq_printf(m, "    zc flips: %llu, stale events: %llu, stale descriptors: %llu%s\n",
+					ch->zc_wbm_flips, ch->zc_stale_events, ch->zc_stale_descs,
+					ch->zc_stale_trip ? " [TRIPPED - zero-copy disabled]" : "");
+			}
 
 			if (ch->mediatype == CHTYPE_AUDIO) {
 				seq_printf(m, "  aud sam ps: %lld\n",
@@ -768,6 +793,11 @@ static int sc0710_initdev(struct pci_dev *pci_dev,
 		goto fail_disable;
 	}
 
+	/* The PCI core defaults max_segment_size to 64 KiB, which would shred a
+	 * mapped video buffer into hundreds of segments; the XDMA has no such
+	 * limit (28-bit per-descriptor length). Only zero-copy buffers map SG. */
+	dma_set_max_seg_size(&pci_dev->dev, UINT_MAX);
+
 	/* MAP the PCIe space, register i2c, program any PCIe quirks.
 	 * Self-cleaning on failure: releases its own regions/mappings. */
 	if (sc0710_dev_setup(dev) < 0) {
@@ -887,10 +917,6 @@ static void sc0710_finidev(struct pci_dev *pci_dev)
 	struct sc0710_dev *dev = pci_get_drvdata(pci_dev);
 	int i;
 
-	/* Every file-handle-reachable hardware path re-checks this after
-	 * taking its serializing mutex and bails with -ENODEV. */
-	WRITE_ONCE(dev->disconnected, true);
-
 	if (dev->kthread_dma) {
 		kthread_stop(dev->kthread_dma);
 		dev->kthread_dma = NULL;
@@ -900,6 +926,32 @@ static void sc0710_finidev(struct pci_dev *pci_dev)
 		kthread_stop(dev->kthread_hdmi);
 		dev->kthread_hdmi = NULL;
 	}
+
+	/* Disconnect and quiesce in one kthread_dma_lock section: a racing
+	 * STREAMOFF/close either finishes its own stop-and-untarget before
+	 * this takes the lock, or blocks on it and then sees the flag with
+	 * the engines stopped and every chain pointed back at scratch, so
+	 * the vb2 teardown it goes on to run frees client buffers no
+	 * descriptor references. Every other file-handle-reachable hardware
+	 * path re-checks the flag after taking its serializing mutex and
+	 * bails with -ENODEV. */
+	mutex_lock(&dev->kthread_dma_lock);
+	WRITE_ONCE(dev->disconnected, true);
+
+	/* Stop the DMA engines explicitly rather than relying on
+	 * pci_disable_device clearing bus-master while they still run. */
+	sc0710_dma_channels_stop(dev);
+
+	/* With the engines stopped and drained, return any zero-copy-targeted
+	 * buffers and point the chains back at the scratch ring, ahead of
+	 * anything that frees client buffers or the rings. */
+	for (i = 0; i < SC0710_MAX_CHANNELS; i++) {
+		struct sc0710_dma_channel *ch = &dev->channel[i];
+
+		if (ch->enabled && ch->mediatype == CHTYPE_VIDEO)
+			sc0710_dma_channel_untarget_all(ch);
+	}
+	mutex_unlock(&dev->kthread_dma_lock);
 
 	/* Unlink first: the /proc readers walk this list and read registers. */
 	mutex_lock(&devlist);
@@ -919,15 +971,15 @@ static void sc0710_finidev(struct pci_dev *pci_dev)
 			sc0710_audio_unregister(dev);
 	}
 
-	/* Drain barrier: every file-handle-reachable hardware path serializes
-	 * on one of these two mutexes and re-checks the disconnected flag after
-	 * acquiring it. In-flight holders finish their transaction against
-	 * still-mapped BARs before we proceed; later entrants bail; brand-new
-	 * entries were already refused by the node unregistration above. */
+	/* Drain barrier: the remaining file-handle-reachable hardware paths
+	 * serialize on signalMutex and re-check the disconnected flag after
+	 * acquiring it (the kthread_dma_lock paths were drained by the
+	 * disconnect section above). In-flight holders finish their
+	 * transaction against still-mapped BARs before we proceed; later
+	 * entrants bail; brand-new entries were already refused by the node
+	 * unregistration above. */
 	mutex_lock(&dev->signalMutex);
 	mutex_unlock(&dev->signalMutex);
-	mutex_lock(&dev->kthread_dma_lock);
-	mutex_unlock(&dev->kthread_dma_lock);
 
 	/* Shut the frame timers down and wake blocked buffer waiters. */
 	for (i = 0; i < SC0710_MAX_CHANNELS; i++) {
@@ -938,10 +990,6 @@ static void sc0710_finidev(struct pci_dev *pci_dev)
 	}
 
 	sc0710_shutdown(dev);
-
-	/* Stop the DMA engines explicitly rather than relying on
-	 * pci_disable_device clearing bus-master while they still run. */
-	sc0710_dma_channels_stop(dev);
 
 	pci_disable_device(pci_dev);
 
@@ -1001,6 +1049,7 @@ static int __init sc0710_init(void)
 	printk(KERN_INFO "sc0710: snapshot date %04d-%02d-%02d\n",
 	       SNAPSHOT/10000, (SNAPSHOT/100)%100, SNAPSHOT%100);
 #endif
+
 #ifdef CONFIG_PROC_FS
 	ret = sc0710_proc_create();
 	if (ret < 0) {
