@@ -245,9 +245,9 @@ struct sc0710_client {
 	u32                      stream_height;
 	u32                      stream_framesize;
 
-	/* Per-client VB2 queue for multi-app support */
+	/* Per-client VB2 queue for multi-app support; q->lock is the node's
+	 * ioctl mutex (ch->v4l2_lock), shared by all clients of the channel. */
 	struct vb2_queue         vb2_queue;
-	struct mutex             vb2_lock;       /* Lock for this client's queue */
 };
 
 struct sc0710_dma_channel
@@ -390,7 +390,11 @@ struct sc0710_audio_dev
 struct sc0710_dev {
 	struct list_head           devlist;
 
-	atomic_t                   refcount;
+	/* Set at the top of PCI remove. Every file-handle-reachable hardware
+	 * path re-checks it after taking its serializing mutex (signalMutex or
+	 * kthread_dma_lock) and bails with -ENODEV, so remove can drain
+	 * in-flight holders and then tear the hardware down. */
+	bool                       disconnected;
 
 	/* board details */
 	int                        nr;
@@ -560,6 +564,7 @@ s64  sc0710_things_per_second_query(struct sc0710_things_per_second *tps);
 
 /* video.c */
 void sc0710_video_unregister(struct sc0710_dma_channel *ch);
+void sc0710_video_disconnect(struct sc0710_dma_channel *ch);
 int  sc0710_video_register(struct sc0710_dma_channel *ch);
 void sc0710_video_free_status_frames(void);
 void sc0710_video_notify_source_change(struct sc0710_dev *dev);

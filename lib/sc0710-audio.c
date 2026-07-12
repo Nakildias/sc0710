@@ -367,6 +367,15 @@ static struct snd_pcm_ops pcm_capture_ops =
 	.page      = snd_pcm_pd_get_page,
 };
 
+/* Final card free (last handle closed, or immediately when none were open):
+ * drop the device reference the card held. */
+static void sc0710_audio_private_free(struct snd_card *card)
+{
+	struct sc0710_audio_dev *chip = (struct sc0710_audio_dev *)card->private_data;
+
+	v4l2_device_put(&chip->dev->v4l2_dev);
+}
+
 void sc0710_audio_unregister(struct sc0710_dev *dev)
 {
 	struct sc0710_dma_channel *channel = &dev->channel[1];
@@ -380,7 +389,11 @@ void sc0710_audio_unregister(struct sc0710_dev *dev)
 		return;
 
 	sc0710_audio_stop_silence(chip);
-	snd_card_free(chip->card);
+	/* Disconnects immediately (open PCM/ctl handles start erroring) and
+	 * defers the card free to the last close, so a handle held open across
+	 * remove - PipeWire keeps one persistently - neither blocks remove nor
+	 * outlives the card. */
+	snd_card_free_when_closed(chip->card);
 }
 
 /*
@@ -429,6 +442,12 @@ int sc0710_audio_register(struct sc0710_dev *dev)
 	chip->buffer_ptr = 0;
 	chip->running = false;
 	sc0710_audio_init_silence_work(chip);
+
+	/* The PCM/ctl callbacks reach into dev; pin it until the card is truly
+	 * freed. private_free fires exactly once on every card-free path,
+	 * including this function's own error unwind. */
+	v4l2_device_get(&dev->v4l2_dev);
+	card->private_free = sc0710_audio_private_free;
 
 	err = snd_sc0710_pcm(chip, 0, "sc0710 HDMI");
 	if (err < 0)

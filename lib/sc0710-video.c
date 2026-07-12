@@ -1116,9 +1116,13 @@ static int sc0710_start_streaming(struct vb2_queue *q, unsigned int count)
 	 * running channel and stream from a stale ring. */
 	if (refcount == 1 && dev->fmt != NULL) {
 		mutex_lock(&dev->kthread_dma_lock);
-		ret = sc0710_dma_channels_resize(dev);
-		if (ret == 0)
-			ret = sc0710_dma_channels_start(dev);
+		if (READ_ONCE(dev->disconnected)) {
+			ret = -ENODEV;
+		} else {
+			ret = sc0710_dma_channels_resize(dev);
+			if (ret == 0)
+				ret = sc0710_dma_channels_start(dev);
+		}
 		mutex_unlock(&dev->kthread_dma_lock);
 		if (ret < 0) {
 			struct sc0710_buffer *buf, *tmp;
@@ -1172,7 +1176,11 @@ static void sc0710_stop_streaming(struct vb2_queue *q)
 	if (refcount <= 0) {
 		mutex_lock(&dev->kthread_dma_lock);
 		atomic_set(&ch->streaming_refcount, 0); /* Clamp to 0 */
-		sc0710_dma_channels_stop(dev);
+		/* After a disconnect the remove path owns the hardware (the
+		 * engines are stopped, the BARs may be unmapped): only the
+		 * software teardown below remains ours. */
+		if (!READ_ONCE(dev->disconnected))
+			sc0710_dma_channels_stop(dev);
 		timer_delete_sync(&ch->timeout);
 		mutex_unlock(&dev->kthread_dma_lock);
 	}
@@ -1210,6 +1218,7 @@ static int sc0710_video_open(struct file *file)
 	struct sc0710_fh *fh;
 	struct vb2_queue *q;
 	unsigned long flags;
+	u32 users;
 	int err;
 
 	dprintk(0, "%s() dev=%s\n", __func__, video_device_node_name(vdev));
@@ -1232,7 +1241,6 @@ static int sc0710_video_open(struct file *file)
 	fh->client->streaming = false;
 	INIT_LIST_HEAD(&fh->client->buffer_list);
 	spin_lock_init(&fh->client->buffer_lock);
-	mutex_init(&fh->client->vb2_lock);
 
 	/* Initialize per-client VB2 queue */
 	q = &fh->client->vb2_queue;
@@ -1245,7 +1253,10 @@ static int sc0710_video_open(struct file *file)
 	q->mem_ops = &vb2_vmalloc_memops;
 	q->timestamp_flags = V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC;
 	q->min_queued_buffers = 2;
-	q->lock = &fh->client->vb2_lock;  /* Use client's lock */
+	/* The node's ioctl lock: the v4l2 core holds it across every ioctl, so
+	 * vb2's blocking waits (DQBUF, read) drop the mutex the caller actually
+	 * holds, and other clients' ioctls proceed during the wait. */
+	q->lock = &ch->v4l2_lock;
 	q->dev = &dev->pci->dev;
 
 	err = vb2_queue_init(q);
@@ -1256,13 +1267,12 @@ static int sc0710_video_open(struct file *file)
 		return err;
 	}
 
-	/* Add to channel's client list */
+	/* Add to the channel's client list; videousers rides the same lock
+	 * (the v4l2 core does not hold vdev->lock for open/release). */
 	spin_lock_irqsave(&ch->client_list_lock, flags);
 	list_add_tail(&fh->client->list, &ch->client_list);
+	users = ++ch->videousers;
 	spin_unlock_irqrestore(&ch->client_list_lock, flags);
-
-	/* Track video users (v4l2_lock already held by framework) */
-	ch->videousers++;
 
 	v4l2_fh_init(&fh->fh, vdev);
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6,18,0)
@@ -1275,7 +1285,7 @@ static int sc0710_video_open(struct file *file)
 	file->private_data = fh;
 #endif
 
-	dprintk(2, "%s() new client opened, videousers=%d\n", __func__, ch->videousers);
+	dprintk(2, "%s() new client opened, videousers=%d\n", __func__, users);
 
 	return 0;
 }
@@ -1287,26 +1297,30 @@ static int sc0710_video_release(struct file *file)
 	struct sc0710_dma_channel *ch = fh->ch;
 	struct sc0710_dev *dev = ch->dev;
 	unsigned long flags;
+	u32 users;
 
 	dprintk(2, "%s() dev=%s\n", __func__, video_device_node_name(vdev));
 
 	/* Release the per-client VB2 queue */
 	if (fh->client) {
-		/* Remove from client list */
+		/* Remove from the client list; videousers rides the same lock
+		 * (the v4l2 core does not hold vdev->lock for open/release). */
 		spin_lock_irqsave(&ch->client_list_lock, flags);
 		list_del(&fh->client->list);
+		users = --ch->videousers;
 		spin_unlock_irqrestore(&ch->client_list_lock, flags);
+		dprintk(2, "%s() videousers=%d\n", __func__, users);
 
-		/* Release the queue (handles stopping streaming if needed) */
+		/* Release the queue (handles stopping streaming if needed).
+		 * The core does not hold vdev->lock for release; take the queue
+		 * lock ourselves like the vb2 fop helpers do. */
+		mutex_lock(&ch->v4l2_lock);
 		vb2_queue_release(&fh->client->vb2_queue);
+		mutex_unlock(&ch->v4l2_lock);
 
 		kfree(fh->client);
 		fh->client = NULL;
 	}
-
-	/* v4l2_lock already held by framework */
-	ch->videousers--;
-	dprintk(2, "%s() videousers=%d\n", __func__, ch->videousers);
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6,18,0)
 	v4l2_fh_del(&fh->fh, file);
@@ -1326,10 +1340,19 @@ static ssize_t sc0710_fop_read(struct file *file, char __user *buf,
 			       size_t count, loff_t *ppos)
 {
 	struct sc0710_fh *fh = file->private_data;
+	ssize_t ret;
+
 	if (!fh || !fh->client)
 		return -EINVAL;
-	return vb2_read(&fh->client->vb2_queue, buf, count, ppos,
-			file->f_flags & O_NONBLOCK);
+	/* The core does not hold vdev->lock for fops; read-fileio mutates
+	 * queue state and its blocking wait drops the queue lock, so take it
+	 * here the way vb2_fop_read does. */
+	if (mutex_lock_interruptible(&fh->ch->v4l2_lock))
+		return -ERESTARTSYS;
+	ret = vb2_read(&fh->client->vb2_queue, buf, count, ppos,
+		       file->f_flags & O_NONBLOCK);
+	mutex_unlock(&fh->ch->v4l2_lock);
+	return ret;
 }
 
 static __poll_t sc0710_fop_poll(struct file *file, poll_table *wait)
@@ -1340,7 +1363,11 @@ static __poll_t sc0710_fop_poll(struct file *file, poll_table *wait)
 	if (!fh || !fh->client)
 		return EPOLLERR;
 
+	/* vb2_poll can start read-fileio; serialize it like vb2_fop_poll. */
+	if (mutex_lock_interruptible(&fh->ch->v4l2_lock))
+		return EPOLLERR;
 	rc = vb2_poll(&fh->client->vb2_queue, file, wait);
+	mutex_unlock(&fh->ch->v4l2_lock);
 
 	/* Also wake callers waiting for V4L2 events (SOURCE_CHANGE) */
 	poll_wait(file, &fh->fh.wait, wait);
@@ -1353,6 +1380,7 @@ static __poll_t sc0710_fop_poll(struct file *file, poll_table *wait)
 static int sc0710_fop_mmap(struct file *file, struct vm_area_struct *vma)
 {
 	struct sc0710_fh *fh = file->private_data;
+
 	if (!fh || !fh->client)
 		return -EINVAL;
 	return vb2_mmap(&fh->client->vb2_queue, vma);
@@ -1363,6 +1391,7 @@ static int sc0710_vidioc_reqbufs(struct file *file, void *priv,
 				 struct v4l2_requestbuffers *p)
 {
 	struct sc0710_fh *fh = file->private_data;
+
 	if (!fh || !fh->client)
 		return -EINVAL;
 	return vb2_reqbufs(&fh->client->vb2_queue, p);
@@ -1372,6 +1401,7 @@ static int sc0710_vidioc_querybuf(struct file *file, void *priv,
 				  struct v4l2_buffer *p)
 {
 	struct sc0710_fh *fh = file->private_data;
+
 	if (!fh || !fh->client)
 		return -EINVAL;
 	return vb2_querybuf(&fh->client->vb2_queue, p);
@@ -1381,6 +1411,7 @@ static int sc0710_vidioc_qbuf(struct file *file, void *priv,
 			      struct v4l2_buffer *p)
 {
 	struct sc0710_fh *fh = file->private_data;
+
 	if (!fh || !fh->client)
 		return -EINVAL;
 	return vb2_qbuf(&fh->client->vb2_queue, NULL, p);
@@ -1390,6 +1421,7 @@ static int sc0710_vidioc_dqbuf(struct file *file, void *priv,
 			       struct v4l2_buffer *p)
 {
 	struct sc0710_fh *fh = file->private_data;
+
 	if (!fh || !fh->client)
 		return -EINVAL;
 	return vb2_dqbuf(&fh->client->vb2_queue, p,
@@ -1400,6 +1432,7 @@ static int sc0710_vidioc_streamon(struct file *file, void *priv,
 				  enum v4l2_buf_type type)
 {
 	struct sc0710_fh *fh = file->private_data;
+
 	if (!fh || !fh->client)
 		return -EINVAL;
 	return vb2_streamon(&fh->client->vb2_queue, type);
@@ -1409,6 +1442,7 @@ static int sc0710_vidioc_streamoff(struct file *file, void *priv,
 				   enum v4l2_buf_type type)
 {
 	struct sc0710_fh *fh = file->private_data;
+
 	if (!fh || !fh->client)
 		return -EINVAL;
 	return vb2_streamoff(&fh->client->vb2_queue, type);
@@ -1742,8 +1776,27 @@ void sc0710_video_unregister(struct sc0710_dma_channel *ch)
 	if (video_is_registered(&ch->vdev))
 		video_unregister_device(&ch->vdev);
 
-	/* No-op unless the handler was initialized (4K Pro only). */
-	v4l2_ctrl_handler_free(&dev->ctrl_handler);
+	/* The control handler stays alive: open file handles unsubscribe
+	 * their control events through it at close. It is freed with dev,
+	 * after the last handle is gone. */
+}
+
+/* Remove-path disconnect, after the node is unregistered and in-flight
+ * ioctls drained: shut the frame timer down (later mod_timer calls are
+ * silently ignored) and error the client queues so blocked DQBUF/poll/read
+ * waiters wake with -EIO - nothing will complete their buffers again. New
+ * clients can't appear (open is refused once the node is unregistered). */
+void sc0710_video_disconnect(struct sc0710_dma_channel *ch)
+{
+	struct sc0710_client *client;
+	unsigned long flags;
+
+	timer_shutdown_sync(&ch->timeout);
+
+	spin_lock_irqsave(&ch->client_list_lock, flags);
+	list_for_each_entry(client, &ch->client_list, list)
+		vb2_queue_error(&client->vb2_queue);
+	spin_unlock_irqrestore(&ch->client_list_lock, flags);
 }
 
 int sc0710_video_register(struct sc0710_dma_channel *ch)

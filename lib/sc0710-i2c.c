@@ -1421,6 +1421,10 @@ int sc0710_set_edid_source(struct sc0710_dev *dev, u32 src)
 	int ret;
 
 	mutex_lock(&dev->signalMutex);
+	if (READ_ONCE(dev->disconnected)) {
+		mutex_unlock(&dev->signalMutex);
+		return -ENODEV;
+	}
 	if (dev->board == SC0710_BOARD_ELGATEO_4KP)
 		ret = __sc0710_4kp_set_edid_source(dev, src);
 	else if (dev->board == SC0710_BOARD_ELGATEO_4KP60_MK2)
@@ -1547,6 +1551,10 @@ int sc0710_i2c_get_edid(struct sc0710_dev *dev, u8 *buf, int start, int len)
 	int addr, ret = 0;
 
 	mutex_lock(&dev->signalMutex);
+	if (READ_ONCE(dev->disconnected)) {
+		mutex_unlock(&dev->signalMutex);
+		return -ENODEV;
+	}
 	if (dev->board == SC0710_BOARD_ELGATEO_4KP60_MK2) {
 		ret = sc0710_mk2_read_edid(dev, buf, start, len);
 		mutex_unlock(&dev->signalMutex);
@@ -1578,6 +1586,11 @@ int sc0710_i2c_set_edid(struct sc0710_dev *dev, const u8 *edid, int len)
 		return -EINVAL;
 
 	mutex_lock(&dev->signalMutex);
+
+	if (READ_ONCE(dev->disconnected)) {
+		mutex_unlock(&dev->signalMutex);
+		return -ENODEV;
+	}
 
 	if (dev->board == SC0710_BOARD_ELGATEO_4KP60_MK2) {
 		/* MK.2: fn 0x59 UpdateEDID protocol to the frontend MCU, entirely

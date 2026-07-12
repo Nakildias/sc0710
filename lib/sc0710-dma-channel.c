@@ -932,15 +932,8 @@ void sc0710_dma_channel_free(struct sc0710_dev *dev, u32 nr)
 
 	ch->enabled = 0;
 
-	/* Unregister video and audio subsystems and detach them from this driver. */
-	if (ch->mediatype == CHTYPE_VIDEO) {
-		sc0710_video_unregister(ch);
-	}
-	if (ch->mediatype == CHTYPE_AUDIO) {
-		sc0710_audio_unregister(dev);
-	}
-
-	/* We don't need any DMA allocations, free them. */
+	/* The V4L2/ALSA nodes are taken down by the remove path before any
+	 * hardware teardown; this frees DMA resources only. */
 	sc0710_dma_chains_free(ch);
 
 	if (sc0710_debug_mode)

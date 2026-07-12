@@ -190,8 +190,6 @@ static int sc0710_dev_setup(struct sc0710_dev *dev)
 	mutex_init(&dev->lock);
 	mutex_init(&dev->signalMutex);
 
-	atomic_inc(&dev->refcount);
-
 	dev->nr = ida_alloc_max(&sc0710_nr_ida, SC0710_MAXBOARDS - 1, GFP_KERNEL);
 	if (dev->nr < 0) {
 		printk(KERN_ERR "sc0710: all %d board slots in use, refusing probe\n",
@@ -244,7 +242,8 @@ static int sc0710_dev_setup(struct sc0710_dev *dev)
 		dev->lmmio[0] = NULL;
 		dev->lmmio[1] = NULL;
 		release_mem_region(pci_resource_start(dev->pci, 0), pci_resource_len(dev->pci, 0));
-		release_mem_region(pci_resource_start(dev->pci, bar1_idx), pci_resource_len(dev->pci, bar1_idx));
+		release_mem_region(pci_resource_start(dev->pci, bar1_idx),
+				   pci_resource_len(dev->pci, bar1_idx));
 		ida_free(&sc0710_nr_ida, dev->nr);
 		return -ENOMEM;
 	}
@@ -262,16 +261,14 @@ static void sc0710_dev_unregister(struct sc0710_dev *dev)
 {
 	int bar1_idx = sc0710_boards[dev->board].bar1_index;
 
-	release_mem_region(pci_resource_start(dev->pci, 0), pci_resource_len(dev->pci, 0));
-	release_mem_region(pci_resource_start(dev->pci, bar1_idx), pci_resource_len(dev->pci, bar1_idx));
-
-	if (!atomic_dec_and_test(&dev->refcount))
-		return;
-
 	sc0710_dma_channels_free(dev);
 
 	iounmap(dev->lmmio[0]);
 	iounmap(dev->lmmio[1]);
+
+	release_mem_region(pci_resource_start(dev->pci, 0), pci_resource_len(dev->pci, 0));
+	release_mem_region(pci_resource_start(dev->pci, bar1_idx),
+			   pci_resource_len(dev->pci, bar1_idx));
 
 	/* Single nr release point: probe failure and remove both land here
 	 * exactly once per device. */
@@ -603,6 +600,21 @@ static int sc0710_thread_hdmi_function(void *data)
 	return 0;
 }
 
+/* Runs when the last reference to the v4l2_device drops: at remove when no
+ * file handles remain, otherwise at the true last close of a node. Everything
+ * an open file handle can still reach (channels, queues, locks, the control
+ * handler) is embedded in dev, so this is the only safe point to free it. */
+static void sc0710_dev_release(struct v4l2_device *v4l2_dev)
+{
+	struct sc0710_dev *dev = container_of(v4l2_dev, struct sc0710_dev, v4l2_dev);
+
+	/* No-op unless the handler was initialized (4K Pro only); freed here
+	 * because open file handles unsubscribe control events through it. */
+	v4l2_ctrl_handler_free(&dev->ctrl_handler);
+	pci_dev_put(dev->pci);
+	kfree(dev);
+}
+
 static int sc0710_initdev(struct pci_dev *pci_dev,
 	const struct pci_device_id *pci_id)
 {
@@ -618,9 +630,16 @@ static int sc0710_initdev(struct pci_dev *pci_dev,
 		printk(KERN_ERR "sc0710: v4l2_device_register failed (%d)\n", err);
 		goto fail_free;
 	}
+	/* From here on dev is freed only by sc0710_dev_release, when the last
+	 * reference drops (v4l2_device_put on the failure paths and at remove;
+	 * the v4l2 core holds a reference per registered node spanning every
+	 * open file handle's lifetime). */
+	dev->v4l2_dev.release = sc0710_dev_release;
 
-	/* pci init */
-	dev->pci = pci_dev;
+	/* pci init. The reference keeps the pci_dev (vb2's dma device, the
+	 * querycap bus_info source) valid for file handles that outlive a
+	 * remove; dropped in sc0710_dev_release. */
+	dev->pci = pci_dev_get(pci_dev);
 	if (pci_enable_device(pci_dev)) {
 		err = -EIO;
 		goto fail_v4l2;
@@ -741,7 +760,11 @@ fail_disable:
 	pci_disable_device(pci_dev);
 fail_v4l2:
 	v4l2_device_unregister(&dev->v4l2_dev);
+	v4l2_device_put(&dev->v4l2_dev);
+	return err;
 fail_free:
+	/* v4l2_device_register itself failed: no release callback is set,
+	 * no reference exists, free directly. */
 	kfree(dev);
 	return err;
 }
@@ -749,6 +772,11 @@ fail_free:
 static void sc0710_finidev(struct pci_dev *pci_dev)
 {
 	struct sc0710_dev *dev = pci_get_drvdata(pci_dev);
+	int i;
+
+	/* Every file-handle-reachable hardware path re-checks this after
+	 * taking its serializing mutex and bails with -ENODEV. */
+	WRITE_ONCE(dev->disconnected, true);
 
 	if (dev->kthread_dma) {
 		kthread_stop(dev->kthread_dma);
@@ -760,6 +788,42 @@ static void sc0710_finidev(struct pci_dev *pci_dev)
 		dev->kthread_hdmi = NULL;
 	}
 
+	/* Unlink first: the /proc readers walk this list and read registers. */
+	mutex_lock(&devlist);
+	list_del(&dev->devlist);
+	mutex_unlock(&devlist);
+
+	/* Take the user-facing nodes down before any hardware teardown,
+	 * mirroring the probe's register-last order. */
+	for (i = 0; i < SC0710_MAX_CHANNELS; i++) {
+		struct sc0710_dma_channel *ch = &dev->channel[i];
+
+		if (!ch->enabled)
+			continue;
+		if (ch->mediatype == CHTYPE_VIDEO)
+			sc0710_video_unregister(ch);
+		else if (ch->mediatype == CHTYPE_AUDIO)
+			sc0710_audio_unregister(dev);
+	}
+
+	/* Drain barrier: every file-handle-reachable hardware path serializes
+	 * on one of these two mutexes and re-checks the disconnected flag after
+	 * acquiring it. In-flight holders finish their transaction against
+	 * still-mapped BARs before we proceed; later entrants bail; brand-new
+	 * entries were already refused by the node unregistration above. */
+	mutex_lock(&dev->signalMutex);
+	mutex_unlock(&dev->signalMutex);
+	mutex_lock(&dev->kthread_dma_lock);
+	mutex_unlock(&dev->kthread_dma_lock);
+
+	/* Shut the frame timers down and wake blocked buffer waiters. */
+	for (i = 0; i < SC0710_MAX_CHANNELS; i++) {
+		struct sc0710_dma_channel *ch = &dev->channel[i];
+
+		if (ch->enabled && ch->mediatype == CHTYPE_VIDEO)
+			sc0710_video_disconnect(ch);
+	}
+
 	sc0710_shutdown(dev);
 
 	/* Stop the DMA engines explicitly rather than relying on
@@ -767,10 +831,6 @@ static void sc0710_finidev(struct pci_dev *pci_dev)
 	sc0710_dma_channels_stop(dev);
 
 	pci_disable_device(pci_dev);
-
-	mutex_lock(&devlist);
-	list_del(&dev->devlist);
-	mutex_unlock(&devlist);
 
 	sc0710_dev_unregister(dev);
 
@@ -785,7 +845,10 @@ static void sc0710_finidev(struct pci_dev *pci_dev)
 	}
 
 	v4l2_device_unregister(&dev->v4l2_dev);
-	kfree(dev);
+
+	/* Drop the probe's reference. The release callback fires here when no
+	 * file handles remain, else at the true last close of a node. */
+	v4l2_device_put(&dev->v4l2_dev);
 }
 
 static struct pci_device_id sc0710_pci_tbl[] = {
