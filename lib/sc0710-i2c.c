@@ -556,17 +556,21 @@ int sc0710_i2c_read_hdmi_status(struct sc0710_dev *dev)
 		return ret;
 	}
 	/* Lock detection differs by board.
-	 * MK2: rbuf[8] is a dedicated lock flag (0 or 1).
-	 * 4K Pro: rbuf[8] is part of the active resolution data, not a lock flag.
-	 *         Use presence of timing data in [4:7] as the lock indicator instead.
-	 *         The 4K Pro MCU intermittently returns all-zero responses even with
-	 *         a valid signal, so require multiple consecutive dropouts before
-	 *         declaring signal loss.
+	 * 4K Pro: no dedicated lock flag; the captured-timing bytes [8:11] are
+	 * zeroed whenever the MCU is not capturing, so their presence is the
+	 * lock indicator. The detected-input bytes [4:7] are not usable: the
+	 * MCU keeps reporting the last negotiated timing there after the cable
+	 * is unplugged, so a lock derived from them never drops. They still
+	 * drive cable-vs-signal detection in the unlocked branch below.
+	 * MK2: rbuf[8] is a dedicated lock flag (0 or 1); the semantics of
+	 * bytes [9:11] on that board are unverified, so they must not feed
+	 * the lock.
+	 * The MCU intermittently returns all-zero responses even with a valid
+	 * signal, so require multiple consecutive dropouts before declaring
+	 * signal loss.
 	 */
-
-
 	if (dev->board == SC0710_BOARD_ELGATEO_4KP)
-		raw_locked = (rbuf[4] | rbuf[5] | rbuf[6] | rbuf[7]) != 0;
+		raw_locked = (rbuf[8] | rbuf[9] | rbuf[10] | rbuf[11]) != 0;
 	else
 		raw_locked = rbuf[8] != 0;
 
