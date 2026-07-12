@@ -35,7 +35,7 @@ MODULE_VERSION(SC0710_DRV_VERSION);
 /* 1 = Basic device statistics
  * 2 = PCIe register dump for entire device
  */
-unsigned int procfs_verbosity = 3;
+unsigned int procfs_verbosity = 1;
 module_param(procfs_verbosity, int, 0644);
 MODULE_PARM_DESC(procfs_verbosity, "enable procfs debugging via /proc/sc0710");
 
@@ -54,10 +54,6 @@ MODULE_PARM_DESC(thread_hdmi_poll_interval_ms, "have the kernel thread poll hdmi
 unsigned int thread_dma_poll_interval_ms = 2;
 module_param(thread_dma_poll_interval_ms, int, 0644);
 MODULE_PARM_DESC(thread_dma_poll_interval_ms, "have the kernel thread poll dma every N ms (def:2)");
-
-unsigned int dma_status = 0;
-module_param(dma_status, int, 0644);
-MODULE_PARM_DESC(dma_status, "Manually start or stop dma activities (def:0 Stopped)");
 
 unsigned int sc0710_debug_mode = 0;
 module_param(sc0710_debug_mode, int, 0644);
@@ -291,7 +287,6 @@ static int sc0710_proc_state_show(struct seq_file *m, void *v)
 		dev = list_entry(list, struct sc0710_dev, devlist);
 
 		seq_printf(m, "%s\n", dev->name);
-		seq_printf(m, "  dma status: %d\n", dma_status);
 
 		/* Cached state only: this file is world-readable, so its read path
 		 * must not run I2C or trigger a DMA reconfig; the HDMI poll
