@@ -1336,13 +1336,16 @@ static int sc0710_4kp_mcu_call(struct sc0710_dev *dev, u8 fn, const u8 *expected
  * One call switches the source; the MCU bounces HPD toward the source by
  * itself and the source renegotiates within ~10 s.
  * The MCU offers no readback for the current selection.
- * 4K Pro only: the protocol is unobserved on the MK2.
+ * Shared by both boards: the MK2 MCU speaks the same protocol with the
+ * same fn codes and ack signatures, verified on real hardware (probe
+ * tiers 2-9; GPU-side EDID captures confirmed the switches take effect).
+ * The MK2 uses the polled-ack call variant below.
  */
 static const struct {
 	u8 fn;
 	u8 ack[3];
 	const char *name;
-} sc0710_4kp_edid_sources[] = {
+} sc0710_edid_sources[] = {
 	[SC0710_EDID_SOURCE_INTERNAL] = { 0x5f, { 0x11, 0x22, 0x66 }, "internal" },
 	[SC0710_EDID_SOURCE_DISPLAY]  = { 0x60, { 0x11, 0x22, 0x77 }, "display" },
 	[SC0710_EDID_SOURCE_MERGED]   = { 0x61, { 0x11, 0x22, 0x88 }, "merged" },
@@ -1353,26 +1356,79 @@ static int __sc0710_4kp_set_edid_source(struct sc0710_dev *dev, u32 src)
 {
 	int ret;
 
-	if (src >= ARRAY_SIZE(sc0710_4kp_edid_sources))
+	if (src >= ARRAY_SIZE(sc0710_edid_sources))
 		return -EINVAL;
 
-	ret = sc0710_4kp_mcu_call(dev, sc0710_4kp_edid_sources[src].fn,
-				  sc0710_4kp_edid_sources[src].ack);
+	ret = sc0710_4kp_mcu_call(dev, sc0710_edid_sources[src].fn,
+				  sc0710_edid_sources[src].ack);
 	if (ret == 0)
 		printk(KERN_INFO "%s: EDID source set to %s\n",
-			dev->name, sc0710_4kp_edid_sources[src].name);
+			dev->name, sc0710_edid_sources[src].name);
 	return ret;
 }
 
-int sc0710_4kp_set_edid_source(struct sc0710_dev *dev, u32 src)
+/* MK2 variant of the MCU function call. Same command bytes and ack
+ * signatures as the 4K Pro, but the MK2's response buffer updates
+ * asynchronously: it keeps returning the PREVIOUS response (with a clean
+ * rc) until the MCU finishes processing, up to ~2 s observed on real
+ * hardware. So poll until the expected ack appears instead of judging the
+ * first read; a stale ack is progress-pending, not failure.
+ * Caller holds signalMutex. */
+static int sc0710_mk2_mcu_call(struct sc0710_dev *dev, u8 fn, const u8 *expected_ack)
+{
+	u8 ack[3];
+	u8 cmd[5] = { 0xab, 0x03, 0x12, 0x34, fn };
+	unsigned long timeout;
+	int ret;
+
+	ret = sc0710_i2c_write(dev, I2C_DEV__MCU_FN, cmd, sizeof(cmd));
+	if (ret < 0)
+		return ret;
+
+	timeout = jiffies + msecs_to_jiffies(2500);
+	for (;;) {
+		msleep(100);
+		memset(ack, 0, sizeof(ack));
+		ret = __sc0710_i2c_read(dev, I2C_DEV__MCU_FN, ack, sizeof(ack));
+		if (ret == 0 && memcmp(ack, expected_ack, sizeof(ack)) == 0)
+			return 0;
+		if (time_after(jiffies, timeout)) {
+			printk(KERN_ERR "%s: MCU function 0x%02x: expected ack %3ph never arrived (last %3ph, rc=%d)\n",
+				dev->name, fn, expected_ack, ack, ret);
+			return -EIO;
+		}
+	}
+}
+
+/* Caller holds signalMutex. */
+static int __sc0710_mk2_set_edid_source(struct sc0710_dev *dev, u32 src)
 {
 	int ret;
 
-	if (dev->board != SC0710_BOARD_ELGATEO_4KP)
-		return -ENODEV;
+	if (src >= ARRAY_SIZE(sc0710_edid_sources))
+		return -EINVAL;
+
+	ret = sc0710_mk2_mcu_call(dev, sc0710_edid_sources[src].fn,
+				  sc0710_edid_sources[src].ack);
+	if (ret == 0)
+		printk(KERN_INFO "%s: EDID source set to %s\n",
+			dev->name, sc0710_edid_sources[src].name);
+	return ret;
+}
+
+/* Shared entry for the EDID Source control: each board keeps its own
+ * verified call variant underneath. */
+int sc0710_set_edid_source(struct sc0710_dev *dev, u32 src)
+{
+	int ret;
 
 	mutex_lock(&dev->signalMutex);
-	ret = __sc0710_4kp_set_edid_source(dev, src);
+	if (dev->board == SC0710_BOARD_ELGATEO_4KP)
+		ret = __sc0710_4kp_set_edid_source(dev, src);
+	else if (dev->board == SC0710_BOARD_ELGATEO_4KP60_MK2)
+		ret = __sc0710_mk2_set_edid_source(dev, src);
+	else
+		ret = -ENODEV;
 	mutex_unlock(&dev->signalMutex);
 	return ret;
 }
@@ -1413,14 +1469,91 @@ static bool sc0710_mcu_sane(struct sc0710_dev *dev)
 	return false;
 }
 
-/* Runtime EDID read for VIDIOC_G_EDID. Fills `len` bytes of the EEPROM
- * image from `start` (both multiples of 16, start+len <= 512). 4K Pro only:
- * the ioctls are disabled at registration on other boards. */
+/* MK.2 EDID read, transcribed from ReadEDID() in the Windows kernel driver
+ * SC0710.X64.SYS (@0x14024fd34). It is entirely MCU-mediated through the safe
+ * I2C_DEV__MCU_FN (0x33) port -- no 0x50 EEPROM, no raw pokes -- so it is
+ * usable any time the MCU is alive, with or without a live HDMI signal:
+ *
+ *   BEGIN: write [ab 03 12 34 <src>] to 0x33, poll a 3-byte read until it
+ *          returns {51 10 35} ("EDID ready"); src selects which image
+ *          (0x5c internal / 0x62 pass-monitor / 0x68 merged).
+ *   BODY:  for each 16-byte offset: write [55 <off>] to set the read pointer,
+ *          then read 16 bytes back from 0x33.
+ *   END:   write [ab 03 12 34 cc], read 3 bytes ({51 10 31} = done).
+ *
+ * `start` and `len` are multiples of 16 within a single 256-byte image.
+ * Caller holds signalMutex. */
+#define SC0710_MK2_EDID_SRC_INTERNAL	0x5c
+static int sc0710_mk2_read_edid(struct sc0710_dev *dev, u8 *buf,
+				int start, int len)
+{
+	static const u8 begin_ack[3] = { 0x51, 0x10, 0x35 };
+	u8 begin[5] = { 0xab, 0x03, 0x12, 0x34, SC0710_MK2_EDID_SRC_INTERNAL };
+	u8 end[5]   = { 0xab, 0x03, 0x12, 0x34, 0xcc };
+	unsigned long timeout;
+	u8 ack[3];
+	int off, ret;
+
+	if (start < 0 || len <= 0 || (start & 15) || (len & 15) ||
+	    start + len > 256)
+		return -EINVAL;
+
+	/* BEGIN: ask the MCU to expose the internal EDID for reading. */
+	ret = sc0710_i2c_write(dev, I2C_DEV__MCU_FN, begin, sizeof(begin));
+	if (ret < 0)
+		return ret;
+
+	timeout = jiffies + msecs_to_jiffies(2500);
+	for (;;) {
+		msleep(100);
+		memset(ack, 0, sizeof(ack));
+		ret = __sc0710_i2c_read(dev, I2C_DEV__MCU_FN, ack, sizeof(ack));
+		if (ret == 0 && memcmp(ack, begin_ack, sizeof(ack)) == 0)
+			break;
+		if (time_after(jiffies, timeout)) {
+			printk(KERN_ERR "%s: EDID read: MCU not ready (last %3ph, rc=%d)\n",
+				dev->name, ack, ret);
+			return -EIO;
+		}
+	}
+
+	/* BODY: pull 16 bytes at a time. */
+	for (off = start; off < start + len; off += 16) {
+		u8 ptr[2] = { 0x55, (u8)off };
+
+		ret = sc0710_i2c_write(dev, I2C_DEV__MCU_FN, ptr, sizeof(ptr));
+		if (ret < 0)
+			return ret;
+		usleep_range(2000, 3000);
+		ret = __sc0710_i2c_read(dev, I2C_DEV__MCU_FN,
+					buf + (off - start), 16);
+		if (ret < 0)
+			return ret;
+		usleep_range(2000, 3000);
+	}
+
+	/* END: best-effort close; the bytes are already in hand. */
+	if (sc0710_i2c_write(dev, I2C_DEV__MCU_FN, end, sizeof(end)) == 0) {
+		msleep(2);
+		__sc0710_i2c_read(dev, I2C_DEV__MCU_FN, ack, sizeof(ack));
+	}
+
+	return 0;
+}
+
+/* Runtime EDID read for VIDIOC_G_EDID. Fills `len` bytes of the EDID image
+ * from `start` (both multiples of 16). The 4K Pro reads its EEPROM directly;
+ * the MK.2 reads the MCU-served internal image (256 bytes max). */
 int sc0710_i2c_get_edid(struct sc0710_dev *dev, u8 *buf, int start, int len)
 {
 	int addr, ret = 0;
 
 	mutex_lock(&dev->signalMutex);
+	if (dev->board == SC0710_BOARD_ELGATEO_4KP60_MK2) {
+		ret = sc0710_mk2_read_edid(dev, buf, start, len);
+		mutex_unlock(&dev->signalMutex);
+		return ret;
+	}
 	for (addr = start; addr + 16 <= start + len; addr += 16) {
 		ret = sc0710_read_edid_page(dev, addr, buf + (addr - start));
 		if (ret < 0)
@@ -1430,14 +1563,15 @@ int sc0710_i2c_get_edid(struct sc0710_dev *dev, u8 *buf, int start, int len)
 	return ret;
 }
 
+/* MK.2 custom EDID write (fn 0x59 UpdateEDID protocol); defined below. */
+static int sc0710_mk2_write_edid(struct sc0710_dev *dev, const u8 *edid, int len);
+
 /* Runtime EDID write for VIDIOC_S_EDID: validate, refuse a sick MCU, skip
  * if already current (no needless HPD bounce), else write and verify, the
- * same protections as the probe-time edid= path. The EEPROM is the
- * internal-mode slot, so the internal EDID source is forced first to make
- * the written EDID visible even if the card was left in another mode.
- * The MCU re-raises HPD itself, so the source re-reads the new EDID within
- * ~10 s. 4K Pro only: the ioctl is disabled at registration on other
- * boards, and the page writer refuses other boards outright. */
+ * same protections as the probe-time edid= path. On the 4K Pro the EEPROM is
+ * the internal-mode slot, so the internal EDID source is forced first to make
+ * the written EDID visible even if the card was left in another mode; the MCU
+ * re-raises HPD itself. The MK.2 uses the fn 0x59 MCU write path instead. */
 int sc0710_i2c_set_edid(struct sc0710_dev *dev, const u8 *edid, int len)
 {
 	int ret;
@@ -1447,7 +1581,11 @@ int sc0710_i2c_set_edid(struct sc0710_dev *dev, const u8 *edid, int len)
 
 	mutex_lock(&dev->signalMutex);
 
-	if (!sc0710_mcu_sane(dev)) {
+	if (dev->board == SC0710_BOARD_ELGATEO_4KP60_MK2) {
+		/* MK.2: fn 0x59 UpdateEDID protocol to the frontend MCU, entirely
+		 * on the safe 0x33 port. Verify afterward with VIDIOC_G_EDID. */
+		ret = sc0710_mk2_write_edid(dev, edid, len);
+	} else if (!sc0710_mcu_sane(dev)) {
 		printk(KERN_ERR "%s: refusing EDID write, bus/MCU unhealthy\n", dev->name);
 		ret = -EIO;
 	} else {
@@ -1461,10 +1599,118 @@ int sc0710_i2c_set_edid(struct sc0710_dev *dev, const u8 *edid, int len)
 	return ret;
 }
 
+/* MK.2 EDID write, transcribed from UpdateEDID() in SC0710.X64.SYS
+ * (@0x1402571d0) -- the normal (non-debug) write path, and the mirror of
+ * sc0710_mk2_read_edid: fully MCU-mediated on the safe I2C_DEV__MCU_FN (0x33)
+ * port, no 0x50 EEPROM. Frames are [ab 03 <op> 34 <fn>] (op 0x12 = command,
+ * op 0xcc = commit):
+ *
+ *   BEGIN:  write [ab 03 12 34 59], poll a 3-byte read until {51 10 30}
+ *           ("ready to receive"). fn 0x59 puts the MCU into EDID-receive mode.
+ *   STREAM: write the 256-byte image as sixteen plain 16-byte writes to 0x33;
+ *           the MCU tracks the offset itself.
+ *   COMMIT: write [ab 03 cc 34 59], poll until {51 10 31} ("stored").
+ *
+ * SAFETY: streaming bare bytes to 0x33 is only safe AFTER the {51 10 30} ack
+ * (the MCU is then expecting the stream); a bare write outside receive mode
+ * wedges the MCU, so we abort without streaming if BEGIN never acks. */
+static int sc0710_mk2_write_edid(struct sc0710_dev *dev, const u8 *edid, int len)
+{
+	static const u8 begin_ack[3] = { 0x51, 0x10, 0x30 };
+	static const u8 end_ack[3]   = { 0x51, 0x10, 0x31 };
+	u8 begin[5]  = { 0xab, 0x03, 0x12, 0x34, 0x59 };
+	u8 commit[5] = { 0xab, 0x03, 0xcc, 0x34, 0x59 };
+	unsigned long timeout;
+	u8 ack[3];
+	int off, rc, ready = 0;
+
+	if (WARN_ON_ONCE(dev->board != SC0710_BOARD_ELGATEO_4KP60_MK2))
+		return -ENODEV;
+	/* The MCU streams a fixed 256-byte image (16 x 16-byte writes). */
+	if (len != 256)
+		return -EINVAL;
+
+	/* BEGIN: request receive mode. */
+	rc = sc0710_i2c_write(dev, I2C_DEV__MCU_FN, begin, sizeof(begin));
+	if (rc < 0)
+		return rc;
+	printk(KERN_INFO "%s: MK2 EDID write: fn 0x59 begin\n", dev->name);
+
+	timeout = jiffies + msecs_to_jiffies(5500);
+	for (;;) {
+		msleep(100);
+		memset(ack, 0, sizeof(ack));
+		rc = __sc0710_i2c_read(dev, I2C_DEV__MCU_FN, ack, sizeof(ack));
+		if (rc == 0 && memcmp(ack, begin_ack, sizeof(ack)) == 0) {
+			ready = 1;
+			break;
+		}
+		if (time_after(jiffies, timeout))
+			break;
+	}
+	if (!ready) {
+		printk(KERN_ERR "%s: MK2 EDID write: MCU never entered receive mode (last %3ph); NOT streaming\n",
+			dev->name, ack);
+		return -EIO;
+	}
+
+	/* STREAM: sixteen 16-byte writes; the MCU advances its own pointer. */
+	msleep(10);
+	for (off = 0; off < len; off += 16) {
+		rc = sc0710_i2c_write(dev, I2C_DEV__MCU_FN, (u8 *)edid + off, 16);
+		if (rc < 0) {
+			printk(KERN_ERR "%s: MK2 EDID write: chunk at %d failed (%d)\n",
+				dev->name, off, rc);
+			return rc;
+		}
+		msleep(10);
+	}
+
+	/* COMMIT: ask the MCU to persist, then wait for the stored ack. */
+	msleep(300);
+	sc0710_i2c_write(dev, I2C_DEV__MCU_FN, commit, sizeof(commit));
+	timeout = jiffies + msecs_to_jiffies(2500);
+	for (;;) {
+		msleep(50);
+		memset(ack, 0, sizeof(ack));
+		rc = __sc0710_i2c_read(dev, I2C_DEV__MCU_FN, ack, sizeof(ack));
+		if (rc == 0 && memcmp(ack, end_ack, sizeof(ack)) == 0) {
+			printk(KERN_INFO "%s: MK2 EDID write: committed (fn 0x59)\n",
+				dev->name);
+			return 0;
+		}
+		if (time_after(jiffies, timeout))
+			break;
+	}
+	printk(KERN_WARNING "%s: MK2 EDID write: streamed, commit ack not seen (last %3ph); verify via G_EDID\n",
+		dev->name, ack);
+	return 0;
+}
+
 int sc0710_i2c_initialize(struct sc0710_dev *dev)
 {
 	int ret;
 
+	if (dev->board == SC0710_BOARD_ELGATEO_4KP60_MK2) {
+		/* The edid= boot parameter loads from /lib/firmware and targets the
+		 * 4K Pro EEPROM; the MK.2 has no such firmware install. Set a custom
+		 * EDID on the MK.2 at runtime via VIDIOC_S_EDID (sc0710-cli
+		 * --edid-config). */
+		if (sc0710_edid_profile && sc0710_edid_profile[0])
+			printk(KERN_INFO "%s: edid= is 4K-Pro-only; set a custom EDID on the "
+				"MK.2 with VIDIOC_S_EDID (sc0710-cli --edid-config)\n", dev->name);
+		/* The MCU keeps standby power across warm reboots, so the power-up
+		 * EDID source is whatever was selected last. Force internal so the
+		 * control's default reflects reality and the HDMI source always sees
+		 * an EDID even with nothing on the passthrough output. */
+		mutex_lock(&dev->signalMutex);
+		sc0710_i2c_bus_reset(dev);
+		if (__sc0710_mk2_set_edid_source(dev, SC0710_EDID_SOURCE_INTERNAL) < 0)
+			printk(KERN_WARNING "%s: could not select the internal EDID source\n",
+				dev->name);
+		mutex_unlock(&dev->signalMutex);
+		return 0;
+	}
 	if (dev->board != SC0710_BOARD_ELGATEO_4KP)
 		return 0;
 

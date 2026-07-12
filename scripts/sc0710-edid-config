@@ -1,0 +1,847 @@
+#!/usr/bin/env python3
+# sc0710-edid-config — EDID configuration GUI for the Elgato 4K60 Pro and
+# 4K60 Pro MK.2 (Yuan SC0710) capture cards on Linux.
+#
+# Launched by `sc0710-cli --edid-config` / `-ec`. Detects the installed card,
+# shows the EDID it is currently serving, offers a library of EDID profiles
+# (bundled + the official set extracted from Elgato's 4K Capture Utility), and
+# writes a chosen EDID to the card via VIDIOC_S_EDID.
+#
+# The GUI needs a Qt binding (PySide6 preferred, PyQt6 accepted). The headless
+# subcommands (--write/--read/--list/--selftest) are Qt-free so the privileged
+# write helper works under pkexec without pulling in Qt.
+#
+#   sc0710-edid-config                       launch the GUI
+#   sc0710-edid-config --list                list detected cards + video nodes
+#   sc0710-edid-config --read  /dev/videoN   print the current EDID as hex
+#   sc0710-edid-config --write /dev/videoN f.bin   write a raw EDID (used via pkexec)
+#
+# SPDX-License-Identifier: GPL-2.0
+
+import os
+import sys
+import glob
+import ctypes
+import fcntl
+import struct
+import shutil
+import tempfile
+import subprocess
+import urllib.request
+
+APP_NAME = "sc0710 EDID Configuration"
+ELGATO_MSI_URL = (
+    "https://edge.elgato.com/egc/windows/spotlight/1.7.16/"
+    "4KCaptureUtility_1.7.16.10419_x64.msi"
+)
+
+# ---------------------------------------------------------------------------
+# Card model table, keyed by PCI subsystem device id (vendor 0x1cfa Elgato).
+# block_size is the EDID length the card serves / accepts.
+# ---------------------------------------------------------------------------
+CARDS = {
+    0x000e: dict(name="Elgato 4K60 Pro MK.2", short="MK.2", edid_bytes=256),
+    0x0012: dict(name="Elgato 4K60 Pro",      short="4K Pro", edid_bytes=512),
+}
+SC0710_PCI_VENDOR = 0x12ab
+SC0710_PCI_DEVICE = 0x0710
+
+
+# ===========================================================================
+# V4L2 EDID ioctl (mirrors struct v4l2_edid / VIDIOC_G_EDID / VIDIOC_S_EDID)
+# ===========================================================================
+class _v4l2_edid(ctypes.Structure):
+    _fields_ = [
+        ("pad", ctypes.c_uint32),
+        ("start_block", ctypes.c_uint32),
+        ("blocks", ctypes.c_uint32),
+        ("reserved", ctypes.c_uint32 * 5),
+        ("edid", ctypes.POINTER(ctypes.c_uint8)),
+    ]
+
+
+def _IOC(direction, typ, nr, size):
+    return (direction << 30) | (size << 16) | (typ << 8) | nr
+
+
+_EDID_SZ = ctypes.sizeof(_v4l2_edid)
+VIDIOC_G_EDID = _IOC(3, ord('V'), 40, _EDID_SZ)
+VIDIOC_S_EDID = _IOC(3, ord('V'), 41, _EDID_SZ)
+
+
+def edid_read(dev):
+    """Return the card's current EDID as bytes (b'' if none)."""
+    fd = os.open(dev, os.O_RDWR)
+    try:
+        e = _v4l2_edid(pad=0, start_block=0, blocks=0)
+        e.edid = None
+        fcntl.ioctl(fd, VIDIOC_G_EDID, e)
+        n = e.blocks
+        if n == 0:
+            return b''
+        buf = (ctypes.c_uint8 * (n * 128))()
+        e2 = _v4l2_edid(pad=0, start_block=0, blocks=n)
+        e2.edid = ctypes.cast(buf, ctypes.POINTER(ctypes.c_uint8))
+        fcntl.ioctl(fd, VIDIOC_G_EDID, e2)
+        return bytes(buf)
+    finally:
+        os.close(fd)
+
+
+def edid_write(dev, data):
+    """Write a raw EDID (multiple of 128 bytes) via VIDIOC_S_EDID."""
+    if not data or len(data) % 128:
+        raise ValueError("EDID length must be a non-zero multiple of 128")
+    n = len(data) // 128
+    fd = os.open(dev, os.O_RDWR)
+    try:
+        buf = (ctypes.c_uint8 * len(data)).from_buffer_copy(data)
+        e = _v4l2_edid(pad=0, start_block=0, blocks=n)
+        e.edid = ctypes.cast(buf, ctypes.POINTER(ctypes.c_uint8))
+        fcntl.ioctl(fd, VIDIOC_S_EDID, e)
+    finally:
+        os.close(fd)
+
+
+# ===========================================================================
+# Card / video-node detection (sysfs, no root needed)
+# ===========================================================================
+def _sysread(path):
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
+def detect_cards():
+    """Return a list of dicts: {dev, name, short, edid_bytes, pci, node_name}."""
+    out = []
+    for vd in sorted(glob.glob('/sys/class/video4linux/video*')):
+        dev = '/dev/' + os.path.basename(vd)
+        node_name = _sysread(vd + '/name')
+        pci = os.path.basename(os.path.realpath(vd + '/device'))
+        base = f'/sys/bus/pci/devices/{pci}'
+        if not os.path.isdir(base):
+            continue
+        try:
+            vendor = int(_sysread(base + '/vendor'), 16)
+            device = int(_sysread(base + '/device'), 16)
+            subdev = int(_sysread(base + '/subsystem_device'), 16)
+        except ValueError:
+            continue
+        if vendor != SC0710_PCI_VENDOR or device != SC0710_PCI_DEVICE:
+            continue
+        info = CARDS.get(subdev, dict(
+            name=node_name or "SC0710 capture card", short="SC0710",
+            edid_bytes=256))
+        out.append(dict(dev=dev, pci=pci, node_name=node_name, subdev=subdev,
+                        **info))
+    return out
+
+
+# ===========================================================================
+# Minimal EDID decoder for the summary line (edid-decode used for full detail)
+# ===========================================================================
+def edid_valid(data):
+    return len(data) >= 128 and data[:8] == b'\x00\xff\xff\xff\xff\xff\xff\x00'
+
+
+def _edid_manufacturer(data):
+    v = (data[8] << 8) | data[9]
+    return ''.join(chr(((v >> s) & 0x1f) + 0x40) for s in (10, 5, 0))
+
+
+def _dtd_resolution(dtd):
+    if len(dtd) < 18 or dtd[:2] == b'\x00\x00':
+        return None
+    hact = dtd[2] | ((dtd[4] & 0xf0) << 4)
+    vact = dtd[5] | ((dtd[7] & 0xf0) << 4)
+    if hact == 0 or vact == 0:
+        return None
+    pclk = (dtd[1] << 8 | dtd[0]) * 10000  # kHz*10 -> Hz
+    htot = hact + (dtd[3] | ((dtd[4] & 0x0f) << 8))
+    vtot = vact + (dtd[6] | ((dtd[7] & 0x0f) << 8))
+    hz = pclk / (htot * vtot) if htot and vtot else 0
+    return hact, vact, hz
+
+
+def edid_summary(data):
+    """Short human summary: manufacturer, product name, preferred resolution."""
+    if not edid_valid(data):
+        return "No valid EDID"
+    mfr = _edid_manufacturer(data)
+    name = None
+    for off in (54, 72, 90, 108):
+        d = data[off:off + 18]
+        if len(d) == 18 and d[0:2] == b'\x00\x00' and d[3] == 0xfc:
+            name = d[5:18].split(b'\x0a')[0].decode('ascii', 'replace').strip()
+            break
+    pref = _dtd_resolution(data[54:72])
+    parts = []
+    if name:
+        parts.append(f'"{name}"')
+    parts.append(f"[{mfr}]")
+    if pref:
+        parts.append(f"{pref[0]}x{pref[1]}@{pref[2]:.0f}Hz")
+    blocks = len(data) // 128
+    parts.append(f"{blocks} block{'s' if blocks != 1 else ''}")
+    return "  ".join(parts)
+
+
+def edid_resolutions(data):
+    """List of 'WxH@RRHz' strings from the detailed timing descriptors."""
+    res = []
+    for blk in range(0, len(data), 128):
+        for off in (54, 72, 90, 108):
+            r = _dtd_resolution(data[blk + off:blk + off + 18])
+            if r:
+                res.append(f"{r[0]}x{r[1]}@{r[2]:.0f}Hz")
+    return res
+
+
+def edid_decode_text(data):
+    """Full decode via the edid-decode tool if present, else a short summary."""
+    if shutil.which('edid-decode'):
+        try:
+            p = subprocess.run(['edid-decode'], input=data,
+                               capture_output=True, timeout=10)
+            txt = p.stdout.decode('utf-8', 'replace')
+            if txt.strip():
+                return txt
+        except Exception:
+            pass
+    lines = [edid_summary(data), "", "Detailed timings:"]
+    lines += [f"  {r}" for r in edid_resolutions(data)] or ["  (none)"]
+    lines += ["", "(install 'edid-decode' for a full report)"]
+    return "\n".join(lines)
+
+
+# ===========================================================================
+# EDID library: bundled files + the official set from Elgato's utility
+# ===========================================================================
+def _xdg(var, default):
+    return os.environ.get(var) or os.path.expanduser(default)
+
+
+def cache_dir():
+    d = os.path.join(_xdg('XDG_CACHE_HOME', '~/.cache'), 'sc0710', 'edid')
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def backup_dir():
+    d = os.path.join(_xdg('XDG_DATA_HOME', '~/.local/share'),
+                     'sc0710', 'edid-backups')
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def library_search_paths():
+    here = os.path.dirname(os.path.abspath(__file__))
+    return [
+        cache_dir(),
+        '/usr/share/sc0710/edid',
+        '/usr/lib/sc0710/edid',
+        '/var/lib/sc0710/edid',
+        os.path.join(here, '..', '4KCaptureUtility'),
+        os.path.join(here, '..', 'mk2_fw'),
+    ]
+
+
+def load_library():
+    """Return {name: path} of every valid EDID .bin found on the search paths."""
+    lib = {}
+    for d in library_search_paths():
+        if not os.path.isdir(d):
+            continue
+        for path in sorted(glob.glob(os.path.join(d, '*.bin'))):
+            try:
+                with open(path, 'rb') as f:
+                    head = f.read(8)
+            except OSError:
+                continue
+            if head == b'\x00\xff\xff\xff\xff\xff\xff\x00':
+                lib.setdefault(os.path.basename(path), path)
+    return lib
+
+
+def library_for_card(lib, card):
+    """Split the library into (recommended, other) for the given card."""
+    want = card['edid_bytes'] if card else None
+    rec, other = [], []
+    for name in sorted(lib):
+        try:
+            sz = os.path.getsize(lib[name])
+        except OSError:
+            sz = 0
+        (rec if want and sz == want else other).append(name)
+    return rec, other
+
+
+def download_and_extract(url=ELGATO_MSI_URL, progress=None, log=None):
+    """Download the Elgato MSI, extract every EDID .bin into the cache dir.
+    Returns the list of extracted file names. `progress(pct)` and `log(msg)`
+    are optional callbacks."""
+    def _log(m):
+        if log:
+            log(m)
+
+    tmp = tempfile.mkdtemp(prefix='sc0710-edid-')
+    try:
+        msi = os.path.join(tmp, 'utility.msi')
+        _log(f"Downloading {os.path.basename(url)} ...")
+        with urllib.request.urlopen(url, timeout=60) as r:
+            total = int(r.headers.get('Content-Length', 0))
+            done = 0
+            with open(msi, 'wb') as out:
+                while True:
+                    chunk = r.read(64 * 1024)
+                    if not chunk:
+                        break
+                    out.write(chunk)
+                    done += len(chunk)
+                    if progress and total:
+                        progress(int(done * 100 / total))
+        _log(f"Downloaded {done // 1024} KiB. Extracting ...")
+
+        ex = os.path.join(tmp, 'x')
+        os.makedirs(ex, exist_ok=True)
+        if not _extract_archive(msi, ex):
+            raise RuntimeError("could not extract the MSI (need 7z or bsdtar)")
+
+        dest = cache_dir()
+        found = []
+        for root, _dirs, files in os.walk(ex):
+            for fn in files:
+                p = os.path.join(root, fn)
+                try:
+                    with open(p, 'rb') as f:
+                        head = f.read(8)
+                except OSError:
+                    continue
+                if head != b'\x00\xff\xff\xff\xff\xff\xff\x00':
+                    continue
+                if os.path.getsize(p) % 128:
+                    continue
+                name = os.path.basename(fn)
+                if not name.lower().endswith('.bin'):
+                    name += '.bin'
+                shutil.copy2(p, os.path.join(dest, name))
+                found.append(name)
+        _log(f"Extracted {len(found)} EDID profiles to {dest}")
+        return sorted(set(found))
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _extract_archive(archive, dest):
+    for cmd in (['7z', 'x', '-y', f'-o{dest}', archive],
+                ['7za', 'x', '-y', f'-o{dest}', archive],
+                ['bsdtar', '-xf', archive, '-C', dest]):
+        if not shutil.which(cmd[0]):
+            continue
+        try:
+            subprocess.run(cmd, check=True, capture_output=True, timeout=120)
+            return True
+        except Exception:
+            continue
+    return False
+
+
+# ===========================================================================
+# Privileged write: try direct, fall back to pkexec of our own --write
+# ===========================================================================
+def write_edid_privileged(dev, data):
+    """Write `data` to `dev`, escalating via pkexec if we lack permission.
+    Returns (ok, message)."""
+    try:
+        edid_write(dev, data)
+        return True, "EDID written."
+    except PermissionError:
+        pass
+    except OSError as e:
+        if e.errno not in (1, 13):  # EPERM / EACCES
+            return False, f"write failed: {e}"
+
+    if not shutil.which('pkexec'):
+        return False, ("Permission denied and pkexec is unavailable. "
+                       "Add your user to the 'video' group or run as root.")
+    tf = tempfile.NamedTemporaryFile(prefix='sc0710-edid-', suffix='.bin',
+                                     delete=False)
+    try:
+        tf.write(data)
+        tf.close()
+        os.chmod(tf.name, 0o644)
+        self_path = os.path.abspath(__file__)
+        p = subprocess.run(['pkexec', sys.executable, self_path,
+                            '--write', dev, tf.name],
+                           capture_output=True, text=True)
+        if p.returncode == 0:
+            return True, "EDID written (via pkexec)."
+        return False, (p.stderr.strip() or p.stdout.strip()
+                       or f"pkexec exited {p.returncode}")
+    finally:
+        os.unlink(tf.name)
+
+
+# ===========================================================================
+# Headless CLI subcommands (Qt-free)
+# ===========================================================================
+def cli_main(argv):
+    cmd = argv[0]
+    if cmd == '--list':
+        cards = detect_cards()
+        if not cards:
+            print("No SC0710 capture card detected.")
+            return 1
+        for c in cards:
+            print(f"{c['dev']}  {c['name']}  (pci {c['pci']}, "
+                  f"{c['edid_bytes']}-byte EDID)")
+        return 0
+    if cmd == '--read':
+        data = edid_read(argv[1])
+        if not data:
+            print("(no EDID)")
+            return 1
+        print(edid_summary(data))
+        for i in range(0, len(data), 16):
+            print(' '.join(f'{b:02x}' for b in data[i:i + 16]))
+        return 0
+    if cmd == '--write':
+        dev, path = argv[1], argv[2]
+        with open(path, 'rb') as f:
+            data = f.read()
+        edid_write(dev, data)
+        print(f"wrote {len(data)} bytes to {dev}")
+        return 0
+    if cmd == '--selftest':
+        return _selftest()
+    print(f"unknown subcommand {cmd!r}", file=sys.stderr)
+    return 2
+
+
+def _selftest():
+    ok = True
+    print(f"struct v4l2_edid size = {_EDID_SZ} (expect 40)")
+    ok &= _EDID_SZ == 40
+    print(f"VIDIOC_G_EDID = {VIDIOC_G_EDID:#010x}")
+    print(f"VIDIOC_S_EDID = {VIDIOC_S_EDID:#010x}")
+    cards = detect_cards()
+    print(f"cards detected: {len(cards)}")
+    for c in cards:
+        print(f"  {c['dev']}  {c['name']}")
+    lib = load_library()
+    print(f"library EDIDs: {len(lib)}")
+    for c in cards:
+        data = b''
+        try:
+            data = edid_read(c['dev'])
+        except OSError as e:
+            print(f"  read {c['dev']}: {e}")
+        if data:
+            print(f"  {c['dev']}: {edid_summary(data)}")
+    print("selftest OK" if ok else "selftest FAILED")
+    return 0 if ok else 1
+
+
+# ===========================================================================
+# GUI
+# ===========================================================================
+def gui_main():
+    try:
+        qt = _import_qt()
+    except ImportError:
+        sys.stderr.write(
+            "sc0710-edid-config: a Qt binding is required for the GUI.\n"
+            "Install one of:\n"
+            "  Arch:    sudo pacman -S pyside6\n"
+            "  Fedora:  sudo dnf install python3-pyside6\n"
+            "  Debian:  sudo apt install python3-pyside6\n"
+            "  (or)     pip install --user PySide6\n")
+        return 3
+    return _run_gui(qt)
+
+
+def _import_qt():
+    try:
+        import PySide6.QtCore as C
+        import PySide6.QtWidgets as W
+        import PySide6.QtGui as G
+        return dict(C=C, W=W, G=G, Signal=C.Signal, binding='PySide6')
+    except ImportError:
+        import PyQt6.QtCore as C
+        import PyQt6.QtWidgets as W
+        import PyQt6.QtGui as G
+        return dict(C=C, W=W, G=G, Signal=C.pyqtSignal, binding='PyQt6')
+
+
+def _run_gui(qt):
+    C, W, G, Signal = qt['C'], qt['W'], qt['G'], qt['Signal']
+    Qt = C.Qt
+
+    class DownloadThread(C.QThread):
+        progress = Signal(int)
+        message = Signal(str)
+        done = Signal(bool, str)
+
+        def run(self):
+            try:
+                files = download_and_extract(
+                    progress=lambda p: self.progress.emit(p),
+                    log=lambda m: self.message.emit(m))
+                self.done.emit(True, f"Added {len(files)} official EDID profiles.")
+            except Exception as e:
+                self.done.emit(False, f"Download failed: {e}")
+
+    class Main(W.QMainWindow):
+        def __init__(self):
+            super().__init__()
+            self.setWindowTitle(APP_NAME)
+            self.resize(1000, 640)
+            self.lib = {}
+            self.cards = []
+            self.card = None
+            self._build()
+            self.refresh_cards()
+            self.reload_library()
+
+        # -- layout ------------------------------------------------------
+        def _build(self):
+            central = W.QWidget()
+            self.setCentralWidget(central)
+            root = W.QVBoxLayout(central)
+
+            # header: card selector + status
+            hdr = W.QHBoxLayout()
+            hdr.addWidget(W.QLabel("<b>Card:</b>"))
+            self.card_box = W.QComboBox()
+            self.card_box.setMinimumWidth(280)
+            self.card_box.currentIndexChanged.connect(self._card_changed)
+            hdr.addWidget(self.card_box)
+            self.rescan_btn = W.QPushButton("Rescan")
+            self.rescan_btn.clicked.connect(self.refresh_cards)
+            hdr.addWidget(self.rescan_btn)
+            hdr.addStretch(1)
+            self.card_status = W.QLabel()
+            hdr.addWidget(self.card_status)
+            root.addLayout(hdr)
+
+            # current EDID panel
+            cur = W.QGroupBox("Currently served EDID")
+            cl = W.QVBoxLayout(cur)
+            self.cur_summary = W.QLabel("—")
+            f = self.cur_summary.font()
+            f.setPointSize(f.pointSize() + 1)
+            f.setBold(True)
+            self.cur_summary.setFont(f)
+            cl.addWidget(self.cur_summary)
+            cur_btns = W.QHBoxLayout()
+            for label, slot in (("Refresh", self.read_current),
+                                ("Back up to file…", self.backup_current),
+                                ("View details…", self.view_current_details)):
+                b = W.QPushButton(label)
+                b.clicked.connect(slot)
+                cur_btns.addWidget(b)
+            cur_btns.addStretch(1)
+            cl.addLayout(cur_btns)
+            root.addWidget(cur)
+
+            # library + preview
+            split = W.QHBoxLayout()
+            libbox = W.QGroupBox("EDID library")
+            lv = W.QVBoxLayout(libbox)
+            self.show_all = W.QCheckBox("Show profiles for other cards too")
+            self.show_all.stateChanged.connect(self.reload_library)
+            lv.addWidget(self.show_all)
+            self.lib_list = W.QListWidget()
+            self.lib_list.currentItemChanged.connect(self._preview_selected)
+            lv.addWidget(self.lib_list, 1)
+            lib_btns = W.QHBoxLayout()
+            self.dl_btn = W.QPushButton("Download official EDIDs")
+            self.dl_btn.clicked.connect(self.download_official)
+            lib_btns.addWidget(self.dl_btn)
+            open_btn = W.QPushButton("Load file…")
+            open_btn.clicked.connect(self.load_file)
+            lib_btns.addWidget(open_btn)
+            lv.addLayout(lib_btns)
+            split.addWidget(libbox, 1)
+
+            prevbox = W.QGroupBox("Preview")
+            pv = W.QVBoxLayout(prevbox)
+            self.preview = W.QPlainTextEdit()
+            self.preview.setReadOnly(True)
+            self.preview.setFont(G.QFont("monospace"))
+            pv.addWidget(self.preview, 1)
+            split.addWidget(prevbox, 1)
+            root.addLayout(split, 1)
+
+            # apply row
+            act = W.QHBoxLayout()
+            self.apply_btn = W.QPushButton("Apply selected EDID to card")
+            self.apply_btn.setMinimumHeight(36)
+            self.apply_btn.clicked.connect(self.apply_selected)
+            act.addWidget(self.apply_btn, 2)
+            self.restore_btn = W.QPushButton("Restore a backup…")
+            self.restore_btn.clicked.connect(self.restore_backup)
+            act.addWidget(self.restore_btn, 1)
+            root.addLayout(act)
+
+            self.progress = W.QProgressBar()
+            self.progress.setVisible(False)
+            root.addWidget(self.progress)
+            self.status = self.statusBar()
+
+        # -- cards -------------------------------------------------------
+        def refresh_cards(self):
+            self.cards = detect_cards()
+            self.card_box.blockSignals(True)
+            self.card_box.clear()
+            for c in self.cards:
+                self.card_box.addItem(f"{c['name']}  ({c['dev']})")
+            self.card_box.blockSignals(False)
+            if self.cards:
+                self.card_box.setCurrentIndex(0)
+                self._card_changed(0)
+                self.card_status.setText(
+                    f"<span style='color:#2a2'>● detected</span>")
+            else:
+                self.card = None
+                self.card_status.setText(
+                    "<span style='color:#c22'>● no card found — is the "
+                    "driver loaded?</span>")
+                self.cur_summary.setText("—")
+                self._set_enabled(False)
+
+        def _set_enabled(self, on):
+            for w in (self.apply_btn, self.restore_btn):
+                w.setEnabled(on)
+
+        def _card_changed(self, idx):
+            if 0 <= idx < len(self.cards):
+                self.card = self.cards[idx]
+                self._set_enabled(True)
+                self.read_current()
+                self.reload_library()
+
+        # -- current EDID ------------------------------------------------
+        def read_current(self):
+            if not self.card:
+                return
+            try:
+                data = edid_read(self.card['dev'])
+            except OSError as e:
+                self.cur_summary.setText(f"read error: {e}")
+                self._current = b''
+                return
+            self._current = data
+            self.cur_summary.setText(edid_summary(data) if data
+                                     else "No EDID currently served")
+
+        def backup_current(self):
+            data = getattr(self, '_current', b'')
+            if not data:
+                self._warn("No current EDID to back up.")
+                return
+            import time
+            default = os.path.join(
+                backup_dir(),
+                f"{self.card['short'].replace('.', '')}_"
+                f"{time.strftime('%Y%m%d_%H%M%S')}.bin")
+            path, _ = W.QFileDialog.getSaveFileName(
+                self, "Save current EDID", default, "EDID (*.bin)")
+            if path:
+                with open(path, 'wb') as f:
+                    f.write(data)
+                self.status.showMessage(f"Backed up to {path}", 5000)
+
+        def view_current_details(self):
+            data = getattr(self, '_current', b'')
+            if data:
+                self._show_details("Current EDID", data)
+
+        # -- library -----------------------------------------------------
+        def reload_library(self, *a):
+            self.lib = load_library()
+            rec, other = library_for_card(self.lib, self.card)
+            self.lib_list.clear()
+            for name in rec:
+                self._add_lib_item(name, recommended=True)
+            if self.show_all.isChecked() or not rec:
+                if rec and other:
+                    sep = W.QListWidgetItem("— other cards —")
+                    sep.setFlags(Qt.ItemFlag.NoItemFlags)
+                    self.lib_list.addItem(sep)
+                for name in other:
+                    self._add_lib_item(name, recommended=False)
+            self.status.showMessage(
+                f"{len(self.lib)} EDID profiles available", 4000)
+
+        def _add_lib_item(self, name, recommended):
+            it = W.QListWidgetItem(name)
+            it.setData(Qt.ItemDataRole.UserRole, self.lib[name])
+            if recommended:
+                fnt = it.font()
+                fnt.setBold(True)
+                it.setFont(fnt)
+            self.lib_list.addItem(it)
+
+        def _selected_path(self):
+            it = self.lib_list.currentItem()
+            if not it:
+                return None
+            return it.data(Qt.ItemDataRole.UserRole)
+
+        def _preview_selected(self, *a):
+            path = self._selected_path()
+            if not path:
+                self.preview.setPlainText("")
+                return
+            try:
+                with open(path, 'rb') as f:
+                    data = f.read()
+            except OSError as e:
+                self.preview.setPlainText(str(e))
+                return
+            warn = ""
+            if self.card and len(data) != self.card['edid_bytes']:
+                warn = (f"\n⚠ This profile is {len(data)} bytes; "
+                        f"{self.card['name']} expects "
+                        f"{self.card['edid_bytes']} bytes and will reject it.\n")
+            self.preview.setPlainText(warn + edid_decode_text(data))
+
+        # -- actions -----------------------------------------------------
+        def apply_selected(self):
+            path = self._selected_path()
+            if not path:
+                self._warn("Select an EDID profile from the library first.")
+                return
+            with open(path, 'rb') as f:
+                data = f.read()
+            self._apply_data(data, os.path.basename(path))
+
+        def load_file(self):
+            path, _ = W.QFileDialog.getOpenFileName(
+                self, "Load EDID file", os.path.expanduser("~"),
+                "EDID (*.bin *.edid);;All files (*)")
+            if not path:
+                return
+            with open(path, 'rb') as f:
+                data = f.read()
+            if not edid_valid(data):
+                self._warn("That file does not look like a valid EDID "
+                           "(missing 00 FF…FF 00 header).")
+                return
+            self.preview.setPlainText(edid_decode_text(data))
+            self._apply_data(data, os.path.basename(path), confirm=True)
+
+        def _apply_data(self, data, label, confirm=True):
+            if not self.card:
+                return
+            if not edid_valid(data):
+                self._warn("Refusing to write: not a valid EDID.")
+                return
+            if len(data) != self.card['edid_bytes']:
+                self._warn(
+                    f"{self.card['name']} expects {self.card['edid_bytes']}-"
+                    f"byte EDIDs; this one is {len(data)} bytes.")
+                return
+            if confirm:
+                m = W.QMessageBox.question(
+                    self, "Apply EDID",
+                    f"Write “{label}” to {self.card['name']}?\n\n"
+                    f"{edid_summary(data)}\n\n"
+                    "Your current EDID can be restored from a backup afterwards.")
+                if m != W.QMessageBox.StandardButton.Yes:
+                    return
+            # auto-backup current before overwriting
+            cur = getattr(self, '_current', b'')
+            if cur:
+                import time
+                bpath = os.path.join(
+                    backup_dir(),
+                    f"auto_{self.card['short'].replace('.', '')}_"
+                    f"{time.strftime('%Y%m%d_%H%M%S')}.bin")
+                try:
+                    with open(bpath, 'wb') as f:
+                        f.write(cur)
+                except OSError:
+                    pass
+            ok, msg = write_edid_privileged(self.card['dev'], data)
+            if ok:
+                self.status.showMessage(msg, 6000)
+                C.QTimer.singleShot(1200, self.read_current)
+                W.QMessageBox.information(
+                    self, "Done",
+                    f"{msg}\n\nThe card is now serving:\n{edid_summary(data)}\n\n"
+                    "Reconnect the HDMI source if it doesn't pick up the "
+                    "change automatically.")
+            else:
+                self._warn(msg)
+
+        def restore_backup(self):
+            path, _ = W.QFileDialog.getOpenFileName(
+                self, "Restore EDID backup", backup_dir(), "EDID (*.bin)")
+            if not path:
+                return
+            with open(path, 'rb') as f:
+                data = f.read()
+            self._apply_data(data, os.path.basename(path), confirm=True)
+
+        # -- download ----------------------------------------------------
+        def download_official(self):
+            self.dl_btn.setEnabled(False)
+            self.progress.setVisible(True)
+            self.progress.setValue(0)
+            self._dl = DownloadThread()
+            self._dl.progress.connect(self.progress.setValue)
+            self._dl.message.connect(lambda m: self.status.showMessage(m, 0))
+            self._dl.done.connect(self._download_done)
+            self._dl.start()
+
+        def _download_done(self, ok, msg):
+            self.progress.setVisible(False)
+            self.dl_btn.setEnabled(True)
+            if ok:
+                self.reload_library()
+                self.status.showMessage(msg, 8000)
+            else:
+                self._warn(msg)
+
+        # -- helpers -----------------------------------------------------
+        def _warn(self, msg):
+            W.QMessageBox.warning(self, APP_NAME, msg)
+
+        def _show_details(self, title, data):
+            self._show_details_dlg(title, data)
+
+        def _show_details_dlg(self, title, data):
+            dlg = W.QDialog(self)
+            dlg.setWindowTitle(title)
+            dlg.resize(720, 560)
+            lay = W.QVBoxLayout(dlg)
+            te = W.QPlainTextEdit()
+            te.setReadOnly(True)
+            te.setFont(G.QFont("monospace"))
+            te.setPlainText(edid_decode_text(data))
+            lay.addWidget(te)
+            b = W.QPushButton("Close")
+            b.clicked.connect(dlg.accept)
+            lay.addWidget(b)
+            dlg.exec()
+
+    app = W.QApplication(sys.argv)
+    win = Main()
+    win.show()
+    return app.exec()
+
+
+# ===========================================================================
+def main():
+    if len(sys.argv) > 1 and sys.argv[1].startswith('--'):
+        return cli_main(sys.argv[1:])
+    return gui_main()
+
+
+if __name__ == '__main__':
+    sys.exit(main())

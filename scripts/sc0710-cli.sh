@@ -17,6 +17,39 @@ BLUE='\033[1;34m'
 BOLD='\033[1m'
 NC='\033[0m'
 
+# --- EDID configuration GUI (runs as the invoking user, NOT root) ---
+# Handled before auto-elevation: the Qt GUI needs the user's display session,
+# and it escalates only for the actual EDID write, via pkexec.
+if [[ "$1" == "-ec" || "$1" == "--edid-config" ]]; then
+    _cli_self="$(readlink -f "${BASH_SOURCE[0]:-$0}" 2>/dev/null || echo "$0")"
+    _cli_dir="$(dirname "$_cli_self")"
+    EDID_GUI=""
+    for _p in \
+        "$_cli_dir/sc0710-edid-config" \
+        "$_cli_dir/../scripts/sc0710-edid-config" \
+        /usr/local/bin/sc0710-edid-config \
+        /usr/local/libexec/sc0710-edid-config \
+        /usr/lib/sc0710/sc0710-edid-config \
+        /usr/bin/sc0710-edid-config; do
+        [[ -f "$_p" ]] && { EDID_GUI="$(readlink -f "$_p")"; break; }
+    done
+    if [[ -z "$EDID_GUI" ]]; then
+        echo -e "${RED}[ERROR]${NC} sc0710-edid-config not found. Reinstall the driver package."
+        exit 1
+    fi
+    if ! lsmod | grep -q "^${DRV_NAME} "; then
+        echo -e "${YELLOW}[WARN]${NC} Driver not loaded — run ${BOLD}sc0710-cli --load${NC} first, or the GUI will show no card."
+    fi
+    if ! python3 -c 'import PySide6' 2>/dev/null && ! python3 -c 'import PyQt6' 2>/dev/null; then
+        echo -e "${YELLOW}[INFO]${NC} The EDID GUI needs a Qt binding (PySide6). Install it with:"
+        echo -e "    Arch:   ${BOLD}sudo pacman -S pyside6${NC}"
+        echo -e "    Fedora: ${BOLD}sudo dnf install python3-pyside6${NC}"
+        echo -e "    Debian: ${BOLD}sudo apt install python3-pyside6${NC}"
+        exit 1
+    fi
+    exec python3 "$EDID_GUI"
+fi
+
 # --- Auto-elevate to root ---
 if [[ $EUID -ne 0 ]]; then
     exec sudo SC0710_INVOKE_USER="$USER" "$0" "$@"
@@ -682,6 +715,7 @@ show_help() {
     echo -e "    ${BOLD}-ss, --software-scaler${NC} Toggle software scaler modes (all cards)"
     echo -e "    ${BOLD}-as, --toggle-auto-scalar${NC} Toggle automatic safety scaler on/off"
     echo -e "    ${BOLD}-pt, --procedural-timings${NC} Toggle timing calculation mode (merge/procedural/static)"
+    echo -e "    ${BOLD}-ec, --edid-config${NC} Open the EDID configuration GUI (4K Pro / MK.2)"
     echo -e "    ${BOLD}-U, --update${NC}     Check for updates and reinstall"
     echo -e "    ${BOLD}-r, -R, --remove${NC} Completely uninstall driver and CLI (AUR: uses yay/paru)"
     echo -e "    ${BOLD}--dump${NC}           Save a debug report to the Desktop"
@@ -1259,6 +1293,9 @@ case "$1" in
         fi
         sc0710_cli_remove_user_state
         rm -f /usr/local/bin/sc0710-cli
+        # EDID tooling installed alongside the CLI
+        rm -f /usr/local/bin/sc0710-edid-config /usr/local/bin/mk2-set-edid
+        rm -rf /usr/share/sc0710/edid
 
         if [[ -x /usr/bin/sc0710-cli ]] || \
             pacman -Q sc0710-dkms-git &>/dev/null || \

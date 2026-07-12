@@ -134,7 +134,7 @@ hardware.sc0710.enable = true;          # kernel module + sc0710-cli
 # hardware.sc0710.kernel = pkgs.linuxPackages_6_19.kernel;  # optional override
 ```
 
-**Note:** The NixOS module builds the driver and installs `sc0710-cli`. **4K Pro users on NixOS** additionally run `scripts/extract-firmware.sh` once (as root, from a repo checkout) to provision the ECP5 firmware and EDID profiles — it installs to `/lib/firmware/sc0710`, which the kernel firmware loader reads directly. The driver programs the FPGA at every module load and refuses to bind if it can't, so no boot service is needed.
+**Note:** The NixOS module builds the driver and installs `sc0710-cli`. **4K Pro users on NixOS** additionally run `scripts/extract-firmware.sh` once (as root, from a repo checkout) to provision the ECP5 firmware and EDID profiles — it installs to `/lib/firmware/sc0710`, which the kernel firmware loader reads directly. (MK.2 users don't need it: capture works without firmware files, and custom EDIDs are written at runtime — no firmware install required.) The driver programs the FPGA at every module load and refuses to bind if it can't, so no boot service is needed.
 
 ### Manual compilation
 
@@ -197,7 +197,7 @@ Same command as above — checks module, DKMS, CLI, systemd units, config files,
 * **4K Pro ECP5 auto-programming** — firmware extraction at install time; the driver programs the FPGA at load and refuses to bind if it can't
 * **Status images** — storage-efficient No Signal / No Device screens
 * **Connection sensing** — distinguishes unplugged cables from signal loss (not 100% reliable)
-* **Video formats** — 4K60, 1440p144, 1080p240 (EDID switching without Windows: `edid=` module param or standard `VIDIOC_S_EDID` ioctls, profiles from `scripts/extract-firmware.sh`)
+* **Video formats** — 4K60, 1440p144, 1080p240. **EDID Source control (Internal/Display/Merged) on both cards** via the `EDID Source` V4L2 control (`v4l2-ctl --set-ctrl=edid_source=N`). **Custom EDID read/write on both cards** via `VIDIOC_G_EDID`/`VIDIOC_S_EDID` — the 4K Pro through its EEPROM (`edid=` boot param, profiles from `scripts/extract-firmware.sh`), the MK.2 through its MCU (runtime only). The graphical **EDID Config app** (`sc0710-cli --edid-config`) manages this for both cards and can fetch Elgato's official EDID profiles
 * **Mode-switch stability** — DMA resync, restart validation, and watchdog recovery during resolution/refresh changes
 * **Safety scaling** — auto-scaler and dynamic-resolution paths reduce crash-prone transitions
 * **Timing controls** — runtime modes (`merge`, `procedural-only`, `static-only`) via CLI
