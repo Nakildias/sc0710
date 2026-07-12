@@ -44,22 +44,29 @@ $(VERSION_HDR): version
 		> "$(VERSION_HDR)"
 
 all: $(VERSION_HDR)
-	@mkdir -p "$(MODULE_OUTPUT_DIR)"
+	@# kbuild writes its .o/.cmd next to the sources, so stage the sources into
+	@# build/ and build there; the source tree stays clean and everything
+	@# (objects, sc0710.ko, Module.symvers) lands under build/. DKMS reads
+	@# build/sc0710.ko (BUILT_MODULE_LOCATION), unchanged.
+	@mkdir -p "$(MODULE_OUTPUT_DIR)/lib"
+	@# cp -u only adds, so prune staged sources deleted/renamed in lib/ or
+	@# they keep satisfying stale #includes.
+	@for f in "$(MODULE_OUTPUT_DIR)/lib"/*.c "$(MODULE_OUTPUT_DIR)/lib"/*.h; do \
+		[ -e "$$f" ] || continue; \
+		[ -e "lib/$${f##*/}" ] || rm -f "$$f"; \
+	done
+	@cp -u Makefile "$(MODULE_OUTPUT_DIR)/Makefile"
+	@cp -u lib/*.c lib/*.h "$(MODULE_OUTPUT_DIR)/lib/"
 	@ulimit -n 1048576 2>/dev/null || ulimit -n 65536 2>/dev/null || ulimit -n 4096 2>/dev/null || true; \
-	$(MAKE) -j1 -C "$(KBUILD_DIR)" M="$(CURDIR)" $(KBUILD_CC) modules
-	@# kbuild builds in place; stage the resulting module into build/.
-	@if [ -f "$(CURDIR)/sc0710.ko" ] && [ ! -f "$(MODULE_OUTPUT_DIR)/sc0710.ko" ]; then \
-		cp "$(CURDIR)/sc0710.ko" "$(MODULE_OUTPUT_DIR)/sc0710.ko"; \
-	fi
+	$(MAKE) -j1 -C "$(KBUILD_DIR)" M="$(MODULE_OUTPUT_DIR)" $(KBUILD_CC) modules
 
 clean:
-	rm -rf "$(MODULE_OUTPUT_DIR)"/*.o "$(MODULE_OUTPUT_DIR)"/*.ko "$(MODULE_OUTPUT_DIR)"/*.mod \
-		"$(MODULE_OUTPUT_DIR)"/*.mod.c "$(MODULE_OUTPUT_DIR)"/*.mod.o "$(MODULE_OUTPUT_DIR)"/.*.cmd \
-		"$(MODULE_OUTPUT_DIR)"/.tmp_versions "$(MODULE_OUTPUT_DIR)"/lib
+	rm -rf "$(MODULE_OUTPUT_DIR)"
+	@# Legacy: sweep artifacts left in the tree by older in-place builds.
 	rm -f sc0710.ko sc0710.o sc0710.mod sc0710.mod.c sc0710.mod.o .module-common.o \
-		Module.symvers modules.order .sc0710*.cmd .module-common*.cmd .modules*.cmd
+		Module.symvers modules.order .sc0710*.cmd .module-common*.cmd .modules*.cmd \
+		lib/*.o lib/.*.cmd 2>/dev/null || true
 	rm -rf .tmp_versions
-	$(MAKE) -j1 -C "$(KBUILD_DIR)" M="$(CURDIR)" clean 2>/dev/null || true
 
 load: all
 	sudo dmesg -c >/dev/null
@@ -73,9 +80,17 @@ load: all
 		dma_status=0
 
 unload:
-	# Only real way to remove the module due to the module not dereferencing itself
-	# Decent chance this causes kernel issues if unlucky
-	sudo rmmod -f sc0710
+	# Plain rmmod refuses while something holds /dev/video* open - that refusal
+	# is the safety net. Never rmmod -f here: force-unloading with an open
+	# capture fd is a use-after-free panic. Note PipeWire/wireplumber holds
+	# video nodes open persistently even with no capture app running; fuser
+	# prints its listing on stderr, so don't silence it.
+	sudo rmmod sc0710 || { \
+		echo "module busy - holders of the video nodes:"; \
+		sudo fuser -v /dev/video* || true; \
+		echo "PipeWire holds nodes without any app open: use scripts/sc0710-cli.sh --unload"; \
+		echo "(stops PipeWire, unloads, restarts it) or close the processes listed above."; \
+		exit 1; }
 	sync
 
 tarball:

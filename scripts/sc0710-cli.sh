@@ -808,61 +808,74 @@ case "$1" in
         fi
         echo -e "${BLUE}::${NC} Unloading driver..."
 
-        if [[ "$IS_ATOMIC" == "true" ]]; then
-            if rmmod "$DRV_NAME" 2>/dev/null; then
-                echo -e "${GREEN}[OK]${NC} Driver unloaded successfully."
-                exit 0
+        if rmmod "$DRV_NAME" 2>/dev/null; then
+            echo -e "${GREEN}[OK]${NC} Driver unloaded successfully."
+            exit 0
+        fi
+
+        echo -e "${YELLOW}[BUSY]${NC} Module is in use. Stopping PipeWire and consumers..."
+        # A plain kill is not enough: systemd restarts the session manager
+        # within a second and it re-grabs the card's nodes before the rmmod
+        # retry. Stop the user services first - BOTH sockets, or any client
+        # touching the pulse socket resurrects the whole stack (wireplumber
+        # is WantedBy=pipewire.service) - and restart them once unloaded.
+        PW_UIDS=()
+        while read -r pid; do
+            uid=$(stat -c %u "/proc/$pid" 2>/dev/null) || continue
+            PW_UIDS+=("$uid")
+        done < <(pgrep -x pipewire 2>/dev/null || true)
+        for uid in $(printf '%s\n' "${PW_UIDS[@]}" | sort -u); do
+            sudo -u "#$uid" XDG_RUNTIME_DIR="/run/user/$uid" \
+                DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" \
+                systemctl --user stop pipewire.socket pipewire-pulse.socket \
+                    pipewire.service pipewire-pulse.service wireplumber.service || true
+        done
+
+        # Target only THIS driver's video nodes, never the whole of
+        # /dev/video* (holders of webcams etc. are unrelated apps).
+        VID_NODES=()
+        for v in /sys/class/video4linux/video*; do
+            [[ -e "$v" ]] || continue
+            if [[ "$(readlink "$v/device/driver" 2>/dev/null)" == */"$DRV_NAME" ]]; then
+                VID_NODES+=("/dev/$(basename "$v")")
             fi
-            echo -e "${YELLOW}[BUSY]${NC} Module is in use. Stopping PipeWire and consumers..."
-            PW_UIDS=()
-            while read -r pid; do
-                uid=$(stat -c %u "/proc/$pid" 2>/dev/null) || continue
-                PW_UIDS+=("$uid")
-            done < <(pgrep -x pipewire 2>/dev/null || true)
-            for uid in $(printf '%s\n' "${PW_UIDS[@]}" | sort -u); do
-                sudo -u "#$uid" XDG_RUNTIME_DIR="/run/user/$uid" \
-                    systemctl --user stop pipewire.socket pipewire.service wireplumber.service 2>/dev/null || true
-            done
-            for vdev in /dev/video*; do
-                [[ -e "$vdev" ]] && fuser -k "$vdev" >/dev/null 2>&1 || true
-            done
-            for sdev in /dev/snd/*; do
-                [[ -e "$sdev" ]] && fuser -k "$sdev" >/dev/null 2>&1 || true
-            done
-            sleep 1
-            if rmmod "$DRV_NAME" 2>/dev/null; then
-                echo -e "${GREEN}[OK]${NC} Driver unloaded successfully."
-            else
-                sleep 2
-                if rmmod "$DRV_NAME" 2>/dev/null; then
-                    echo -e "${GREEN}[OK]${NC} Driver unloaded successfully."
-                else
-                    echo -e "${RED}[ERROR]${NC} Module is still held by the kernel."
-                    for uid in $(printf '%s\n' "${PW_UIDS[@]}" | sort -u); do
-                        sudo -u "#$uid" XDG_RUNTIME_DIR="/run/user/$uid" \
-                            systemctl --user start pipewire.socket 2>/dev/null || true
-                    done
-                    exit 1
-                fi
+        done
+
+        # The card holds ALSA nodes too; target only THIS card's sound
+        # devices, never the whole of /dev/snd (holders of other cards are
+        # the desktop's audio stack).
+        SND_NODES=()
+        CARD_LINK=$(readlink "/proc/asound/$DRV_NAME" 2>/dev/null || true)
+        if [[ "$CARD_LINK" == card* ]]; then
+            N="${CARD_LINK#card}"
+            SND_NODES=(/dev/snd/pcmC"$N"D* /dev/snd/controlC"$N")
+        fi
+        fuser -k "${VID_NODES[@]}" "${SND_NODES[@]}" >/dev/null 2>&1 || true
+        sleep 1
+
+        if ! rmmod "$DRV_NAME" 2>/dev/null; then
+            sleep 2
+            if ! rmmod "$DRV_NAME" 2>/dev/null; then
+                # Never rmmod -f: force-unloading under an open capture fd
+                # is a guaranteed kernel panic, not a recovery.
+                echo -e "${RED}[ERROR]${NC} Module is still in use; close these and retry:"
+                fuser -v "${VID_NODES[@]}" "${SND_NODES[@]}" 2>&1 || true
+                for uid in $(printf '%s\n' "${PW_UIDS[@]}" | sort -u); do
+                    sudo -u "#$uid" XDG_RUNTIME_DIR="/run/user/$uid" \
+                        DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" \
+                        systemctl --user start pipewire.socket pipewire-pulse.socket 2>/dev/null || true
+                done
+                exit 1
             fi
+        fi
+        echo -e "${GREEN}[OK]${NC} Driver unloaded successfully."
+        if [[ ${#PW_UIDS[@]} -gt 0 ]]; then
             echo -e "${BLUE}[INFO]${NC} Restarting PipeWire..."
             for uid in $(printf '%s\n' "${PW_UIDS[@]}" | sort -u); do
                 sudo -u "#$uid" XDG_RUNTIME_DIR="/run/user/$uid" \
-                    systemctl --user start pipewire.socket 2>/dev/null || true
+                    DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" \
+                    systemctl --user start pipewire.socket pipewire-pulse.socket 2>/dev/null || true
             done
-        else
-            if ! rmmod "$DRV_NAME" 2>/dev/null; then
-                echo -e "${YELLOW}[BUSY]${NC} Standard unload failed. Attempting force..."
-                fuser -k /dev/video* >/dev/null 2>&1 || true
-                sleep 0.5
-                if rmmod -f "$DRV_NAME" 2>/dev/null; then
-                    echo -e "${GREEN}[OK]${NC} Driver force-unloaded successfully."
-                else
-                    echo -e "${RED}[ERROR]${NC} Kernel refused to force unload. A reboot may be required."
-                fi
-            else
-                echo -e "${GREEN}[OK]${NC} Driver unloaded successfully."
-            fi
         fi
         ;;
     --restart)
