@@ -200,6 +200,49 @@ Same command as above — checks module, DKMS, CLI, systemd units, config files,
 * **Timing controls** — runtime modes (`merge`, `procedural-only`, `static-only`) via CLI
 * **Debug dumps** — `sc0710-cli --dump` collects distro, kernel, `lspci`, driver version, and service state for issue reports
 
+### Pixel formats (YUYV 4:2:2 and native BGR24 4:4:4)
+
+Two capture formats are offered; pick per app over V4L2, no reload:
+
+* **`YUYV` (default)** — packed 4:2:2, 2 bytes/pixel. Lowest bandwidth, always available.
+* **`BGR24`** — native **4:4:4**, 3 bytes/pixel: the card's full-chroma mode (Elgato markets
+  it "RGB24 8-bit 4:4:4"; the bytes are BGR-ordered). ~50 % more PCIe/RAM bandwidth than
+  YUYV, so it is opt-in. Reported as **full-range sRGB**, so color-managed apps take the
+  bytes as captured instead of range-expanding them.
+
+```bash
+v4l2-ctl -d /dev/video0 --list-formats                     # YUYV + BGR3
+v4l2-ctl -d /dev/video0 --set-fmt-video=pixelformat=BGR3   # select 4:4:4
+# OBS / ffmpeg pick it via the normal format menu / -pixel_format bgr24
+```
+
+The format is device-wide (one card, one DMA pipeline) and can only be changed while no app
+is capturing or holding buffers (a change attempt then returns `EBUSY`). Interlaced sources
+are YUYV-only: a `BGR24` request is clamped to YUYV, and if a signal turns interlaced
+mid-session under `BGR24` the driver delivers no frames until the format or signal changes.
+For **bit-accurate** RGB capture, also present an RGB-only EDID (below): on a YCbCr wire the
+card round-trips RGB→YCbCr→RGB and loses ~2 codes; on an RGB wire it captures within ±1 of
+bit-perfect.
+
+### Choosing the presented EDID
+
+The card presents an EDID to the HDMI source; changing it changes what the source outputs
+(resolution, and RGB vs YCbCr). Two ways:
+
+* **`edid=<name>` module param** — loads `/lib/firmware/sc0710/edid/<name>.bin` at module
+  load (profiles installed by `extract-firmware.sh`), e.g. `edid=1440p`.
+* **`VIDIOC_S_EDID` at runtime** — `v4l2-ctl --set-edid`. For a **raw binary** EDID file add
+  `,format=raw`; the default expects the hex-text format that `--get-edid` produces:
+
+```bash
+v4l2-ctl -d /dev/video0 --get-edid                          # dump current (hex text)
+v4l2-ctl -d /dev/video0 --set-edid=file=my-edid.bin,format=raw   # write a raw .bin
+```
+
+An RGB-only EDID (color-encoding bits `00`, no YCbCr flags) makes the source output RGB
+4:4:4 — the wire to pair with `BGR24` for bit-accurate 4:4:4 capture. The source
+renegotiates ~8–10 s after a write (a brief re-detect of the old mode first is normal).
+
 ## Troubleshooting
 
 | Problem | What to try |

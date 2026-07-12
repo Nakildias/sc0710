@@ -375,6 +375,25 @@ struct sc0710_format
 	struct v4l2_dv_timings dv_timings;
 };
 
+/* A selectable capture pixel format: everything the driver forks on per
+ * format lives in this row, so adding a format is one table entry.
+ * Packed formats only; a planar format (NV12) needs its own sizing. */
+struct sc0710_pixfmt {
+	u32  fourcc;
+	u32  bpp;         /* Bytes per pixel */
+	u32  pipeline_d0; /* BAR0 0xD0 capture-format selector value */
+	/* Full-range RGB output: colorimetry reports sRGB (the detected YCbCr
+	 * colorimetry does not describe it), and black is all-zero bytes. */
+	bool rgb;
+	/* The interlaced field weave understands this memory layout. */
+	bool weave_ok;
+	/* The horizontal-tear detector understands this memory layout. */
+	bool tear_ok;
+};
+
+extern const struct sc0710_pixfmt sc0710_pixfmts[];
+extern const unsigned int sc0710_pixfmts_count;
+
 struct sc0710_audio_dev
 {
 	struct sc0710_dev         *dev;
@@ -433,6 +452,9 @@ struct sc0710_dev {
 	u32                        pixelLineH, pixelLineV; /* HDMI line format */
 	u32                        width, height;    /* Actual display */
 	u32                        interlaced;
+	/* Selected V4L2 output format (device-wide, changed only while idle):
+	 * a row of sc0710_pixfmts, never NULL; YUYV is the default. */
+	const struct sc0710_pixfmt *pixfmt;
 	const struct sc0710_format *fmt;
 	const struct sc0710_format *last_fmt;  /* Last active format for placeholders */
 	/* Fallback for unlisted timings: two slots, alternated on each timing
@@ -477,6 +499,23 @@ struct sc0710_dev {
 	u32 pending_pixelLineH, pending_pixelLineV;
 	u8 pending_hint_interval, pending_hint_flags;
 };
+
+/* Bytes per pixel of the selected output format. */
+static inline u32 sc0710_bpp(const struct sc0710_dev *dev)
+{
+	return dev->pixfmt->bpp;
+}
+
+/* Frame size of fmt under the selected pixel format, computed live so a
+ * format change while a signal is locked (which does not re-detect timing)
+ * can't leave the DMA sizing stale. 0 when fmt is NULL. Callers racing the
+ * HDMI thread must pass their own snapshot of dev->fmt, not dev->fmt
+ * itself: dev->pixfmt only changes while idle, dev->fmt does not. */
+static inline u32 sc0710_framesize(const struct sc0710_dev *dev,
+	const struct sc0710_format *fmt)
+{
+	return fmt ? fmt->width * dev->pixfmt->bpp * fmt->height : 0;
+}
 
 struct sc0710_fh
 {

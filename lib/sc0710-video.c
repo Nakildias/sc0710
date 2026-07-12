@@ -147,6 +147,60 @@ static enum v4l2_quantization sc0710_get_v4l2_quantization(struct sc0710_dev *de
 	return V4L2_QUANTIZATION_DEFAULT;
 }
 
+/* The selectable capture formats. 0xD0 bit 6 selects the packed 4:4:4
+ * capture format (BGR byte order); clear = YUYV 4:2:2. */
+const struct sc0710_pixfmt sc0710_pixfmts[] = {
+	{
+		.fourcc      = V4L2_PIX_FMT_YUYV,  /* packed 4:2:2, default */
+		.bpp         = 2,
+		.pipeline_d0 = 0x4100,
+		.weave_ok    = true,
+		.tear_ok     = true,
+	}, {
+		.fourcc      = V4L2_PIX_FMT_BGR24, /* packed 4:4:4 */
+		.bpp         = 3,
+		.pipeline_d0 = 0x4140,
+		.rgb         = true,
+	},
+};
+
+const unsigned int sc0710_pixfmts_count = ARRAY_SIZE(sc0710_pixfmts);
+
+/* The table row for fourcc, or NULL when unknown. */
+static const struct sc0710_pixfmt *sc0710_pixfmt_find(u32 fourcc)
+{
+	unsigned int i;
+
+	for (i = 0; i < sc0710_pixfmts_count; i++) {
+		if (sc0710_pixfmts[i].fourcc == fourcc)
+			return &sc0710_pixfmts[i];
+	}
+	return NULL;
+}
+
+/* Fill the colorimetry fields for the negotiated pixel format.
+ * RGB formats reach userspace as full-range bytes (measured black 0, white
+ * 254-255), so they are tagged full-range sRGB; the detected YCbCr
+ * colorimetry does not describe the RGB output and would make color-managed
+ * apps range-expand it. */
+static void sc0710_fill_colorimetry(struct sc0710_dev *dev,
+	const struct sc0710_pixfmt *pf, struct v4l2_pix_format *pix)
+{
+	if (pf->rgb) {
+		pix->colorspace = V4L2_COLORSPACE_SRGB;
+		pix->xfer_func = V4L2_XFER_FUNC_SRGB;
+		pix->ycbcr_enc = V4L2_YCBCR_ENC_DEFAULT;
+		pix->quantization = force_quantization == 1 ?
+			V4L2_QUANTIZATION_LIM_RANGE :
+			V4L2_QUANTIZATION_FULL_RANGE;
+		return;
+	}
+	pix->colorspace = sc0710_get_v4l2_colorspace(dev);
+	pix->xfer_func = sc0710_get_v4l2_xfer_func(dev);
+	pix->ycbcr_enc = sc0710_get_v4l2_ycbcr_enc(dev);
+	pix->quantization = sc0710_get_v4l2_quantization(dev);
+}
+
 #define FILL_MODE_COLORBARS 0
 #define FILL_MODE_GREENSCREEN 1
 #define FILL_MODE_BLUESCREEN 2
@@ -322,7 +376,7 @@ static void sc0710_get_effective_size(struct sc0710_dev *dev,
 {
 	*width = fmt->width;
 	*height = fmt->height;
-	*framesize = fmt->width * 2 * fmt->height;
+	*framesize = sc0710_framesize(dev, fmt);
 }
 
 static void fill_frame(struct sc0710_dma_channel *ch,
@@ -828,10 +882,9 @@ static int vidioc_g_input(struct file *file, void *priv, unsigned int *i)
 
 static int vidioc_enum_fmt_vid_cap(struct file *file, void *priv, struct v4l2_fmtdesc *f)
 {
-	if (f->index != 0)
+	if (f->index >= sc0710_pixfmts_count)
 		return -EINVAL;
-
-	f->pixelformat = V4L2_PIX_FMT_YUYV;
+	f->pixelformat = sc0710_pixfmts[f->index].fourcc;
 	return 0;
 }
 
@@ -849,15 +902,12 @@ static int vidioc_g_fmt_vid_cap(struct file *file, void *priv, struct v4l2_forma
 
 	f->fmt.pix.width = eff_w;
 	f->fmt.pix.height = eff_h;
-	f->fmt.pix.pixelformat = V4L2_PIX_FMT_YUYV;
+	f->fmt.pix.pixelformat = dev->pixfmt->fourcc;
 	f->fmt.pix.field = fmt->interlaced ?
 		V4L2_FIELD_INTERLACED : V4L2_FIELD_NONE;
-	f->fmt.pix.bytesperline = eff_w * 2;
+	f->fmt.pix.bytesperline = eff_w * sc0710_bpp(dev);
 	f->fmt.pix.sizeimage = eff_fs;
-	f->fmt.pix.colorspace = sc0710_get_v4l2_colorspace(dev);
-	f->fmt.pix.xfer_func = sc0710_get_v4l2_xfer_func(dev);
-	f->fmt.pix.ycbcr_enc = sc0710_get_v4l2_ycbcr_enc(dev);
-	f->fmt.pix.quantization = sc0710_get_v4l2_quantization(dev);
+	sc0710_fill_colorimetry(dev, dev->pixfmt, &f->fmt.pix);
 
 	return 0;
 }
@@ -867,6 +917,7 @@ static int vidioc_try_fmt_vid_cap(struct file *file, void *priv, struct v4l2_for
 	struct sc0710_dma_channel *ch = video_drvdata(file);
 	struct sc0710_dev *dev = ch->dev;
 	const struct sc0710_format *fmt;
+	const struct sc0710_pixfmt *pf;
 	u32 eff_w, eff_h, eff_fs;
 
 	/* Use real format if available, otherwise use lastfmt, then default */
@@ -874,24 +925,60 @@ static int vidioc_try_fmt_vid_cap(struct file *file, void *priv, struct v4l2_for
 
 	sc0710_get_effective_size(dev, fmt, &eff_w, &eff_h, &eff_fs);
 
+	/* Unknown formats clamp to YUYV, as do formats the field weave can't
+	 * produce for an interlaced source. Size for the requested format,
+	 * not the currently active one. */
+	pf = sc0710_pixfmt_find(f->fmt.pix.pixelformat);
+	if (!pf || (fmt->interlaced && !pf->weave_ok))
+		pf = &sc0710_pixfmts[0];
+
 	f->fmt.pix.width = eff_w;
 	f->fmt.pix.height = eff_h;
-	f->fmt.pix.pixelformat = V4L2_PIX_FMT_YUYV;
+	f->fmt.pix.pixelformat = pf->fourcc;
 	f->fmt.pix.field = fmt->interlaced ?
 		V4L2_FIELD_INTERLACED : V4L2_FIELD_NONE;
-	f->fmt.pix.bytesperline = eff_w * 2;
-	f->fmt.pix.sizeimage = eff_fs;
-	f->fmt.pix.colorspace = sc0710_get_v4l2_colorspace(dev);
-	f->fmt.pix.xfer_func = sc0710_get_v4l2_xfer_func(dev);
-	f->fmt.pix.ycbcr_enc = sc0710_get_v4l2_ycbcr_enc(dev);
-	f->fmt.pix.quantization = sc0710_get_v4l2_quantization(dev);
+	f->fmt.pix.bytesperline = eff_w * pf->bpp;
+	f->fmt.pix.sizeimage = eff_w * pf->bpp * eff_h;
+	sc0710_fill_colorimetry(dev, pf, &f->fmt.pix);
 
 	return 0;
 }
 
 static int vidioc_s_fmt_vid_cap(struct file *file, void *priv, struct v4l2_format *f)
 {
-	return vidioc_try_fmt_vid_cap(file, priv, f);
+	struct sc0710_dma_channel *ch = video_drvdata(file);
+	struct sc0710_dev *dev = ch->dev;
+	struct sc0710_client *client;
+	unsigned long flags;
+	bool busy = false;
+	int ret = vidioc_try_fmt_vid_cap(file, priv, f);
+
+	if (ret)
+		return ret;
+
+	/* Format is device-wide (one card, one DMA pipeline). Only change it while
+	 * capture is stopped, so the DMA sizing and the 0xD0 format bit stay
+	 * consistent for the whole session; a change request during capture is
+	 * rejected unless it matches the active format. */
+	if (ch->state == STATE_RUNNING)
+		return f->fmt.pix.pixelformat == dev->pixfmt->fourcc ? 0 : -EBUSY;
+
+	/* Same rule while any client holds buffers: they were negotiated and
+	 * mapped at the current format's size. The buffer ioctls serialize on
+	 * the node's ioctl lock, so the snapshot can't race an allocation. */
+	spin_lock_irqsave(&ch->client_list_lock, flags);
+	list_for_each_entry(client, &ch->client_list, list) {
+		if (vb2_is_busy(&client->vb2_queue)) {
+			busy = true;
+			break;
+		}
+	}
+	spin_unlock_irqrestore(&ch->client_list_lock, flags);
+	if (busy)
+		return f->fmt.pix.pixelformat == dev->pixfmt->fourcc ? 0 : -EBUSY;
+
+	dev->pixfmt = sc0710_pixfmt_find(f->fmt.pix.pixelformat);
+	return 0;
 }
 
 static int vidioc_enum_framesizes(struct file *file, void *priv, struct v4l2_frmsizeenum *fsize)
@@ -900,7 +987,7 @@ static int vidioc_enum_framesizes(struct file *file, void *priv, struct v4l2_frm
 	struct sc0710_dev *dev = ch->dev;
 	u32 eff_w, eff_h, eff_fs;
 
-	if (fsize->pixel_format != V4L2_PIX_FMT_YUYV)
+	if (!sc0710_pixfmt_find(fsize->pixel_format))
 		return -EINVAL;
 
 	/* Only support the currently detected resolution */
@@ -925,7 +1012,7 @@ static int vidioc_enum_frameintervals(struct file *file, void *priv, struct v4l2
 	struct sc0710_dev *dev = ch->dev;
 	u32 eff_w, eff_h, eff_fs;
 
-	if (fival->pixel_format != V4L2_PIX_FMT_YUYV)
+	if (!sc0710_pixfmt_find(fival->pixel_format))
 		return -EINVAL;
 
 	if (fival->index != 0)
@@ -1703,27 +1790,39 @@ static void sc0710_vid_timeout(struct timer_list *t)
 				unsigned long buf_sz = vb2_plane_size(&buf->vb.vb2_buf, 0);
 				u32 fill_w = eff_w, fill_h = eff_h, fill_fs = eff_fs;
 
-				/* Clamp to buffer capacity to prevent overflow when
-				 * the detected format is larger than what the client
-				 * allocated (e.g. 4K placeholder into 1080p buffer).
-				 */
-				if (fill_fs > buf_sz && fill_w && fill_h) {
-					sc0710_guess_dims_from_framesize((u32)buf_sz,
-								&fill_w, &fill_h);
-					fill_fs = fill_w * 2 * fill_h;
-				}
-				if (fill_fs > buf_sz) {
-					/* Last resort: the largest 1920-wide strip
-					 * that fits. Never write a hardcoded
-					 * geometry past the client's buffer. */
-					fill_w = 1920;
-					fill_h = min_t(u32, 1080, buf_sz / (1920 * 2));
-					fill_fs = fill_w * 2 * fill_h;
-				}
-
-				{
+				if (dev->pixfmt->rgb) {
+					/* The pattern renderer and the dims
+					 * fallbacks below are YUYV-only;
+					 * RGB black is all zeros. */
+					if (fill_fs > buf_sz)
+						fill_fs = buf_sz;
+					memset(dst, 0, fill_fs);
+					vb2_set_plane_payload(&buf->vb.vb2_buf, 0, fill_fs);
+				} else {
 					int fillmode = dev->cable_connected ?
 						FILL_MODE_NOSIGNAL : FILL_MODE_NODEVICE;
+
+					/* Clamp to buffer capacity to prevent
+					 * overflow when the detected format is
+					 * larger than what the client allocated
+					 * (e.g. 4K placeholder into 1080p buffer).
+					 */
+					if (fill_fs > buf_sz && fill_w && fill_h) {
+						sc0710_guess_dims_from_framesize((u32)buf_sz,
+									&fill_w, &fill_h);
+						fill_fs = fill_w * 2 * fill_h;
+					}
+					if (fill_fs > buf_sz) {
+						/* Last resort: the largest
+						 * 1920-wide strip that fits.
+						 * Never write a hardcoded
+						 * geometry past the client's
+						 * buffer. */
+						fill_w = 1920;
+						fill_h = min_t(u32, 1080, buf_sz / (1920 * 2));
+						fill_fs = fill_w * 2 * fill_h;
+					}
+
 					fill_frame(ch, dst, fill_w, fill_h, fillmode);
 					vb2_set_plane_payload(&buf->vb.vb2_buf, 0, fill_fs);
 				}

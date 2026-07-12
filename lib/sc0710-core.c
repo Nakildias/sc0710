@@ -210,6 +210,7 @@ static int sc0710_dev_setup(struct sc0710_dev *dev)
 	/* The keepalive thread needs a mutex */
 	mutex_init(&dev->kthread_hdmi_lock);
 	mutex_init(&dev->kthread_dma_lock);
+	dev->pixfmt = &sc0710_pixfmts[0];
 
 	if (get_resources(dev) < 0) {
 		printk(KERN_ERR "%s No more PCIe resources for "
@@ -302,7 +303,8 @@ static int sc0710_proc_state_show(struct seq_file *m, void *v)
 				dev->interlaced ? 'i' : 'p',
 				dev->pixelLineH, dev->pixelLineV);
 			if (dev->fmt) {
-				seq_printf(m, "   framesize: %d\n", dev->fmt->framesize);
+				seq_printf(m, "   framesize: %d\n",
+					sc0710_framesize(dev, dev->fmt));
 			}
 		} else {
 			seq_printf(m, "        HDMI: no signal\n");

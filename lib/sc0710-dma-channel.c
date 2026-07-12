@@ -316,6 +316,15 @@ static void sc0710_dma_dequeue_video(struct sc0710_dma_channel *ch,
 		return;
 	}
 
+	/* Format negotiation refuses formats the field weave can't produce,
+	 * but the source can go interlaced mid-session; drop rather than
+	 * deliver scrambled frames. */
+	if (cached_interlaced && !dev->pixfmt->weave_ok) {
+		printk_ratelimited(KERN_WARNING "%s: interlaced signal with a capture format the field weave does not support, dropping frames\n",
+			dev->name);
+		return;
+	}
+
 	/* During resolution transitions the detected format (cached_framesize)
 	 * may differ from the DMA chain allocation (total_transfer_size) because
 	 * the channel cannot be resized while STATE_RUNNING.
@@ -372,7 +381,8 @@ static void sc0710_dma_dequeue_video(struct sc0710_dma_channel *ch,
 	 * resync when a persistent tear seam is detected.
 	 */
 	if (ch->tear_validation_frames_left > 0) {
-		if (dev->frame_staging_buf &&
+		if (dev->pixfmt->tear_ok &&
+		    dev->frame_staging_buf &&
 		    dev->frame_staging_size >= source_framesize) {
 			int gathered = sc0710_dma_chain_dq_to_ptr(ch, chain,
 				dev->frame_staging_buf, source_framesize);
@@ -410,7 +420,8 @@ static void sc0710_dma_dequeue_video(struct sc0710_dma_channel *ch,
 
 			ch->tear_validation_frames_left--;
 		} else {
-			/* Validation needs a contiguous frame buffer; disable if unavailable. */
+			/* Validation needs a contiguous frame buffer and the
+			 * YUYV-only tear detector; disable if unavailable. */
 			ch->tear_validation_frames_left = 0;
 			ch->tear_streak_count = 0;
 			ch->tear_last_line = -1;
@@ -583,8 +594,8 @@ int sc0710_dma_channel_service(struct sc0710_dma_channel *ch)
 		return 0;
 	}
 
-	cached_fmt = dev->fmt;
-	cached_framesize = cached_fmt ? cached_fmt->framesize : 0;
+	cached_fmt = READ_ONCE(dev->fmt);
+	cached_framesize = sc0710_framesize(dev, cached_fmt);
 	cached_width = cached_fmt ? cached_fmt->width : 0;
 	cached_height = cached_fmt ? cached_fmt->height : 0;
 	cached_interlaced = cached_fmt ? cached_fmt->interlaced : 0;
@@ -867,7 +878,8 @@ int sc0710_dma_channel_resize(struct sc0710_dev *dev, u32 nr, enum sc0710_channe
 
 	sc0710_dma_chains_free(ch);
 
-	printk(KERN_INFO "%s channel %d resized for framesize %d\n", dev->name, nr, dev->fmt->framesize);
+	printk(KERN_INFO "%s channel %d resized for framesize %d\n",
+		dev->name, nr, sc0710_framesize(dev, dev->fmt));
 
 	if (ch->mediatype == CHTYPE_VIDEO) {
 		ch->numDescriptorChains = DMA_TRANSFER_CHAINS;
@@ -876,7 +888,7 @@ int sc0710_dma_channel_resize(struct sc0710_dev *dev, u32 nr, enum sc0710_channe
 		 * size, which could be much larger or smaller than any previous allocation.
 		 * Video transfers vary and need adjustment.
 		 */
-		ch->buf_size = dev->fmt->framesize;
+		ch->buf_size = sc0710_framesize(dev, dev->fmt);
 		if (sc0710_debug_mode)
 			printk("Resizing channel for size %d\n", ch->buf_size);
 	} else

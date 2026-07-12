@@ -855,7 +855,7 @@ confirmed_timing_change:
 			dyn->fpsnum     = fps_est * 1000;
 			dyn->fpsden     = 1000;
 			dyn->depth      = 8;
-			dyn->framesize  = dev->width * 2 * dev->height;
+			dyn->framesize  = dev->width * sc0710_bpp(dev) * dev->height;
 			snprintf(dev->dynamic_fmt_name[dev->dynamic_fmt_idx],
 				 sizeof(dev->dynamic_fmt_name[0]),
 				 "%ux%u%s%u(dynamic)",
