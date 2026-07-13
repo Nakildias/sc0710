@@ -198,7 +198,7 @@ Same command as above — checks module, DKMS, CLI, systemd units, config files,
 * **Video formats** — 4K60, 1440p144, 1080p240. **EDID Source control (Internal/Display/Merged) on both cards** via the `EDID Source` V4L2 control (`v4l2-ctl --set-ctrl=edid_source=N`). **Custom EDID read/write on both cards** via `VIDIOC_G_EDID`/`VIDIOC_S_EDID` — the 4K Pro through its EEPROM (`edid=` boot param, profiles from `scripts/extract-firmware.sh`), the MK.2 through its MCU (runtime only). The graphical **EDID Config app** (`sc0710-cli --edid-config`) manages this for both cards and can fetch Elgato's official EDID profiles
 * **Mode-switch stability** — DMA resync, restart validation, and watchdog recovery during resolution/refresh changes; apps are told to renegotiate via `V4L2_EVENT_SOURCE_CHANGE`
 * **Timing controls** — runtime modes (`merge`, `procedural-only`, `static-only`) via CLI
-* **HDR (MK.2)** — host PQ→SDR tonemap on **YUYV and BGR24** (CPU; see [`docs/hdr_software.md`](docs/hdr_software.md)), MCU **hardware tonemap** via `hw_tonemap` / MCU `0x11` (see [`docs/hdr_hardware.md`](docs/hdr_hardware.md)), or native BGR24 HDR passthrough with BT.2020/PQ tags
+* **HDR (MK.2)** — host PQ→SDR tonemap on **YUYV and BGR24**, MCU **hardware tonemap** via `hw_tonemap` / MCU `0x11`, or native BGR24 HDR passthrough with BT.2020/PQ tags
 * **Driver manager GUI** — `sc0710-cli --gui` (load/unload/restart, toggles, EDID/HDR config launchers, dump + HDR tests)
 * **Debug dumps** — `sc0710-cli --dump` collects distro, kernel, `lspci`, driver version, and service state for issue reports
 
@@ -334,7 +334,8 @@ If you can test, debug, or submit patches for any of the above, please [open an 
 This fork is maintained by **[Nakildias](https://github.com/Nakildias)** (`nakildiaspro@gmail.com`).
 
 * Based on original reverse engineering by **[Steven Toth (@stoth68000)](https://github.com/stoth68000)** and subsequent work by **[@Subtixx](https://github.com/Subtixx)**.
-* Thanks to **[Onhil (@Onhil)](https://github.com/Onhil)** for work on the Elgato 4K Pro.
+* Thanks to **[Onhil (@Onhil)](https://github.com/Onhil)** for his work on the Elgato 4K Pro.
+* Thanks to **[JerwuQu (@JerwuQu)](https://github.com/JerwuQu)** for his work on the Elgato 4K Pro EDID Flashing & BRG24 Support.
 
 The kernel module is a derivative of Steven Toth's sc0710 driver (GPL v2). Original copyright notices are preserved in source files; modifications in this fork are attributed separately. Installer scripts are original work in this repository. See **[COPYRIGHT](COPYRIGHT)** for details.
 
