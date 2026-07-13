@@ -154,6 +154,8 @@ static bool sc0710_detect_horizontal_tear(const u8 *buf, u32 width, u32 height, 
 	return false;
 }
 
+/* Host PQ→SDR tonemap lives in sc0710-tonemap.c (luminance-preserving). */
+
 /* The ways of processing the DMA.
  * 1. Polled
  * 2. IRQ.
@@ -301,6 +303,9 @@ static void sc0710_dma_dequeue_video(struct sc0710_dma_channel *ch,
 	int delivered = 0;
 	int stale_clients = 0;
 	const u8 *woven_frame = NULL;
+	u8 *tm_frame = NULL;
+	/* Host tonemap on both YUYV and BGR24 (preview LUT; no gamut convert). */
+	int want_tm = sc0710_want_sw_tonemap(dev);
 	u32 streak_required = dma_resync_tear_streak_required ?
 		dma_resync_tear_streak_required : 1;
 
@@ -341,9 +346,9 @@ static void sc0710_dma_dequeue_video(struct sc0710_dma_channel *ch,
 	/* Pre-allocate staging buffer outside of spinlock context.
 	 * vzalloc/vfree are sleeping calls that must not be called
 	 * while holding spinlocks.  We size the buffer once here for
-	 * the tear-validation and interlaced weaving paths.
+	 * the tear-validation, interlaced weaving, and host tonemap paths.
 	 */
-	if ((cached_interlaced || ch->tear_validation_frames_left > 0) &&
+	if ((cached_interlaced || ch->tear_validation_frames_left > 0 || want_tm) &&
 	    (!dev->frame_staging_buf ||
 	     dev->frame_staging_size < source_framesize)) {
 		u8 *old = dev->frame_staging_buf;
@@ -448,6 +453,32 @@ static void sc0710_dma_dequeue_video(struct sc0710_dma_channel *ch,
 		}
 	}
 
+	/*
+	 * Host HDR→SDR (optional): gather once into staging, tonemap in place,
+	 * then all clients read from that buffer. Works for YUYV and BGR24.
+	 */
+	if (want_tm) {
+		if (!woven_frame && !frame_gathered &&
+		    dev->frame_staging_buf &&
+		    dev->frame_staging_size >= source_framesize) {
+			int gathered = sc0710_dma_chain_dq_to_ptr(ch, chain,
+				dev->frame_staging_buf, source_framesize);
+			if (gathered == (int)source_framesize)
+				frame_gathered = 1;
+		}
+		if (woven_frame)
+			tm_frame = (u8 *)woven_frame;
+		else if (frame_gathered)
+			tm_frame = dev->frame_staging_buf;
+
+		if (tm_frame) {
+			if (dev->pixfmt->rgb)
+				sc0710_bgr24_sw_tonemap(tm_frame, source_w, source_h);
+			else
+				sc0710_yuyv8_sw_tonemap(tm_frame, source_w, source_h);
+		}
+	}
+
 	/* Broadcast frame to all streaming clients */
 	spin_lock_irqsave(&ch->client_list_lock, flags);
 	list_for_each_entry(client, &ch->client_list, list) {
@@ -455,6 +486,7 @@ static void sc0710_dma_dequeue_video(struct sc0710_dma_channel *ch,
 		unsigned long buf_flags;
 		u8 *dst;
 		unsigned long buffer_size;
+		const u8 *src_frame = tm_frame ? tm_frame : woven_frame;
 
 		if (!client->streaming)
 			continue;
@@ -485,12 +517,12 @@ static void sc0710_dma_dequeue_video(struct sc0710_dma_channel *ch,
 			continue;
 		}
 
-		if (woven_frame) {
+		if (src_frame) {
 			if (source_framesize <= buffer_size) {
-				memcpy(dst, woven_frame, source_framesize);
+				memcpy(dst, src_frame, source_framesize);
 				vb2_set_plane_payload(&vb_buf->vb.vb2_buf, 0, source_framesize);
 			} else {
-				memcpy(dst, woven_frame, buffer_size);
+				memcpy(dst, src_frame, buffer_size);
 				vb2_set_plane_payload(&vb_buf->vb.vb2_buf, 0, buffer_size);
 			}
 		} else {
@@ -851,6 +883,9 @@ static struct sc0710_client *sc0710_dma_zc_client(struct sc0710_dma_channel *ch,
 		return NULL;
 	if (ch->zc_stale_trip)
 		return NULL;
+	/* Host tonemap needs a gather/copy path; never DMA into client buffers. */
+	if (sc0710_want_sw_tonemap(ch->dev))
+		return NULL;
 	if (cached_framesize == 0 || cached_interlaced)
 		return NULL;
 	if (ch->skip_next_frames || ch->tear_validation_frames_left)
@@ -1017,7 +1052,16 @@ int sc0710_dma_channel_service(struct sc0710_dma_channel *ch)
 			 * below so the ring keeps turning until the resync. */
 			if (ch->mediatype == CHTYPE_VIDEO && !stale_completion) {
 				if (chain->target_buf) {
-					sc0710_dma_deliver_targeted(ch, chain);
+					/* Tonemap may flip mid-session; never deliver
+					 * an un-tonemapped zero-copy frame. */
+					if (sc0710_want_sw_tonemap(dev)) {
+						sc0710_dma_chain_untarget(chain);
+						sc0710_dma_dequeue_video(ch, chain,
+							cached_framesize, cached_width,
+							cached_height, cached_interlaced);
+					} else {
+						sc0710_dma_deliver_targeted(ch, chain);
+					}
 				} else {
 					sc0710_dma_dequeue_video(ch, chain, cached_framesize,
 						cached_width, cached_height,

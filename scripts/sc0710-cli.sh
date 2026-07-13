@@ -17,37 +17,57 @@ BLUE='\033[1;34m'
 BOLD='\033[1m'
 NC='\033[0m'
 
-# --- EDID configuration GUI (runs as the invoking user, NOT root) ---
-# Handled before auto-elevation: the Qt GUI needs the user's display session,
-# and it escalates only for the actual EDID write, via pkexec.
-if [[ "$1" == "-ec" || "$1" == "--edid-config" ]]; then
+# --- EDID / HDR / Manager GUIs (run as the invoking user, NOT root) ---
+# Handled before full auto-elevation: Qt needs the user's display session.
+# Privilege for writes uses the same sudo ticket as the rest of sc0710-cli
+# (cached after `sudo -v` here so Apply does not re-prompt every time).
+if [[ "$1" == "-ec" || "$1" == "--edid-config" ||
+      "$1" == "-hc" || "$1" == "--hdr-config" ||
+      "$1" == "-g" || "$1" == "--gui" ]]; then
     _cli_self="$(readlink -f "${BASH_SOURCE[0]:-$0}" 2>/dev/null || echo "$0")"
     _cli_dir="$(dirname "$_cli_self")"
-    EDID_GUI=""
+    if [[ "$1" == "-hc" || "$1" == "--hdr-config" ]]; then
+        _gui_name="sc0710-hdr-config"
+        _gui_label="HDR"
+    elif [[ "$1" == "-g" || "$1" == "--gui" ]]; then
+        _gui_name="sc0710-gui"
+        _gui_label="Driver Manager"
+    else
+        _gui_name="sc0710-edid-config"
+        _gui_label="EDID"
+    fi
+    _GUI=""
     for _p in \
-        "$_cli_dir/sc0710-edid-config" \
-        "$_cli_dir/../scripts/sc0710-edid-config" \
-        /usr/local/bin/sc0710-edid-config \
-        /usr/local/libexec/sc0710-edid-config \
-        /usr/lib/sc0710/sc0710-edid-config \
-        /usr/bin/sc0710-edid-config; do
-        [[ -f "$_p" ]] && { EDID_GUI="$(readlink -f "$_p")"; break; }
+        "$_cli_dir/${_gui_name}" \
+        "$_cli_dir/../scripts/${_gui_name}" \
+        "/usr/local/bin/${_gui_name}" \
+        "/usr/local/libexec/${_gui_name}" \
+        "/usr/lib/sc0710/${_gui_name}" \
+        "/usr/bin/${_gui_name}"; do
+        [[ -f "$_p" ]] && { _GUI="$(readlink -f "$_p")"; break; }
     done
-    if [[ -z "$EDID_GUI" ]]; then
-        echo -e "${RED}[ERROR]${NC} sc0710-edid-config not found. Reinstall the driver package."
+    if [[ -z "$_GUI" ]]; then
+        echo -e "${RED}[ERROR]${NC} ${_gui_name} not found. Reinstall the driver package."
         exit 1
     fi
     if ! lsmod | grep -q "^${DRV_NAME} "; then
         echo -e "${YELLOW}[WARN]${NC} Driver not loaded — run ${BOLD}sc0710-cli --load${NC} first, or the GUI will show no card."
     fi
     if ! python3 -c 'import PySide6' 2>/dev/null && ! python3 -c 'import PyQt6' 2>/dev/null; then
-        echo -e "${YELLOW}[INFO]${NC} The EDID GUI needs a Qt binding (PySide6). Install it with:"
+        echo -e "${YELLOW}[INFO]${NC} The ${_gui_label} GUI needs a Qt binding (PySide6). Install it with:"
         echo -e "    Arch:   ${BOLD}sudo pacman -S pyside6${NC}"
         echo -e "    Fedora: ${BOLD}sudo dnf install python3-pyside6${NC}"
         echo -e "    Debian: ${BOLD}sudo apt install python3-pyside6${NC}"
         exit 1
     fi
-    exec python3 "$EDID_GUI"
+    # Prime sudo once (same auth as other sc0710-cli commands). GUI writes use sudo.
+    if [[ $EUID -ne 0 ]]; then
+        if ! sudo -v; then
+            echo -e "${RED}[ERROR]${NC} sudo authentication required for ${_gui_label}."
+            exit 1
+        fi
+    fi
+    exec python3 "$_GUI"
 fi
 
 # --- Auto-elevate to root ---
@@ -686,6 +706,461 @@ write_debug_dump() {
     echo -e "${BLUE}[INFO]${NC} Attach this file when reporting issues on GitHub."
 }
 
+# --- HDR snapshot self-test (Desktop/HDR/) ---
+
+sc0710_find_video_dev() {
+    local n name
+    for n in /sys/class/video4linux/video*; do
+        [[ -f "$n/name" ]] || continue
+        name=$(tr -d '\0' < "$n/name" 2>/dev/null || true)
+        if [[ "$name" == *sc0710* ]]; then
+            printf '%s\n' "/dev/$(basename "$n")"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Stop PipeWire so we can open the capture node exclusively.
+# Sets SC0710_HDR_TEST_PW_UIDS for later restart.
+sc0710_hdr_test_stop_pipewire() {
+    local uid pid
+    SC0710_HDR_TEST_PW_UIDS=()
+    while read -r pid; do
+        uid=$(stat -c %u "/proc/$pid" 2>/dev/null) || continue
+        SC0710_HDR_TEST_PW_UIDS+=("$uid")
+    done < <(pgrep -x pipewire 2>/dev/null || true)
+    for uid in $(printf '%s\n' "${SC0710_HDR_TEST_PW_UIDS[@]}" | sort -u); do
+        sudo -u "#$uid" XDG_RUNTIME_DIR="/run/user/$uid" \
+            DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" \
+            systemctl --user stop pipewire.socket pipewire-pulse.socket \
+                pipewire.service pipewire-pulse.service wireplumber.service 2>/dev/null || true
+    done
+    sleep 0.5
+}
+
+sc0710_hdr_test_start_pipewire() {
+    local uid
+    for uid in $(printf '%s\n' "${SC0710_HDR_TEST_PW_UIDS[@]:-}" | sort -u); do
+        [[ -n "$uid" ]] || continue
+        sudo -u "#$uid" XDG_RUNTIME_DIR="/run/user/$uid" \
+            DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" \
+            systemctl --user start pipewire.socket pipewire-pulse.socket 2>/dev/null || true
+    done
+    SC0710_HDR_TEST_PW_UIDS=()
+}
+
+# Apply module params + V4L2 FourCC for one HDR-test cell.
+# $1 force_eotf  $2 hdr_bgr24  $3 sw_tonemap  $4 fourcc (YUYV|BGR3)  $5 video
+# optional $6 hw_tonemap (default 0 when omitted)
+sc0710_hdr_test_apply() {
+    local fe="$1" bgr="$2" tm="$3" fourcc="$4" video="$5"
+    local hw="${6:-0}"
+    local wh w h
+
+    echo "$fe" > /sys/module/sc0710/parameters/force_eotf
+    echo "$bgr" > /sys/module/sc0710/parameters/hdr_bgr24
+    if [[ -f /sys/module/sc0710/parameters/hw_tonemap ]]; then
+        echo "$hw" > /sys/module/sc0710/parameters/hw_tonemap
+    fi
+    echo "$tm" > /sys/module/sc0710/parameters/sw_tonemap
+    # Give sync_hdr_deliver a beat (format may resize while idle).
+    sleep 1.2
+
+    wh=$(v4l2-ctl -d "$video" --get-fmt-video 2>/dev/null \
+        | awk -F: '/Width\/Height/{gsub(/ /,"",$2); print $2; exit}')
+    w=${wh%%/*}
+    h=${wh##*/}
+    if [[ ! "$w" =~ ^[0-9]+$ || ! "$h" =~ ^[0-9]+$ ]]; then
+        wh=$(grep -oE '[0-9]+x[0-9]+' /proc/sc0710-state 2>/dev/null | head -1)
+        w=${wh%%x*}
+        h=${wh##*x}
+    fi
+    if [[ ! "$w" =~ ^[0-9]+$ || ! "$h" =~ ^[0-9]+$ ]]; then
+        w=1920
+        h=1080
+    fi
+
+    # Explicit FourCC so tonemap+BGR24 and baseline cells are comparable.
+    v4l2-ctl -d "$video" --set-fmt-video="width=${w},height=${h},pixelformat=${fourcc}" >/dev/null 2>&1 || true
+    sleep 0.4
+}
+
+# Grab one still from $1 into PNG $2 (YUYV or BGR24).
+sc0710_hdr_test_capture() {
+    local dev="$1" out="$2"
+    local fmt wh w h pix_fmt bpp frame_bytes raw tmpdir err fmt_info
+
+    if ! command -v v4l2-ctl >/dev/null 2>&1; then
+        echo -e "${RED}[ERROR]${NC} v4l2-ctl is required for --hdr-test (pacman: v4l-utils)."
+        return 1
+    fi
+
+    fmt_info=$(v4l2-ctl -d "$dev" --get-fmt-video 2>/dev/null) || {
+        echo -e "${RED}[ERROR]${NC} Cannot query format on $dev"
+        return 1
+    }
+    fmt=$(printf '%s\n' "$fmt_info" | awk -F"'" '/Pixel Format/{print $2; exit}')
+    wh=$(printf '%s\n' "$fmt_info" | awk -F: '/Width\/Height/{gsub(/ /,"",$2); print $2; exit}')
+    w=${wh%%/*}
+    h=${wh##*/}
+    if [[ ! "$w" =~ ^[0-9]+$ || ! "$h" =~ ^[0-9]+$ || "$w" -lt 2 || "$h" -lt 2 ]]; then
+        wh=$(grep -oE '[0-9]+x[0-9]+' /proc/sc0710-state 2>/dev/null | head -1)
+        w=${wh%%x*}
+        h=${wh##*x}
+    fi
+    if [[ ! "$w" =~ ^[0-9]+$ || ! "$h" =~ ^[0-9]+$ ]]; then
+        echo -e "${RED}[ERROR]${NC} Could not determine capture resolution."
+        return 1
+    fi
+
+    case "$fmt" in
+        BGR3|BGR24|RGB3)
+            pix_fmt=bgr24
+            bpp=3
+            ;;
+        YUYV|YUYV*)
+            pix_fmt=yuyv422
+            bpp=2
+            ;;
+        *)
+            if [[ "$(cat /sys/module/sc0710/parameters/hdr_bgr24 2>/dev/null)" == "1" ]] &&
+               [[ "$(cat /sys/module/sc0710/parameters/sw_tonemap 2>/dev/null)" == "0" ]]; then
+                pix_fmt=bgr24
+                bpp=3
+                fmt=BGR3
+            else
+                pix_fmt=yuyv422
+                bpp=2
+                fmt=YUYV
+            fi
+            ;;
+    esac
+    frame_bytes=$((w * h * bpp))
+
+    tmpdir=$(mktemp -d /tmp/sc0710-hdr-XXXXXX) || return 1
+    raw="${tmpdir}/frame.raw"
+
+    err=$(v4l2-ctl -d "$dev" \
+        --stream-mmap=4 \
+        --stream-skip=8 \
+        --stream-count=1 \
+        --stream-to="$raw" 2>&1) || {
+        echo -e "${RED}[ERROR]${NC} v4l2 stream failed: ${err:-unknown}"
+        rm -rf "$tmpdir"
+        return 1
+    }
+
+    if [[ ! -s "$raw" ]]; then
+        echo -e "${RED}[ERROR]${NC} Empty raw capture from $dev ($fmt ${w}x${h})"
+        rm -rf "$tmpdir"
+        return 1
+    fi
+
+    if [[ $(stat -c%s "$raw") -gt $frame_bytes ]]; then
+        tail -c "$frame_bytes" "$raw" > "${raw}.one" && mv "${raw}.one" "$raw"
+    fi
+
+    err=$(ffmpeg -hide_banner -loglevel error -y \
+        -f rawvideo -pix_fmt "$pix_fmt" -s:v "${w}x${h}" -i "$raw" \
+        -frames:v 1 "$out" 2>&1) || {
+        echo -e "${RED}[ERROR]${NC} Convert failed ($fmt ${w}x${h} → PNG): ${err:-ffmpeg error}"
+        rm -rf "$tmpdir"
+        return 1
+    }
+    rm -rf "$tmpdir"
+
+    [[ -s "$out" ]] || { echo -e "${RED}[ERROR]${NC} Empty snapshot: $out"; return 1; }
+    return 0
+}
+
+# Cycle HDR configs; save PNGs + summary to Desktop/HDR/.
+# Slot 00 is a forced-SDR baseline (no HDR processing) for side-by-side reference.
+sc0710_hdr_self_test() {
+    local stamp outdir video orig_fe orig_bgr orig_tm orig_fmt
+    local mode_slug mode_label fe bgr tm fourcc out meta rc=0
+
+    if ! lsmod | grep -q "^${DRV_NAME} "; then
+        echo -e "${RED}[ERROR]${NC} Module not loaded. Run: sc0710-cli --load"
+        return 1
+    fi
+    if [[ ! -f /sys/module/sc0710/parameters/hdr_bgr24 ]] ||
+       [[ ! -f /sys/module/sc0710/parameters/sw_tonemap ]] ||
+       [[ ! -f /sys/module/sc0710/parameters/force_eotf ]]; then
+        echo -e "${RED}[ERROR]${NC} HDR params missing — rebuild/reload the driver first."
+        return 1
+    fi
+    if ! command -v ffmpeg >/dev/null 2>&1; then
+        echo -e "${RED}[ERROR]${NC} ffmpeg is required for --hdr-test."
+        return 1
+    fi
+    if ! command -v v4l2-ctl >/dev/null 2>&1; then
+        echo -e "${RED}[ERROR]${NC} v4l2-ctl is required for --hdr-test (pacman: v4l-utils)."
+        return 1
+    fi
+
+    video=$(sc0710_find_video_dev) || {
+        echo -e "${RED}[ERROR]${NC} No sc0710 video device found."
+        return 1
+    }
+
+    resolve_dump_desktop
+    outdir="${DUMP_DESKTOP}/HDR"
+    mkdir -p "$outdir"
+    stamp=$(date '+%Y%m%d_%H%M%S')
+    meta="${outdir}/hdr-test_${stamp}_summary.txt"
+
+    orig_fe=$(cat /sys/module/sc0710/parameters/force_eotf)
+    orig_bgr=$(cat /sys/module/sc0710/parameters/hdr_bgr24)
+    orig_tm=$(cat /sys/module/sc0710/parameters/sw_tonemap)
+    orig_fmt=$(v4l2-ctl -d "$video" --get-fmt-video 2>/dev/null \
+        | awk -F"'" '/Pixel Format/{print $2; exit}')
+    [[ -z "$orig_fmt" ]] && orig_fmt=YUYV
+
+    cleanup_hdr_test() {
+        echo "$orig_fe" > /sys/module/sc0710/parameters/force_eotf 2>/dev/null || true
+        echo "$orig_bgr" > /sys/module/sc0710/parameters/hdr_bgr24 2>/dev/null || true
+        echo "$orig_tm" > /sys/module/sc0710/parameters/sw_tonemap 2>/dev/null || true
+        v4l2-ctl -d "$video" --set-fmt-video="pixelformat=${orig_fmt}" >/dev/null 2>&1 || true
+        sc0710_hdr_test_start_pipewire
+    }
+    trap cleanup_hdr_test EXIT
+
+    echo -e "${BLUE}::${NC} HDR self-test → ${BOLD}${outdir}${NC}"
+    echo -e "   Device: ${BOLD}${video}${NC}"
+    echo -e "   ${YELLOW}Tip:${NC} slot ${BOLD}00${NC} is forced-SDR baseline (no HDR processing)."
+    echo -e "   For a true no-HDR picture, feed an SDR source during 00, or drop your own"
+    echo -e "   baseline PNG into this folder named like ${BOLD}00-baseline-*.png${NC}."
+    echo -e "   Restoring after test: force_eotf=${orig_fe} hdr_bgr24=${orig_bgr} sw_tonemap=${orig_tm} fmt=${orig_fmt}"
+    {
+        echo "sc0710 HDR self-test"
+        echo "timestamp: $(date -Iseconds)"
+        echo "device: $video"
+        echo "driver: $(cat /sys/module/sc0710/version 2>/dev/null || echo unknown)"
+        echo "hdmi (at start):"
+        grep -E 'HDMI|colorimetry|colorspace|eotf|color_deep|deliver' /proc/sc0710-state 2>/dev/null || true
+        echo ""
+        echo "columns: slug | force_eotf | hdr_bgr24 | sw_tonemap | fourcc"
+        echo ""
+    } > "$meta"
+
+    echo -e "${BLUE}::${NC} Stopping PipeWire for exclusive capture..."
+    sc0710_hdr_test_stop_pipewire
+    fuser -k "$video" >/dev/null 2>&1 || true
+    sleep 0.5
+
+    # slug|label|force_eotf|hdr_bgr24|sw_tonemap|fourcc
+    # Keep ≤12 cells. 00 = no-HDR reference (forced SDR).
+    while IFS='|' read -r mode_slug mode_label fe bgr tm fourcc; do
+        [[ -z "$mode_slug" || "$mode_slug" == \#* ]] && continue
+        echo -e "${BLUE}::${NC} ${BOLD}${mode_slug}${NC} — ${mode_label}"
+        echo -e "   force_eotf=${fe} hdr_bgr24=${bgr} sw_tonemap=${tm} fmt=${fourcc}"
+        sc0710_hdr_test_apply "$fe" "$bgr" "$tm" "$fourcc" "$video"
+
+        out="${outdir}/hdr-test_${stamp}_${mode_slug}.png"
+        if sc0710_hdr_test_capture "$video" "$out"; then
+            echo -e "   ${GREEN}[OK]${NC} Saved $(basename "$out")"
+            {
+                echo "=== ${mode_slug} — ${mode_label} ==="
+                echo "file: $(basename "$out")"
+                echo "force_eotf=$fe hdr_bgr24=$bgr sw_tonemap=$tm fourcc=$fourcc"
+                v4l2-ctl -d "$video" --get-fmt-video 2>/dev/null || true
+                grep -E 'HDMI|eotf|color_deep|deliver|colorimetry|colorspace' /proc/sc0710-state 2>/dev/null || true
+                echo ""
+            } >> "$meta"
+        else
+            echo -e "   ${RED}[FAIL]${NC} ${mode_label}"
+            echo "=== ${mode_slug} — ${mode_label} FAILED ===" >> "$meta"
+            rc=1
+        fi
+    done <<'EOF'
+00-baseline-no-hdr|Baseline forced-SDR YUYV (no HDR processing)|1|0|0|YUYV
+01-baseline-bgr-sdr|Baseline forced-SDR BGR24|1|0|0|BGR3
+02-hdr-yuyv-raw|HDR auto · YUYV · raw (no tonemap)|0|0|0|YUYV
+03-hdr-yuyv-tm|HDR auto · YUYV · tonemap|0|0|1|YUYV
+04-hdr-bgr-passthru|HDR auto · BGR24 passthrough prefer|0|1|0|BGR3
+05-hdr-bgr-tm|HDR auto · BGR24 · tonemap|0|0|1|BGR3
+06-force-pq-yuyv-raw|Force PQ · YUYV · raw|2|0|0|YUYV
+07-force-pq-yuyv-tm|Force PQ · YUYV · tonemap|2|0|1|YUYV
+08-force-pq-bgr-raw|Force PQ · BGR24 · raw|2|1|0|BGR3
+09-force-pq-bgr-tm|Force PQ · BGR24 · tonemap|2|0|1|BGR3
+10-preset-passthru|Preset: HDR passthrough|0|1|0|BGR3
+11-preset-tonemap|Preset: tonemap preview|0|0|1|YUYV
+EOF
+
+    trap - EXIT
+    cleanup_hdr_test
+
+    if [[ "$DUMP_USER" != "root" ]]; then
+        chown -R "$DUMP_USER:" "$outdir" 2>/dev/null || true
+    fi
+
+    echo ""
+    if [[ "$rc" -eq 0 ]]; then
+        echo -e "${GREEN}[OK]${NC} HDR self-test complete → ${BOLD}${outdir}${NC}"
+    else
+        echo -e "${YELLOW}[WARN]${NC} HDR self-test finished with failures → ${BOLD}${outdir}${NC}"
+    fi
+    echo -e "   Summary: ${BOLD}$(basename "$meta")${NC}"
+    return "$rc"
+}
+
+# MCU enable A/B: HW-only vs SW vs raw × YUYV/BGR24 → Desktop/HDR/hw-ab_<stamp>/
+# Collects PNGs + per-cell dmesg + /proc/sc0710-state (see docs/hdr_hardware.md).
+sc0710_hdr_hw_ab_test() {
+    local stamp outdir video orig_fe orig_bgr orig_tm orig_hw orig_fmt
+    local mode_slug mode_label fe bgr tm hw fourcc out meta dmesg_file state_file rc=0
+
+    if ! lsmod | grep -q "^${DRV_NAME} "; then
+        echo -e "${RED}[ERROR]${NC} Module not loaded. Run: sc0710-cli --load"
+        return 1
+    fi
+    if [[ ! -f /sys/module/sc0710/parameters/hw_tonemap ]] ||
+       [[ ! -f /sys/module/sc0710/parameters/sw_tonemap ]] ||
+       [[ ! -f /sys/module/sc0710/parameters/hdr_bgr24 ]]; then
+        echo -e "${RED}[ERROR]${NC} hw_tonemap/sw_tonemap missing — rebuild/reload first."
+        return 1
+    fi
+    if ! command -v ffmpeg >/dev/null 2>&1; then
+        echo -e "${RED}[ERROR]${NC} ffmpeg is required."
+        return 1
+    fi
+    if ! command -v v4l2-ctl >/dev/null 2>&1; then
+        echo -e "${RED}[ERROR]${NC} v4l2-ctl is required (pacman: v4l-utils)."
+        return 1
+    fi
+
+    video=$(sc0710_find_video_dev) || {
+        echo -e "${RED}[ERROR]${NC} No sc0710 video device found."
+        return 1
+    }
+
+    resolve_dump_desktop
+    stamp=$(date '+%Y%m%d_%H%M%S')
+    outdir="${DUMP_DESKTOP}/HDR/hw-ab_${stamp}"
+    mkdir -p "$outdir"
+    meta="${outdir}/SUMMARY.txt"
+
+    orig_fe=$(cat /sys/module/sc0710/parameters/force_eotf)
+    orig_bgr=$(cat /sys/module/sc0710/parameters/hdr_bgr24)
+    orig_tm=$(cat /sys/module/sc0710/parameters/sw_tonemap)
+    orig_hw=$(cat /sys/module/sc0710/parameters/hw_tonemap)
+    orig_fmt=$(v4l2-ctl -d "$video" --get-fmt-video 2>/dev/null \
+        | awk -F"'" '/Pixel Format/{print $2; exit}')
+    [[ -z "$orig_fmt" ]] && orig_fmt=YUYV
+
+    cleanup_hdr_hw_ab() {
+        echo "$orig_fe" > /sys/module/sc0710/parameters/force_eotf 2>/dev/null || true
+        echo "$orig_bgr" > /sys/module/sc0710/parameters/hdr_bgr24 2>/dev/null || true
+        echo "$orig_hw" > /sys/module/sc0710/parameters/hw_tonemap 2>/dev/null || true
+        echo "$orig_tm" > /sys/module/sc0710/parameters/sw_tonemap 2>/dev/null || true
+        v4l2-ctl -d "$video" --set-fmt-video="pixelformat=${orig_fmt}" >/dev/null 2>&1 || true
+        sc0710_hdr_test_start_pipewire
+    }
+    trap cleanup_hdr_hw_ab EXIT
+
+    echo -e "${BLUE}::${NC} MCU HW A/B test → ${BOLD}${outdir}${NC}"
+    echo -e "   Device: ${BOLD}${video}${NC}"
+    echo -e "   Feed an ${BOLD}HDR-PQ${NC} source the whole run."
+    echo -e "   Cells: A=HW-only (0x11)  B=SW tonemap  C=raw (both off)  × YUYV + BGR24"
+    {
+        echo "sc0710 MCU hardware tonemap A/B"
+        echo "timestamp: $(date -Iseconds)"
+        echo "device: $video"
+        echo "driver: $(cat /sys/module/sc0710/version 2>/dev/null || echo unknown)"
+        echo "outdir: $outdir"
+        echo ""
+        echo "Compare PNGs:"
+        echo "  A vs C — does MCU 0x11 remapping happen?"
+        echo "  A vs B — HW baked look vs tuned software"
+        echo ""
+        echo "hdmi (at start):"
+        cat /proc/sc0710-state 2>/dev/null || true
+        echo ""
+        echo "===== dmesg (start, last 40 sc0710 lines) ====="
+        dmesg -T 2>/dev/null | grep -iE 'sc0710|hw_tonemap|HDR pipe' | tail -40 || true
+        echo ""
+    } > "$meta"
+
+    echo -e "${BLUE}::${NC} Stopping PipeWire for exclusive capture..."
+    sc0710_hdr_test_stop_pipewire
+    fuser -k "$video" >/dev/null 2>&1 || true
+    sleep 0.5
+
+    # slug|label|force_eotf|hdr_bgr24|sw_tonemap|hw_tonemap|fourcc
+    while IFS='|' read -r mode_slug mode_label fe bgr tm hw fourcc; do
+        [[ -z "$mode_slug" || "$mode_slug" == \#* ]] && continue
+        echo -e "${BLUE}::${NC} ${BOLD}${mode_slug}${NC} — ${mode_label}"
+        echo -e "   force_eotf=${fe} hdr_bgr24=${bgr} sw=${tm} hw=${hw} fmt=${fourcc}"
+        sc0710_hdr_test_apply "$fe" "$bgr" "$tm" "$fourcc" "$video" "$hw"
+
+        out="${outdir}/${mode_slug}.png"
+        dmesg_file="${outdir}/${mode_slug}.dmesg.txt"
+        state_file="${outdir}/${mode_slug}.state.txt"
+
+        {
+            echo "=== ${mode_slug} — ${mode_label} ==="
+            echo "params: force_eotf=$fe hdr_bgr24=$bgr sw_tonemap=$tm hw_tonemap=$hw fourcc=$fourcc"
+            echo "sysfs: hw=$(cat /sys/module/sc0710/parameters/hw_tonemap) sw=$(cat /sys/module/sc0710/parameters/sw_tonemap)"
+            echo ""
+            echo "----- /proc/sc0710-state -----"
+            cat /proc/sc0710-state 2>/dev/null || true
+            echo ""
+            echo "----- dmesg (hw_tonemap / HDR pipe / recent sc0710) -----"
+            dmesg -T 2>/dev/null | grep -iE 'hw_tonemap|HDR pipe|sc0710' | tail -50 || true
+        } > "$dmesg_file"
+        cp "$dmesg_file" "$state_file" 2>/dev/null || true
+
+        if sc0710_hdr_test_capture "$video" "$out"; then
+            echo -e "   ${GREEN}[OK]${NC} $(basename "$out")"
+            {
+                echo "=== ${mode_slug} — ${mode_label} ==="
+                echo "file: $(basename "$out")"
+                echo "force_eotf=$fe hdr_bgr24=$bgr sw_tonemap=$tm hw_tonemap=$hw fourcc=$fourcc"
+                v4l2-ctl -d "$video" --get-fmt-video 2>/dev/null || true
+                grep -E 'HDMI|eotf|color_deep|deliver|mode=|hw.tonemap|tonemap' /proc/sc0710-state 2>/dev/null || true
+                echo "dmesg_hw:"
+                dmesg 2>/dev/null | grep -E 'hw_tonemap MCU' | tail -3 || true
+                echo ""
+            } >> "$meta"
+        else
+            echo -e "   ${RED}[FAIL]${NC} ${mode_label}"
+            echo "=== ${mode_slug} — ${mode_label} FAILED ===" >> "$meta"
+            cat "$dmesg_file" >> "$meta"
+            rc=1
+        fi
+    done <<'EOF'
+A-hw-yuyv|A HW-only · YUYV (MCU 0x11, no SW)|0|0|0|2|YUYV
+A-hw-bgr|A HW-only · BGR24 (MCU 0x11, no SW)|0|0|0|2|BGR3
+B-sw-yuyv|B SW tonemap · YUYV (no MCU)|0|0|1|0|YUYV
+B-sw-bgr|B SW tonemap · BGR24 (no MCU)|0|0|1|0|BGR3
+C-raw-yuyv|C raw · YUYV (HW+SW off)|0|0|0|0|YUYV
+C-raw-bgr|C raw · BGR24 (HW+SW off)|0|0|0|0|BGR3
+EOF
+
+    {
+        echo ""
+        echo "===== dmesg (end, last 60 sc0710 lines) ====="
+        dmesg -T 2>/dev/null | grep -iE 'sc0710|hw_tonemap|HDR pipe' | tail -60 || true
+    } >> "$meta"
+
+    trap - EXIT
+    cleanup_hdr_hw_ab
+
+    if [[ "$DUMP_USER" != "root" ]]; then
+        chown -R "$DUMP_USER:" "$outdir" 2>/dev/null || true
+    fi
+
+    echo ""
+    if [[ "$rc" -eq 0 ]]; then
+        echo -e "${GREEN}[OK]${NC} HW A/B complete → ${BOLD}${outdir}${NC}"
+    else
+        echo -e "${YELLOW}[WARN]${NC} HW A/B finished with failures → ${BOLD}${outdir}${NC}"
+    fi
+    echo -e "   Open ${BOLD}SUMMARY.txt${NC} + the six PNGs. Tell me A vs C and A vs B per format."
+    return "$rc"
+}
+
 # --- Help Function ---
 show_help() {
     if [[ "$IS_ATOMIC" == "true" ]]; then
@@ -706,6 +1181,11 @@ show_help() {
     echo -e "    ${BOLD}-it, --image-toggle${NC} Toggle status images on/off"
     echo -e "    ${BOLD}-pt, --procedural-timings${NC} Toggle timing calculation mode (merge/procedural/static)"
     echo -e "    ${BOLD}-ec, --edid-config${NC} Open the EDID configuration GUI (4K Pro / MK.2)"
+    echo -e "    ${BOLD}-hc, --hdr-config${NC}  Open the HDR / color-depth settings GUI"
+    echo -e "    ${BOLD}-g, --gui${NC}         Open the driver manager GUI (load/unload/tools)"
+    echo -e "    ${BOLD}-ht, --hdr-toggle${NC} Cycle: tonemap preview ↔ HDR passthrough ↔ SDR-only"
+    echo -e "    ${BOLD}--hdr-test${NC}       Snapshot ~12 HDR configs to Desktop/HDR/ (incl. no-HDR baseline)"
+    echo -e "    ${BOLD}--hdr-hw-test${NC}    MCU A/B: HW vs SW vs raw × YUYV/BGR24 + dmesg → Desktop/HDR/hw-ab_*/"
     echo -e "    ${BOLD}-U, --update${NC}     Check for updates and reinstall"
     echo -e "    ${BOLD}-r, -R, --remove${NC} Completely uninstall driver and CLI (AUR: uses yay/paru)"
     echo -e "    ${BOLD}--dump${NC}           Save a debug report to the Desktop"
@@ -1092,6 +1572,41 @@ case "$1" in
         fi
         save_config
         ;;
+    -ht|--hdr-toggle)
+        if [[ ! -f /sys/module/sc0710/parameters/hdr_bgr24 ]] ||
+           [[ ! -f /sys/module/sc0710/parameters/sw_tonemap ]]; then
+            LIVE=$(cat /sys/module/sc0710/version 2>/dev/null || echo "not loaded")
+            echo -e "${RED}[ERROR]${NC} HDR controls missing (need hdr_bgr24/sw_tonemap)."
+            echo -e "  Running module: ${BOLD}${LIVE}${NC} (package tree: ${CURRENT_VERSION:-unknown})"
+            echo -e "  Reload the new build: ${BOLD}sc0710-cli --restart${NC}"
+            exit 1
+        fi
+        BGR=$(cat /sys/module/sc0710/parameters/hdr_bgr24)
+        TM=$(cat /sys/module/sc0710/parameters/sw_tonemap)
+        # tonemap preview (bgr ignored/0, tm=1) → passthrough → SDR-only → tonemap
+        if [[ "$TM" == "1" ]]; then
+            echo 1 > /sys/module/sc0710/parameters/hdr_bgr24
+            echo 0 > /sys/module/sc0710/parameters/sw_tonemap
+            echo -e "${GREEN}[OK]${NC} HDR passthrough — BGR24 + PQ/BT.2020 when HDMI is HDR (no SW tonemap)"
+        elif [[ "$BGR" == "1" && "$TM" == "0" ]]; then
+            echo 0 > /sys/module/sc0710/parameters/hdr_bgr24
+            echo 0 > /sys/module/sc0710/parameters/sw_tonemap
+            echo -e "${YELLOW}[OK]${NC} SDR-only — leave YUYV (no BGR24 prefer, no tonemap)"
+        else
+            echo 0 > /sys/module/sc0710/parameters/hdr_bgr24
+            echo 1 > /sys/module/sc0710/parameters/sw_tonemap
+            echo -e "${GREEN}[OK]${NC} Tonemap preview — host tonemap when HDMI is HDR-PQ (YUYV or BGR24)"
+        fi
+        if [[ -r /proc/sc0710-state ]]; then
+            grep -E 'HDMI|color_deep|eotf|deliver|mode=' /proc/sc0710-state 2>/dev/null || true
+        fi
+        ;;
+    --hdr-test)
+        sc0710_hdr_self_test
+        ;;
+    --hdr-hw-test)
+        sc0710_hdr_hw_ab_test
+        ;;
     -it|--image-toggle)
         if [[ ! -f /sys/module/sc0710/parameters/use_status_images ]]; then
             echo -e "${RED}[ERROR]${NC} Module not loaded. Load it first with: sc0710-cli --load"
@@ -1235,8 +1750,9 @@ case "$1" in
         fi
         sc0710_cli_remove_user_state
         rm -f /usr/local/bin/sc0710-cli
-        # EDID tooling installed alongside the CLI
-        rm -f /usr/local/bin/sc0710-edid-config /usr/local/bin/mk2-set-edid
+        # EDID / HDR tooling installed alongside the CLI
+        rm -f /usr/local/bin/sc0710-edid-config /usr/local/bin/sc0710-hdr-config \
+            /usr/local/bin/mk2-set-edid /usr/local/bin/mk2-set-tonemap
         rm -rf /usr/share/sc0710/edid
 
         if [[ -x /usr/bin/sc0710-cli ]] || \

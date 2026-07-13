@@ -1,0 +1,727 @@
+#!/usr/bin/env python3
+# sc0710-hdr-config — HDR / color-depth settings GUI for Elgato SC0710 cards.
+#
+# Launched by `sc0710-cli --hdr-config` / `-hc`. Same Qt style as
+# sc0710-edid-config (stock widgets, card selector, group boxes). Privilege
+# escalation for sysfs writes uses sudo (same ticket as sc0710-cli).
+#
+#   sc0710-hdr-config                  launch the GUI
+#   sc0710-hdr-config --status         print live HDR state
+#   sc0710-hdr-config --set k=v …      write module params (used via sudo)
+#   sc0710-hdr-config --persist k=v …  write params + /etc/modprobe.d snippet
+#
+# SPDX-License-Identifier: GPL-2.0-or-later
+
+import os
+import sys
+import glob
+import random
+import shutil
+import subprocess
+
+APP_NAME = "sc0710 HDR Configuration"
+
+CARDS = {
+    0x000e: dict(name="Elgato 4K60 Pro MK.2", short="MK.2"),
+    0x0012: dict(name="Elgato 4K Pro", short="4K Pro"),
+}
+SC0710_PCI_VENDOR = 0x12ab
+SC0710_PCI_DEVICE = 0x0710
+
+PARAM_DIR = "/sys/module/sc0710/parameters"
+PROC_STATE = "/proc/sc0710-state"
+PERSIST_FILE = "/etc/modprobe.d/sc0710-hdr.conf"
+
+# name -> (label, choices as [(value, text), ...], help)
+PARAMS = [
+    ("hw_tonemap", "HW tonemap (MCU)", [
+        (0, "Off — leave MCU tonemap disabled"),
+        (1, "Auto — MCU tonemap while HDMI HDR-PQ"),
+        (2, "Force — MCU tonemap always"),
+    ], "MK.2 onboard HDR→SDR (Windows KS prop 722 → MCU 0x32 sub 0x11). "
+       "No CPU cost. Takes priority over SW tonemap."),
+    ("hdr_bgr24", "BGR24 while HDR", [
+        (0, "Off — leave format alone / YUYV default"),
+        (1, "Auto — BGR24 while HDR (not tonemapping)"),
+        (2, "Force — BGR24 when 10-bit prefer"),
+    ], "Prefer native BGR24 4:4:4 while HDMI is HDR. Ignored while tonemapping."),
+    ("sw_tonemap", "SW tonemap (CPU)", [
+        (0, "Off — no host remap"),
+        (1, "Auto — host tonemap while HDMI HDR-PQ"),
+        (2, "Force — always host tonemap"),
+    ], "Host PQ→SDR on CPU. Ignored while HW tonemap is active."),
+    ("color_deep", "Color depth prefer", [
+        (0, "8-bit prefer"),
+        (1, "10-bit request"),
+        (2, "Auto (when HDR)"),
+    ], "MCU prefer bit (does not change DMA payload on MK.2)."),
+    ("force_eotf", "Force EOTF", [
+        (0, "Auto (status bit 0x40)"),
+        (1, "Force SDR"),
+        (2, "Force HDR-PQ"),
+        (3, "Force HLG"),
+    ], "Overrides detected EOTF for the whole HDR pipeline (not tags only)."),
+    ("force_quantization", "Force quantization", [
+        (0, "Auto"),
+        (1, "Limited (16–235)"),
+        (2, "Full (0–255)"),
+    ], "Override limited/full range tagging."),
+]
+
+# Collapsible fine-tune sections: (id, title, start_collapsed, sliders)
+# Each slider: (name, label, min, max, default, suffix, help)
+SLIDER_SECTIONS = [
+    ("bgr", "4:4:4 software tonemap (BGR24)", True, [
+        ("tm_bgr_target", "Reinhard T×100", 10, 80, 50, "",
+         "Default 50. Raise = brighter midtones. "
+         "T=58 + paper 203 uses the baked gold curve."),
+        ("tm_bgr_paper", "Paper white", 50, 400, 400, " nits",
+         "Default 400 nits. Raise = darker highlights. "
+         "203 + T=58 uses the baked gold curve."),
+        ("tm_bgr_gain", "Post RGB gain", 50, 150, 150, "%",
+         "Default 150%. Gain after the curve."),
+        ("tm_bgr_chroma", "Saturation", 0, 300, 150, "%",
+         "Default 150%. 100 = unity; raise toward 300 for punchier color."),
+    ]),
+    ("yuyv", "4:2:0 software tonemap (YUYV)", True, [
+        ("tm_yuyv_target", "Reinhard T×100", 10, 80, 80, "",
+         "Shoulder strength T×100 (80 default). Raise = brighter midtones."),
+        ("tm_paper_nits", "Paper white", 50, 400, 225, " nits",
+         "Paper-white reference (225 default). Raise = darker highlights."),
+        ("tm_yuyv_gain", "Post Y gain", 50, 150, 100, "%",
+         "Gain after the curve (100 = unity)."),
+        ("tm_yuyv_chroma", "Saturation", 0, 300, 300, "%",
+         "Default 300%. 100 = unity UV."),
+    ]),
+]
+
+SLIDERS = [s for _id, _t, _c, slides in SLIDER_SECTIONS for s in slides]
+
+PRESETS = [
+    ("hw-tonemap", "Hardware tonemap (MCU)",
+     {"hw_tonemap": 1, "sw_tonemap": 0, "hdr_bgr24": 0},
+     "Card-side HDR→SDR (no CPU). Preferred on MK.2 — matches Windows prop 722."),
+    ("sw-tonemap", "Software tonemap (CPU)",
+     {"hw_tonemap": 0, "sw_tonemap": 1, "hdr_bgr24": 0},
+     "Host PQ→SDR preview (burns CPU). Fallback if HW looks wrong."),
+    ("passthrough", "HDR passthrough",
+     {"hw_tonemap": 0, "sw_tonemap": 0, "hdr_bgr24": 1},
+     "BGR24 + BT.2020/PQ tags when HDMI is HDR (no tonemap)."),
+    ("sdr", "SDR-only",
+     {"hw_tonemap": 0, "sw_tonemap": 0, "hdr_bgr24": 0},
+     "YUYV default — no BGR24 prefer, no tonemap."),
+]
+
+
+def _sysread(path):
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
+def module_loaded():
+    try:
+        with open("/proc/modules") as f:
+            return any(line.startswith("sc0710 ") for line in f)
+    except OSError:
+        return False
+
+
+def detect_cards():
+    out = []
+    for vd in sorted(glob.glob("/sys/class/video4linux/video*")):
+        dev = "/dev/" + os.path.basename(vd)
+        node_name = _sysread(vd + "/name")
+        pci = os.path.basename(os.path.realpath(vd + "/device"))
+        base = f"/sys/bus/pci/devices/{pci}"
+        if not os.path.isdir(base):
+            continue
+        try:
+            vendor = int(_sysread(base + "/vendor"), 16)
+            device = int(_sysread(base + "/device"), 16)
+            subdev = int(_sysread(base + "/subsystem_device"), 16)
+        except ValueError:
+            continue
+        if vendor != SC0710_PCI_VENDOR or device != SC0710_PCI_DEVICE:
+            continue
+        info = CARDS.get(subdev, dict(
+            name=node_name or "SC0710 capture card", short="SC0710"))
+        out.append(dict(dev=dev, pci=pci, node_name=node_name, subdev=subdev,
+                        **info))
+    return out
+
+
+def read_param(name):
+    raw = _sysread(os.path.join(PARAM_DIR, name))
+    if raw == "":
+        return None
+    try:
+        return int(raw.split()[0])
+    except ValueError:
+        return raw
+
+
+def known_param_names():
+    return {p[0] for p in PARAMS} | {s[0] for s in SLIDERS}
+
+
+def read_all_params():
+    out = {name: read_param(name) for name, *_ in PARAMS}
+    for name, *_ in SLIDERS:
+        out[name] = read_param(name)
+    return out
+
+
+def write_param_direct(name, value):
+    path = os.path.join(PARAM_DIR, name)
+    with open(path, "w") as f:
+        f.write(f"{value}\n")
+
+
+def write_params_direct(mapping):
+    for k, v in mapping.items():
+        write_param_direct(k, v)
+
+
+def write_persist_file(mapping):
+    lines = [
+        "# Written by sc0710-hdr-config — HDR / color module options",
+        "options sc0710 "
+        + " ".join(f"{k}={v}" for k, v in sorted(mapping.items())),
+        "",
+    ]
+    with open(PERSIST_FILE, "w") as f:
+        f.write("\n".join(lines))
+
+
+def privileged_set(mapping, persist=False):
+    """Apply mapping; escalate via sudo if needed (reuses sc0710-cli ticket)."""
+    try:
+        write_params_direct(mapping)
+        if persist:
+            write_persist_file({**read_all_params(), **{
+                k: int(v) for k, v in mapping.items()}})
+        return True, "Applied."
+    except PermissionError:
+        pass
+    except OSError as e:
+        return False, str(e)
+
+    if not shutil.which("sudo"):
+        return False, ("Permission denied and sudo is unavailable. "
+                       "Run as root or via sc0710-cli --hdr-config.")
+
+    self_path = os.path.realpath(__file__)
+    args = [sys.executable, self_path,
+            "--persist" if persist else "--set",
+            *[f"{k}={v}" for k, v in mapping.items()]]
+
+    # Prefer non-interactive sudo (ticket already primed by sc0710-cli).
+    p = subprocess.run(["sudo", "-n", *args], capture_output=True, text=True)
+    if p.returncode != 0:
+        # Ticket missing/expired — ask once, then retry.
+        if subprocess.run(["sudo", "-v"]).returncode != 0:
+            err = (p.stderr or p.stdout or "").strip() or "sudo authentication failed"
+            return False, err
+        p = subprocess.run(["sudo", "-n", *args], capture_output=True, text=True)
+    if p.returncode == 0:
+        return True, ("Applied."
+                      + (" Persisted for next boot." if persist else ""))
+    err = (p.stderr or p.stdout or "").strip() or f"sudo exited {p.returncode}"
+    return False, err
+
+
+def live_status_text():
+    parts = []
+    if not module_loaded():
+        return "Driver not loaded."
+    ver = _sysread("/sys/module/sc0710/version")
+    if ver:
+        parts.append(f"Driver {ver}")
+    params = read_all_params()
+    if params.get("hw_tonemap") in (1, 2):
+        parts.append("mode: hardware tonemap (MCU)")
+    elif params.get("sw_tonemap") == 1:
+        parts.append("mode: software tonemap (CPU)")
+    elif params.get("hdr_bgr24") == 1 and params.get("sw_tonemap") == 0:
+        parts.append("mode: HDR passthrough")
+    elif params.get("hdr_bgr24") == 0 and params.get("sw_tonemap") == 0:
+        parts.append("mode: SDR-only")
+    else:
+        parts.append(
+            f"mode: custom (hw={params.get('hw_tonemap')} "
+            f"sw={params.get('sw_tonemap')} "
+            f"bgr={params.get('hdr_bgr24')})")
+    state = _sysread(PROC_STATE)
+    if state:
+        for key in ("HDMI:", "colorimetry:", "colorspace:", "color_deep:"):
+            for line in state.splitlines():
+                if key in line:
+                    parts.append(line.strip())
+                    break
+    return "\n".join(parts) if parts else "No status available."
+
+
+def cli_main(argv):
+    if not argv:
+        return 1
+    if argv[0] == "--status":
+        print(live_status_text())
+        for name, *_ in PARAMS:
+            print(f"  {name}={read_param(name)}")
+        for name, *_ in SLIDERS:
+            print(f"  {name}={read_param(name)}")
+        return 0 if module_loaded() else 1
+    if argv[0] in ("--set", "--persist"):
+        persist = argv[0] == "--persist"
+        mapping = {}
+        known = known_param_names()
+        for arg in argv[1:]:
+            if "=" not in arg:
+                sys.stderr.write(f"bad arg: {arg}\n")
+                return 2
+            k, v = arg.split("=", 1)
+            if k not in known:
+                sys.stderr.write(f"unknown param: {k}\n")
+                return 2
+            mapping[k] = int(v)
+        if not mapping:
+            sys.stderr.write("no key=value pairs\n")
+            return 2
+        if not module_loaded():
+            sys.stderr.write("sc0710 module not loaded\n")
+            return 1
+        try:
+            write_params_direct(mapping)
+            if persist:
+                cur = read_all_params()
+                cur.update(mapping)
+                write_persist_file({k: int(v) for k, v in cur.items()
+                                   if v is not None})
+        except OSError as e:
+            sys.stderr.write(f"{e}\n")
+            return 1
+        print("ok")
+        return 0
+    sys.stderr.write(f"unknown option: {argv[0]}\n")
+    return 2
+
+
+def _import_qt():
+    try:
+        import PySide6.QtCore as C
+        import PySide6.QtWidgets as W
+        import PySide6.QtGui as G
+        return dict(C=C, W=W, G=G, Signal=C.Signal, binding="PySide6")
+    except ImportError:
+        import PyQt6.QtCore as C
+        import PyQt6.QtWidgets as W
+        import PyQt6.QtGui as G
+        return dict(C=C, W=W, G=G, Signal=C.pyqtSignal, binding="PyQt6")
+
+
+def gui_main():
+    try:
+        qt = _import_qt()
+    except ImportError:
+        sys.stderr.write(
+            "sc0710-hdr-config: a Qt binding is required for the GUI.\n"
+            "Install one of:\n"
+            "  Arch:    sudo pacman -S pyside6\n"
+            "  Fedora:  sudo dnf install python3-pyside6\n"
+            "  Debian:  sudo apt install python3-pyside6\n"
+            "  (or)     pip install --user PySide6\n")
+        return 3
+    return _run_gui(qt)
+
+
+def _run_gui(qt):
+    C, W, G = qt["C"], qt["W"], qt["G"]
+    Qt = C.Qt
+
+    class Main(W.QMainWindow):
+        def __init__(self):
+            super().__init__()
+            self.setWindowTitle(APP_NAME)
+            self.resize(760, 860)
+            self.cards = []
+            self.card = None
+            self._combos = {}
+            self._sliders = {}
+            self._build()
+            self.refresh_cards()
+            self.reload_from_sysfs()
+            self._timer = C.QTimer(self)
+            self._timer.timeout.connect(self.refresh_live)
+            self._timer.start(2000)
+
+        def _build(self):
+            central = W.QWidget()
+            self.setCentralWidget(central)
+            root = W.QVBoxLayout(central)
+
+            hdr = W.QHBoxLayout()
+            hdr.addWidget(W.QLabel("<b>Card:</b>"))
+            self.card_box = W.QComboBox()
+            self.card_box.setMinimumWidth(280)
+            self.card_box.currentIndexChanged.connect(self._card_changed)
+            hdr.addWidget(self.card_box)
+            self.rescan_btn = W.QPushButton("Rescan")
+            self.rescan_btn.clicked.connect(self.refresh_cards)
+            hdr.addWidget(self.rescan_btn)
+            hdr.addStretch(1)
+            self.card_status = W.QLabel()
+            hdr.addWidget(self.card_status)
+            root.addLayout(hdr)
+
+            live = W.QGroupBox("Live signal / pipe")
+            lv = W.QVBoxLayout(live)
+            self.live_label = W.QLabel("—")
+            self.live_label.setWordWrap(True)
+            f = self.live_label.font()
+            f.setFamily("monospace")
+            self.live_label.setFont(f)
+            lv.addWidget(self.live_label)
+            root.addWidget(live)
+
+            preset_box = W.QGroupBox("Quick modes")
+            pl = W.QVBoxLayout(preset_box)
+            self.preset_group = W.QButtonGroup(self)
+            for i, (_key, title, _vals, tip) in enumerate(PRESETS):
+                rb = W.QRadioButton(title)
+                rb.setToolTip(tip)
+                self.preset_group.addButton(rb, i)
+                pl.addWidget(rb)
+                tip_l = W.QLabel(f"<span style='color:#666'>{tip}</span>")
+                tip_l.setWordWrap(True)
+                tip_l.setContentsMargins(22, 0, 0, 6)
+                pl.addWidget(tip_l)
+            self.preset_group.buttonClicked.connect(self._preset_clicked)
+            root.addWidget(preset_box)
+
+            adv = W.QGroupBox("Advanced parameters")
+            form = W.QFormLayout(adv)
+            for name, label, choices, tip in PARAMS:
+                cb = W.QComboBox()
+                for val, text in choices:
+                    cb.addItem(text, val)
+                cb.setToolTip(tip)
+                self._combos[name] = cb
+                cb.currentIndexChanged.connect(self._manual_tweak)
+                form.addRow(f"{label}:", cb)
+            root.addWidget(adv)
+
+            self._section_slider_names = {}
+            self._collapse_btns = []
+            for sec_id, title, start_collapsed, slides in SLIDER_SECTIONS:
+                box, names = self._build_slider_section(
+                    W, Qt, sec_id, title, start_collapsed, slides)
+                self._section_slider_names[sec_id] = names
+                root.addWidget(box)
+
+            act = W.QHBoxLayout()
+            self.apply_btn = W.QPushButton("Apply")
+            self.apply_btn.setMinimumHeight(36)
+            self.apply_btn.clicked.connect(lambda: self.apply(persist=False))
+            act.addWidget(self.apply_btn, 2)
+            self.persist_btn = W.QPushButton("Apply + save for reboot")
+            self.persist_btn.setMinimumHeight(36)
+            self.persist_btn.clicked.connect(lambda: self.apply(persist=True))
+            act.addWidget(self.persist_btn, 2)
+            self.reset_all_btn = W.QPushButton("Reset all")
+            self.reset_all_btn.setToolTip(
+                "Restore every tonemap slider to built-in defaults and Apply.")
+            self.reset_all_btn.clicked.connect(self.reset_slider_defaults)
+            act.addWidget(self.reset_all_btn, 1)
+            self.reload_btn = W.QPushButton("Reload")
+            self.reload_btn.clicked.connect(self.reload_from_sysfs)
+            act.addWidget(self.reload_btn, 1)
+            root.addLayout(act)
+
+            self.status = self.statusBar()
+            # Keep enable refs for refresh_cards (per-section buttons).
+            self.reset_sliders_btn = getattr(self, "_any_reset_btn", None)
+            self.randomize_btn = getattr(self, "_any_rand_btn", None)
+
+        def _build_slider_section(self, W, Qt, sec_id, title, start_collapsed,
+                                  slides):
+            """Collapsible section with disclosure button + slider form."""
+            wrap = W.QWidget()
+            outer = W.QVBoxLayout(wrap)
+            outer.setContentsMargins(0, 0, 0, 0)
+            outer.setSpacing(2)
+
+            header = W.QToolButton()
+            header.setText(title)
+            header.setCheckable(True)
+            header.setChecked(not start_collapsed)
+            header.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+            header.setArrowType(
+                Qt.ArrowType.DownArrow if not start_collapsed
+                else Qt.ArrowType.RightArrow)
+            header.setStyleSheet(
+                "QToolButton { border: none; font-weight: 600; text-align: left; }")
+            header.setSizePolicy(W.QSizePolicy.Policy.Expanding,
+                                 W.QSizePolicy.Policy.Fixed)
+            outer.addWidget(header)
+
+            body = W.QWidget()
+            body_l = W.QVBoxLayout(body)
+            body_l.setContentsMargins(12, 0, 0, 6)
+            form = W.QFormLayout()
+            names = []
+            for name, label, lo, hi, default, suffix, tip in slides:
+                row = W.QWidget()
+                hl = W.QHBoxLayout(row)
+                hl.setContentsMargins(0, 0, 0, 0)
+                sl = W.QSlider(Qt.Orientation.Horizontal)
+                sl.setRange(lo, hi)
+                sl.setValue(default)
+                sl.setToolTip(tip)
+                spin = W.QSpinBox()
+                spin.setRange(lo, hi)
+                spin.setValue(default)
+                if suffix:
+                    spin.setSuffix(suffix)
+                spin.setFixedWidth(90)
+                spin.setToolTip(tip)
+                sl.valueChanged.connect(spin.setValue)
+                spin.valueChanged.connect(sl.setValue)
+                sl.valueChanged.connect(self._manual_tweak)
+                hl.addWidget(sl, 1)
+                hl.addWidget(spin)
+                self._sliders[name] = (sl, spin)
+                names.append(name)
+                form.addRow(f"{label}:", row)
+            body_l.addLayout(form)
+
+            btns = W.QHBoxLayout()
+            reset_btn = W.QPushButton("Reset defaults")
+            reset_btn.setToolTip(f"Restore {title} defaults and Apply.")
+            reset_btn.clicked.connect(
+                lambda _=False, sid=sec_id: self.reset_section_defaults(sid))
+            btns.addWidget(reset_btn)
+            rand_btn = W.QPushButton("Randomize + Apply")
+            rand_btn.setToolTip(
+                f"Randomize {title} sliders and Apply immediately.")
+            rand_btn.clicked.connect(
+                lambda _=False, sid=sec_id: self.randomize_section(sid))
+            btns.addWidget(rand_btn)
+            btns.addStretch(1)
+            body_l.addLayout(btns)
+            outer.addWidget(body)
+
+            def _toggle(checked, b=body, h=header):
+                b.setVisible(checked)
+                h.setArrowType(
+                    Qt.ArrowType.DownArrow if checked
+                    else Qt.ArrowType.RightArrow)
+
+            header.toggled.connect(_toggle)
+            body.setVisible(not start_collapsed)
+            self._collapse_btns.append(header)
+            # Remember one pair for enable/disable with module load state.
+            self._any_reset_btn = reset_btn
+            self._any_rand_btn = rand_btn
+            if not hasattr(self, "_section_btns"):
+                self._section_btns = []
+            self._section_btns.append((reset_btn, rand_btn))
+            return wrap, names
+
+        def refresh_cards(self):
+            self.cards = detect_cards()
+            self.card_box.blockSignals(True)
+            self.card_box.clear()
+            for c in self.cards:
+                self.card_box.addItem(f"{c['name']}  ({c['dev']})")
+            self.card_box.blockSignals(False)
+            loaded = module_loaded()
+            if self.cards:
+                self.card_box.setCurrentIndex(0)
+                self._card_changed(0)
+                self.card_status.setText(
+                    "<span style='color:#2a2'>● detected</span>")
+            else:
+                self.card = None
+                if loaded:
+                    self.card_status.setText(
+                        "<span style='color:#c82'>● driver loaded, "
+                        "no video node</span>")
+                else:
+                    self.card_status.setText(
+                        "<span style='color:#c22'>● no card — is the "
+                        "driver loaded?</span>")
+            self.apply_btn.setEnabled(loaded)
+            self.persist_btn.setEnabled(loaded)
+            self.reset_all_btn.setEnabled(loaded)
+            for reset_btn, rand_btn in getattr(self, "_section_btns", []):
+                reset_btn.setEnabled(loaded)
+                rand_btn.setEnabled(loaded)
+            self.refresh_live()
+        def _card_changed(self, idx):
+            if 0 <= idx < len(self.cards):
+                self.card = self.cards[idx]
+            self.refresh_live()
+
+        def refresh_live(self):
+            self.live_label.setText(live_status_text())
+
+        def reload_from_sysfs(self):
+            if not module_loaded():
+                self.status.showMessage("Driver not loaded", 4000)
+                self.refresh_live()
+                return
+            params = read_all_params()
+            for name, cb in self._combos.items():
+                val = params.get(name)
+                if val is None:
+                    continue
+                idx = cb.findData(val)
+                if idx < 0:
+                    idx = 0
+                cb.blockSignals(True)
+                cb.setCurrentIndex(idx)
+                cb.blockSignals(False)
+            for name, (sl, spin) in self._sliders.items():
+                val = params.get(name)
+                if val is None:
+                    continue
+                try:
+                    val = int(val)
+                except (TypeError, ValueError):
+                    continue
+                sl.blockSignals(True)
+                spin.blockSignals(True)
+                sl.setValue(val)
+                spin.setValue(val)
+                sl.blockSignals(False)
+                spin.blockSignals(False)
+            self._sync_preset_radios(params)
+            self.refresh_live()
+            self.status.showMessage("Reloaded from driver", 3000)
+
+        def _sync_preset_radios(self, params):
+            match = None
+            for i, (_key, _title, vals, _tip) in enumerate(PRESETS):
+                if all(params.get(k) == v for k, v in vals.items()):
+                    match = i
+                    break
+            for btn in self.preset_group.buttons():
+                btn.blockSignals(True)
+                btn.setChecked(self.preset_group.id(btn) == match)
+                btn.blockSignals(False)
+
+        def _preset_clicked(self, btn):
+            i = self.preset_group.id(btn)
+            if i < 0:
+                return
+            vals = PRESETS[i][2]
+            for k, v in vals.items():
+                cb = self._combos[k]
+                idx = cb.findData(v)
+                if idx >= 0:
+                    cb.blockSignals(True)
+                    cb.setCurrentIndex(idx)
+                    cb.blockSignals(False)
+
+        def _manual_tweak(self, *_a):
+            # Uncheck presets when the user edits combos/sliders directly.
+            params = {n: self._combos[n].currentData() for n in self._combos}
+            self._sync_preset_radios(params)
+
+        def _set_slider_values(self, values):
+            for name, (sl, spin) in self._sliders.items():
+                if name not in values:
+                    continue
+                val = int(values[name])
+                sl.blockSignals(True)
+                spin.blockSignals(True)
+                sl.setValue(val)
+                spin.setValue(val)
+                sl.blockSignals(False)
+                spin.blockSignals(False)
+            self._manual_tweak()
+
+        def _section_defaults(self, sec_id):
+            for sid, _t, _c, slides in SLIDER_SECTIONS:
+                if sid == sec_id:
+                    return {name: default
+                            for name, _l, _lo, _hi, default, *_ in slides}
+            return {}
+
+        def _section_slides(self, sec_id):
+            for sid, _t, _c, slides in SLIDER_SECTIONS:
+                if sid == sec_id:
+                    return slides
+            return []
+
+        def reset_section_defaults(self, sec_id):
+            vals = self._section_defaults(sec_id)
+            summary = " ".join(f"{k}={v}" for k, v in vals.items())
+            self._set_slider_values(vals)
+            self.apply(persist=False, status_prefix=f"Defaults[{sec_id}]: {summary}")
+
+        def randomize_section(self, sec_id):
+            vals = {}
+            for name, _l, lo, hi, _default, *_ in self._section_slides(sec_id):
+                vals[name] = random.randint(lo, hi)
+            summary = " ".join(f"{k}={v}" for k, v in vals.items())
+            self._set_slider_values(vals)
+            self.apply(persist=False, status_prefix=f"Random[{sec_id}]: {summary}")
+
+        def reset_slider_defaults(self):
+            # Reset every section (kept for compatibility).
+            vals = {name: default for name, _l, _lo, _hi, default, *_ in SLIDERS}
+            summary = " ".join(f"{k}={v}" for k, v in vals.items())
+            self._set_slider_values(vals)
+            self.apply(persist=False, status_prefix=f"Defaults: {summary}")
+
+        def randomize_sliders(self):
+            vals = {}
+            for name, _l, lo, hi, _default, *_ in SLIDERS:
+                vals[name] = random.randint(lo, hi)
+            summary = " ".join(f"{k}={v}" for k, v in vals.items())
+            self._set_slider_values(vals)
+            self.apply(persist=False, status_prefix=f"Random: {summary}")
+
+        def _current_mapping(self):
+            out = {n: int(self._combos[n].currentData()) for n in self._combos}
+            for name, (_sl, spin) in self._sliders.items():
+                out[name] = int(spin.value())
+            return out
+
+        def apply(self, persist=False, status_prefix=None):
+            if not module_loaded():
+                W.QMessageBox.warning(
+                    self, "Not loaded",
+                    "The sc0710 module is not loaded.\n"
+                    "Run: sc0710-cli --load")
+                return
+            mapping = self._current_mapping()
+            ok, msg = privileged_set(mapping, persist=persist)
+            if ok:
+                if status_prefix:
+                    self.status.showMessage(f"{status_prefix} — {msg}", 12000)
+                    C.QTimer.singleShot(400, self.refresh_live)
+                else:
+                    self.status.showMessage(msg, 6000)
+                    C.QTimer.singleShot(400, self.reload_from_sysfs)
+            else:
+                W.QMessageBox.warning(self, "Apply failed", msg)
+
+    app = W.QApplication(sys.argv)
+    win = Main()
+    win.show()
+    return app.exec()
+
+
+def main():
+    if len(sys.argv) > 1 and sys.argv[1].startswith("--"):
+        return cli_main(sys.argv[1:])
+    return gui_main()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -523,7 +523,16 @@ out_unlock:
 	mutex_unlock(&dev->kthread_dma_lock);
 }
 
-
+/* Map MCU HDMI hint byte to EOTF. Bit 0x40 is a provisional PQ hint until a
+ * full DRM InfoFrame parse exists; gate it on BT.2020 so BT.709 SDR paths are
+ * not misclassified when 0x40 is set spuriously. */
+static enum sc0710_eotf_e sc0710_eotf_from_hdmi(u8 hint_flags,
+	enum sc0710_colorimetry_e colorimetry)
+{
+	if ((hint_flags & 0x40) && colorimetry == BT_2020)
+		return EOTF_HDR_PQ;
+	return EOTF_SDR;
+}
 
 int sc0710_i2c_read_hdmi_status(struct sc0710_dev *dev)
 {
@@ -611,14 +620,14 @@ int sc0710_i2c_read_hdmi_status(struct sc0710_dev *dev)
 		default:  dev->colorimetry = BT_UNDEFINED;
 		}
 
+		dev->eotf = sc0710_eotf_from_hdmi(rbuf[0x0d], dev->colorimetry);
+
 		switch (rbuf[0x0f]) {
 		case 0x0: dev->colorspace = CS_YUV_YCRCB_422_420; break;
 		case 0x1: dev->colorspace = CS_YUV_YCRCB_444;     break;
 		case 0x2: dev->colorspace = CS_RGB_444;            break;
 		default:  dev->colorspace = CS_UNDEFINED;
 		}
-
-		dev->eotf = EOTF_SDR;
 
 		new_pixelLineV = rbuf[0x05] << 8 | rbuf[0x04];
 		new_pixelLineH = rbuf[0x07] << 8 | rbuf[0x06];
@@ -686,6 +695,22 @@ int sc0710_i2c_read_hdmi_status(struct sc0710_dev *dev)
 		dev->last_hint_flags = rbuf[0x0d];
 		if (dev->fmt)
 			dev->last_fmt = dev->fmt;
+
+		/* HDR metadata can flip without a resolution change; catch it. */
+		{
+			u8 want_bgr = sc0710_prefer_hdr_bgr24(dev) ? 1 : 0;
+			u8 want_tm = sc0710_want_sw_tonemap(dev) ? 1 : 0;
+			u8 want_hw = sc0710_want_hw_tonemap(dev) ? 1 : 0;
+
+			if (dev->hdr_pipe_bgr24 != want_bgr ||
+			    dev->hdr_pipe_tonemap != want_tm ||
+			    dev->hdr_pipe_hw_tonemap != want_hw) {
+				mutex_unlock(&dev->signalMutex);
+				sc0710_i2c_apply_color_deep(dev);
+				sc0710_sync_hdr_deliver_ex(dev, false);
+				return 0;
+			}
+		}
 
 	} else {
 		/* Clear any pending debounce — signal is gone */
@@ -902,6 +927,10 @@ confirmed_timing_change:
 	}
 
 	mutex_unlock(&dev->signalMutex);
+
+	/* AUTO color_deep / HDR deliver may flip with metadata on this commit. */
+	sc0710_i2c_apply_color_deep(dev);
+	sc0710_sync_hdr_deliver_ex(dev, true);
 
 	for (i = 0; i < SC0710_MAX_CHANNELS; i++) {
 		struct sc0710_dma_channel *vch = &dev->channel[i];
@@ -1710,6 +1739,409 @@ static int sc0710_mk2_write_edid(struct sc0710_dev *dev, const u8 *edid, int len
 	return 0;
 }
 
+/* MK.2 HDR→SDR tonemap write, transcribed from UpdateHDRToneMappingData()
+ * in SC0710.X64.SYS (@0x140257398). Same BEGIN/STREAM/COMMIT framing as
+ * EDID fn 0x59, retargeted to fn 0x63 with a 1024-byte payload (64 × 16-byte
+ * writes) on the safe I2C_DEV__MCU_FN (0x33) port.
+ *
+ * Payload is 512 little-endian uint16 samples (KS prop 0x2d3, MinData=0x400).
+ * Exact curve still under RE — empirical all-0x01 looks like passthrough;
+ * flat u16=1 crushes to black. Never stream without the receive-mode ack. */
+static int sc0710_mk2_write_hdr_tonemap(struct sc0710_dev *dev, const u8 *lut, int len)
+{
+	static const u8 begin_ack[3] = { 0x51, 0x10, 0x30 };
+	static const u8 end_ack[3]   = { 0x51, 0x10, 0x31 };
+	u8 begin[5]  = { 0xab, 0x03, 0x12, 0x34, 0x63 };
+	u8 commit[5] = { 0xab, 0x03, 0xcc, 0x34, 0x63 };
+	unsigned long timeout;
+	u8 ack[3];
+	int off, rc, ready = 0;
+
+	if (WARN_ON_ONCE(dev->board != SC0710_BOARD_ELGATEO_4KP60_MK2))
+		return -ENODEV;
+	if (len != 1024)
+		return -EINVAL;
+
+	rc = sc0710_i2c_write(dev, I2C_DEV__MCU_FN, begin, sizeof(begin));
+	if (rc < 0)
+		return rc;
+	printk(KERN_INFO "%s: MK2 HDR tonemap write: fn 0x63 begin\n", dev->name);
+
+	timeout = jiffies + msecs_to_jiffies(5500);
+	for (;;) {
+		msleep(100);
+		memset(ack, 0, sizeof(ack));
+		rc = __sc0710_i2c_read(dev, I2C_DEV__MCU_FN, ack, sizeof(ack));
+		if (rc == 0 && memcmp(ack, begin_ack, sizeof(ack)) == 0) {
+			ready = 1;
+			break;
+		}
+		if (time_after(jiffies, timeout))
+			break;
+	}
+	if (!ready) {
+		printk(KERN_ERR "%s: MK2 HDR tonemap write: MCU never entered receive mode (last %3ph); NOT streaming\n",
+			dev->name, ack);
+		return -EIO;
+	}
+
+	msleep(10);
+	for (off = 0; off < len; off += 16) {
+		rc = sc0710_i2c_write(dev, I2C_DEV__MCU_FN, (u8 *)lut + off, 16);
+		if (rc < 0) {
+			printk(KERN_ERR "%s: MK2 HDR tonemap write: chunk at %d failed (%d)\n",
+				dev->name, off, rc);
+			return rc;
+		}
+		msleep(10);
+	}
+
+	msleep(300);
+	sc0710_i2c_write(dev, I2C_DEV__MCU_FN, commit, sizeof(commit));
+	timeout = jiffies + msecs_to_jiffies(2500);
+	for (;;) {
+		msleep(50);
+		memset(ack, 0, sizeof(ack));
+		rc = __sc0710_i2c_read(dev, I2C_DEV__MCU_FN, ack, sizeof(ack));
+		if (rc == 0 && memcmp(ack, end_ack, sizeof(ack)) == 0) {
+			printk(KERN_INFO "%s: MK2 HDR tonemap write: committed (fn 0x63)\n",
+				dev->name);
+			/* Windows UpdateHDRToneMappingData finishes with fn 0x58
+			 * (same trailing identify/apply as UpdateEDID). Best-effort. */
+			{
+				u8 apply[5] = { 0xab, 0x03, 0x12, 0x34, 0x58 };
+
+				msleep(50);
+				sc0710_i2c_write(dev, I2C_DEV__MCU_FN, apply, sizeof(apply));
+			}
+			return 0;
+		}
+		if (time_after(jiffies, timeout))
+			break;
+	}
+	printk(KERN_WARNING "%s: MK2 HDR tonemap write: streamed, commit ack not seen (last %3ph)\n",
+		dev->name, ack);
+	return 0;
+}
+
+int sc0710_i2c_set_hdr_tonemap(struct sc0710_dev *dev, const u8 *lut, int len)
+{
+	int ret;
+
+	if (dev->board != SC0710_BOARD_ELGATEO_4KP60_MK2)
+		return -ENODEV;
+	if (!lut || len != 1024)
+		return -EINVAL;
+
+	mutex_lock(&dev->signalMutex);
+	ret = sc0710_mk2_write_hdr_tonemap(dev, lut, len);
+	mutex_unlock(&dev->signalMutex);
+	return ret;
+}
+
+/*
+ * Windows XET_HDMI_HDR_TO_SDR (KS prop 722): write MCU 7-bit addr 0x32
+ * subaddress 0x11 = 0 (passthrough) or 1 (onboard HDR→SDR). The card uses a
+ * firmware-baked curve — this is NOT the optional 1024-byte fn 0x63 LUT.
+ */
+int sc0710_i2c_apply_hw_tonemap(struct sc0710_dev *dev, int enable)
+{
+	u8 wbuf[2];
+	int ret;
+
+	if (!dev)
+		return -EINVAL;
+	if (dev->board != SC0710_BOARD_ELGATEO_4KP60_MK2)
+		return -ENODEV;
+
+	wbuf[0] = 0x11;
+	wbuf[1] = enable ? 1 : 0;
+
+	mutex_lock(&dev->signalMutex);
+	ret = sc0710_i2c_write(dev, I2C_DEV__ARM_MCU, wbuf, sizeof(wbuf));
+	mutex_unlock(&dev->signalMutex);
+	if (ret < 0) {
+		printk(KERN_WARNING "%s: hw_tonemap MCU 0x11=%u failed (%d)\n",
+		       dev->name, wbuf[1], ret);
+		return ret;
+	}
+	printk(KERN_INFO "%s: hw_tonemap MCU 0x11=%u (%s)\n",
+	       dev->name, wbuf[1], enable ? "on" : "off");
+	return 0;
+}
+
+enum sc0710_eotf_e sc0710_effective_eotf(struct sc0710_dev *dev)
+{
+	switch (force_eotf) {
+	case 1: return EOTF_SDR;
+	case 2: return EOTF_HDR_PQ;
+	case 3: return EOTF_HDR_HLG;
+	default:
+		return dev ? dev->eotf : EOTF_UNKNOWN;
+	}
+}
+
+bool sc0710_hdmi_is_hdr(struct sc0710_dev *dev)
+{
+	enum sc0710_eotf_e e = sc0710_effective_eotf(dev);
+
+	return e == EOTF_HDR_PQ || e == EOTF_HDR_HLG;
+}
+
+bool sc0710_want_10bit(struct sc0710_dev *dev)
+{
+	if (!dev)
+		return false;
+	if (dev->color_deep == 1)
+		return true;
+	if (dev->color_deep == 0)
+		return false;
+	/* AUTO: 10-bit prefer when HDR (not merely BT.2020 SDR). */
+	return sc0710_hdmi_is_hdr(dev);
+}
+
+bool sc0710_want_hw_tonemap(struct sc0710_dev *dev)
+{
+	enum sc0710_eotf_e e;
+
+	if (hw_tonemap == 2)
+		return true;
+	if (hw_tonemap != 1 || !dev)
+		return false;
+	if (dev->board != SC0710_BOARD_ELGATEO_4KP60_MK2)
+		return false;
+	/* PQ only — same gate as host tonemap. */
+	e = sc0710_effective_eotf(dev);
+	return e == EOTF_HDR_PQ;
+}
+
+bool sc0710_want_sw_tonemap(struct sc0710_dev *dev)
+{
+	enum sc0710_eotf_e e;
+
+	/* MCU owns the map — do not also burn CPU. */
+	if (sc0710_want_hw_tonemap(dev))
+		return false;
+	if (sw_tonemap == 2)
+		return true;
+	if (sw_tonemap != 1 || !dev)
+		return false;
+	/* PQ LUT only — do not apply it to HLG. */
+	e = sc0710_effective_eotf(dev);
+	return e == EOTF_HDR_PQ;
+}
+
+bool sc0710_prefer_hdr_bgr24(struct sc0710_dev *dev)
+{
+	if (!hdr_bgr24)
+		return false;
+	/* Tonemapped frames are SDR — do not flip to HDR-tagged BGR24. */
+	if (sc0710_want_hw_tonemap(dev) || sc0710_want_sw_tonemap(dev))
+		return false;
+	/* 2 = force whenever color_deep wants 10-bit; 1 = only while HDMI HDR. */
+	if (hdr_bgr24 >= 2)
+		return sc0710_want_10bit(dev);
+	return sc0710_hdmi_is_hdr(dev);
+}
+
+void sc0710_sync_hdr_deliver(struct sc0710_dev *dev)
+{
+	sc0710_sync_hdr_deliver_ex(dev, false);
+}
+
+/* Update preferred FourCC / HDR tags and notify clients when deliver or
+ * tonemap flips. Modes while HDMI is HDR-PQ:
+ *   hw/sw tonemap on → keep format + SDR tags
+ *   tonemap off → BGR24 + BT.2020/PQ tags when hdr_bgr24 prefers 4:4:4
+ *
+ * When capture is active, any pipeline-affecting change must run the same
+ * stop → resize → program 0xC8/0xD0 → GO-last sequence as timing changes
+ * (sc0710_reset_dma_frame_sync). defer_dma_resync=true when the caller will
+ * reset immediately (confirmed timing change path).
+ */
+void sc0710_sync_hdr_deliver_ex(struct sc0710_dev *dev, bool defer_dma_resync)
+{
+	const struct sc0710_pixfmt *want_pf;
+	const struct sc0710_pixfmt *old_pf;
+	u8 want_bgr;
+	u8 want_tm;
+	u8 want_hw;
+	bool changed = false;
+	bool pipe_changed = false;
+	bool streaming = false;
+	int i;
+
+	if (!dev)
+		return;
+
+	want_hw = sc0710_want_hw_tonemap(dev) ? 1 : 0;
+	want_tm = sc0710_want_sw_tonemap(dev) ? 1 : 0;
+	want_bgr = sc0710_prefer_hdr_bgr24(dev) ? 1 : 0;
+
+	/* Software/passthrough must not run on top of a live MCU map. */
+	if (want_tm)
+		want_hw = 0;
+
+	for (i = 0; i < SC0710_MAX_CHANNELS; i++) {
+		struct sc0710_dma_channel *ch = &dev->channel[i];
+
+		if (ch->enabled && ch->mediatype == CHTYPE_VIDEO &&
+		    atomic_read(&ch->streaming_refcount) > 0) {
+			streaming = true;
+			break;
+		}
+	}
+
+	old_pf = dev->pixfmt;
+	want_pf = old_pf;
+	/* Only auto-pick BGR24 for HDR passthrough. Tonemap leaves the
+	 * negotiated format alone so 4:4:4 stays 4:4:4. */
+	if (!streaming && want_bgr)
+		want_pf = &sc0710_pixfmts[1]; /* BGR24 */
+
+	if (want_pf != old_pf) {
+		dev->pixfmt = want_pf;
+		changed = true;
+		pipe_changed = true;
+		if (!streaming) {
+			mutex_lock(&dev->kthread_dma_lock);
+			sc0710_dma_channels_resize(dev);
+			mutex_unlock(&dev->kthread_dma_lock);
+		}
+	}
+
+	if (dev->hdr_pipe_hw_tonemap != want_hw) {
+		if (dev->board == SC0710_BOARD_ELGATEO_4KP60_MK2)
+			sc0710_i2c_apply_hw_tonemap(dev, want_hw);
+		dev->hdr_pipe_hw_tonemap = want_hw;
+		changed = true;
+		pipe_changed = true;
+	}
+
+	if (dev->hdr_pipe_bgr24 != want_bgr ||
+	    dev->hdr_pipe_tonemap != want_tm) {
+		dev->hdr_pipe_bgr24 = want_bgr;
+		dev->hdr_pipe_tonemap = want_tm;
+		changed = true;
+		pipe_changed = true;
+	}
+
+	if (!changed)
+		return;
+
+	printk(KERN_INFO "%s: HDR pipe → %s (%s)\n",
+	       dev->name,
+	       want_hw ? "hw-tonemap" :
+	       (want_tm ? "sw-tonemap" :
+		(want_bgr ? "passthrough" : "raw")),
+	       (dev->pixfmt && dev->pixfmt->rgb) ? "BGR24" : "YUYV");
+
+	if (!defer_dma_resync && streaming && pipe_changed) {
+		printk(KERN_INFO "%s: Pipeline change during capture — full DMA resync\n",
+		       dev->name);
+		sc0710_reset_dma_frame_sync(dev);
+	}
+
+	if (!defer_dma_resync)
+		sc0710_video_notify_source_change(dev);
+}
+
+/* Windows CDevice stream setup RMW's MCU 7-bit addr 0x32 control byte:
+ *  - bit 0x40 = 10-bit prefer
+ *  - bits 0x10/0x20 = HDR vs SDR mode select (Windows uses fdec/HDR)
+ *  - always OR 0x0f
+ * Subaddress is 0 (or 1 on some FW). After a real change, re-assert the
+ * EDID source so the MCU bounces HPD and the HDMI source can renegotiate
+ * deep color.
+ */
+int sc0710_i2c_apply_color_deep(struct sc0710_dev *dev)
+{
+	u8 wbuf[2];
+	u8 rbuf[1];
+	u8 val;
+	u8 sub;
+	int want10;
+	int hdr;
+	int ret = -EIO;
+	int changed = 0;
+	int need_hpd = 0;
+	int old40;
+
+	if (!dev)
+		return -EINVAL;
+
+	want10 = sc0710_want_10bit(dev) ? 1 : 0;
+	hdr = sc0710_hdmi_is_hdr(dev) ? 1 : 0;
+
+	mutex_lock(&dev->signalMutex);
+
+	for (sub = 0; sub <= 1; sub++) {
+		wbuf[0] = sub;
+		ret = __sc0710_i2c_writeread(dev, I2C_DEV__ARM_MCU,
+					     wbuf, 1, rbuf, 1);
+		if (ret < 0)
+			continue;
+
+		val = rbuf[0];
+		old40 = !!(rbuf[0] & 0x40);
+
+		/* 0x10/0x20 field — match Windows HDR vs SDR branch. */
+		val &= (u8)~0x30;
+		if (hdr)
+			val |= 0x10;
+		else
+			val |= 0x20;
+
+		if (want10)
+			val |= 0x40;
+		else
+			val &= (u8)~0x40;
+		val |= 0x0f;
+
+		if (val == rbuf[0]) {
+			changed = 1;
+			break;
+		}
+
+		wbuf[0] = sub;
+		wbuf[1] = val;
+		ret = sc0710_i2c_write(dev, I2C_DEV__ARM_MCU, wbuf, 2);
+		if (ret < 0) {
+			printk(KERN_WARNING "%s: color_deep write sub=%u failed (%d)\n",
+				dev->name, sub, ret);
+			continue;
+		}
+
+		printk(KERN_INFO "%s: color_deep MCU sub 0x%02x: %02x -> %02x "
+			"(%s, %s)\n",
+			dev->name, sub, rbuf[0], val,
+			want10 ? "10-bit prefer" : "8-bit prefer",
+			hdr ? "HDR bits" : "SDR bits");
+		changed = 1;
+		/* Only HPD-bounce when the 10-bit prefer bit flips — SDR/HDR
+		 * 0x10/0x20 tweaks alone were double-bouncing every lock. */
+		if (old40 != !!(val & 0x40))
+			need_hpd = 1;
+		break;
+	}
+
+	dev->active_10bit = want10;
+
+	if (need_hpd &&
+	    dev->board == SC0710_BOARD_ELGATEO_4KP60_MK2) {
+		/* Re-select internal EDID → MCU HPD bounce → source renegotiate. */
+		printk(KERN_INFO "%s: color_deep: bouncing HPD via EDID source reselect\n",
+			dev->name);
+		__sc0710_mk2_set_edid_source(dev, SC0710_EDID_SOURCE_INTERNAL);
+	}
+
+	mutex_unlock(&dev->signalMutex);
+
+	if (!changed && ret < 0)
+		return ret;
+	return 0;
+}
+
 int sc0710_i2c_initialize(struct sc0710_dev *dev)
 {
 	int ret;
@@ -1732,6 +2164,7 @@ int sc0710_i2c_initialize(struct sc0710_dev *dev)
 			printk(KERN_WARNING "%s: could not select the internal EDID source\n",
 				dev->name);
 		mutex_unlock(&dev->signalMutex);
+		sc0710_i2c_apply_color_deep(dev);
 		return 0;
 	}
 	if (dev->board != SC0710_BOARD_ELGATEO_4KP)

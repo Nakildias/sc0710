@@ -198,6 +198,8 @@ Same command as above — checks module, DKMS, CLI, systemd units, config files,
 * **Video formats** — 4K60, 1440p144, 1080p240. **EDID Source control (Internal/Display/Merged) on both cards** via the `EDID Source` V4L2 control (`v4l2-ctl --set-ctrl=edid_source=N`). **Custom EDID read/write on both cards** via `VIDIOC_G_EDID`/`VIDIOC_S_EDID` — the 4K Pro through its EEPROM (`edid=` boot param, profiles from `scripts/extract-firmware.sh`), the MK.2 through its MCU (runtime only). The graphical **EDID Config app** (`sc0710-cli --edid-config`) manages this for both cards and can fetch Elgato's official EDID profiles
 * **Mode-switch stability** — DMA resync, restart validation, and watchdog recovery during resolution/refresh changes; apps are told to renegotiate via `V4L2_EVENT_SOURCE_CHANGE`
 * **Timing controls** — runtime modes (`merge`, `procedural-only`, `static-only`) via CLI
+* **HDR (MK.2)** — host PQ→SDR tonemap on **YUYV and BGR24** (CPU; see [`docs/hdr_software.md`](docs/hdr_software.md)), MCU **hardware tonemap** via `hw_tonemap` / MCU `0x11` (see [`docs/hdr_hardware.md`](docs/hdr_hardware.md)), or native BGR24 HDR passthrough with BT.2020/PQ tags
+* **Driver manager GUI** — `sc0710-cli --gui` (load/unload/restart, toggles, EDID/HDR config launchers, dump + HDR tests)
 * **Debug dumps** — `sc0710-cli --dump` collects distro, kernel, `lspci`, driver version, and service state for issue reports
 
 ### Pixel formats (YUYV 4:2:2 and native BGR24 4:4:4)
@@ -207,14 +209,22 @@ Two capture formats are offered; pick per app over V4L2, no reload:
 * **`YUYV` (default)** — packed 4:2:2, 2 bytes/pixel. Lowest bandwidth, always available.
 * **`BGR24`** — native **4:4:4**, 3 bytes/pixel: the card's full-chroma mode (Elgato markets
   it "RGB24 8-bit 4:4:4"; the bytes are BGR-ordered). ~50 % more PCIe/RAM bandwidth than
-  YUYV, so it is opt-in. Reported as **full-range sRGB**, so color-managed apps take the
-  bytes as captured instead of range-expanding them.
+  YUYV, so it is opt-in. Reported as **full-range sRGB** for SDR, or **BT.2020 / PQ** when
+  HDMI is HDR and host tonemap is off.
 
 ```bash
 v4l2-ctl -d /dev/video0 --list-formats                     # YUYV + BGR3
 v4l2-ctl -d /dev/video0 --set-fmt-video=pixelformat=BGR3   # select 4:4:4
 # OBS / ffmpeg pick it via the normal format menu / -pixel_format bgr24
 ```
+
+On **MK.2**, HDR mode can also auto-select the format while idle:
+
+* **`sw_tonemap=1` (default)** + HDMI HDR-PQ → host PQ→SDR preview: **BGR24** luminance-preserving RGB (preferred); **YUYV** limited-range Y LUT + mild chroma pull. SDR tags.
+* **`sw_tonemap=0`** + **`hdr_bgr24=1` (default)** + HDMI HDR → prefer **BGR24**, BT.2020/PQ tags (no P010)
+* SDR → leave format alone / YUYV default; no tonemap
+
+Use `sc0710-cli --gui` for the manager, `--hdr-config` (`-hc`) for tonemap presets, or `--hdr-toggle` to cycle modes.
 
 The format is device-wide (one card, one DMA pipeline) and can only be changed while no app
 is capturing or holding buffers (a change attempt then returns `EBUSY`). Interlaced sources
@@ -305,8 +315,7 @@ For GitHub issues, attach output from `sc0710-cli --dump`.
 ## Known limitations / roadmap
 
 * **4K60 DMA tearing** — horizontal tears or frame shifts at 4K60 (~995 MB/s) under heavy load; **under active investigation**
-* **HDR tonemapping (on hold)** — requires opaque I2C commands to the onboard ARM MCU
-* **10-bit pixel format (on hold)** — P010/P016 register map unknown
+* **10-bit planar formats** — P010/P016 not implemented; HDR passthrough uses native **BGR24** 4:4:4 instead
 
 ## Help wanted
 

@@ -512,6 +512,15 @@ struct sc0710_dev {
 	enum sc0710_colorimetry_e  colorimetry;
 	enum sc0710_colorspace_e   colorspace;
 	enum sc0710_eotf_e         eotf;       /* Detected/forced EOTF for HDR */
+	/* Windows CustomAnalogVideoNativeColorDeepProperty:
+	 * 0=8-bit prefer, 1=10-bit request, 2=auto (when HDMI HDR).
+	 * active_10bit is what the MCU was last programmed with. */
+	u32                        color_deep;   /* 0/1/2 preference */
+	u32                        active_10bit; /* 0 or 1, applied */
+	/* Last notified HDR pipe state (BGR24 deliver + host/hw tonemap). */
+	u8                         hdr_pipe_bgr24;
+	u8                         hdr_pipe_tonemap;
+	u8                         hdr_pipe_hw_tonemap;
 	u32                        cable_connected; /* 5V sense: cable physically present */
 	u32                        unlocked_no_timing_count; /* Consecutive polls with no lock and no timing */
 	u32                        lock_dropout_count;       /* 4K Pro: consecutive polls with no lock while previously locked */
@@ -609,6 +618,43 @@ int sc0710_i2c_initialize(struct sc0710_dev *dev);
 int sc0710_i2c_hdmi_status_dump(struct sc0710_dev *dev);
 int sc0710_i2c_get_edid(struct sc0710_dev *dev, u8 *buf, int start, int len);
 int sc0710_i2c_set_edid(struct sc0710_dev *dev, const u8 *edid, int len);
+/* MK.2 only: upload 1024-byte HDR→SDR tonemap blob (MCU fn 0x63).
+ * Optional custom curve (Windows KS prop 723). Enable/disable is separate. */
+int sc0710_i2c_set_hdr_tonemap(struct sc0710_dev *dev, const u8 *lut, int len);
+/* MK.2: Windows XET_HDMI_HDR_TO_SDR (722) — MCU 0x32 sub 0x11 = 0/1. */
+int sc0710_i2c_apply_hw_tonemap(struct sc0710_dev *dev, int enable);
+/* Apply 8/10-bit capture mode (MCU control byte bit 0x40). */
+int sc0710_i2c_apply_color_deep(struct sc0710_dev *dev);
+enum sc0710_eotf_e sc0710_effective_eotf(struct sc0710_dev *dev);
+bool sc0710_hdmi_is_hdr(struct sc0710_dev *dev);
+bool sc0710_want_10bit(struct sc0710_dev *dev);
+bool sc0710_want_hw_tonemap(struct sc0710_dev *dev);
+bool sc0710_want_sw_tonemap(struct sc0710_dev *dev);
+bool sc0710_prefer_hdr_bgr24(struct sc0710_dev *dev);
+void sc0710_sync_hdr_deliver(struct sc0710_dev *dev);
+void sc0710_sync_hdr_deliver_ex(struct sc0710_dev *dev, bool defer_dma_resync);
+void sc0710_sync_hdr_deliver_all(void);
+void sc0710_yuyv8_sw_tonemap(u8 *yuyv, u32 w, u32 h);
+void sc0710_bgr24_sw_tonemap(u8 *bgr, u32 w, u32 h);
+extern int color_deep; /* module_param in sc0710-video.c */
+extern int hdr_bgr24;
+extern int hw_tonemap;
+extern int sw_tonemap;
+extern int tm_yuyv_target;
+extern int tm_paper_nits;
+extern int tm_yuyv_gain;
+extern int tm_yuyv_chroma;
+extern int tm_yuyv_black;
+extern int tm_yuyv_white;
+extern int tm_yuyv_u;
+extern int tm_yuyv_v;
+extern int tm_yuyv_pq_bias;
+extern int tm_yuyv_oetf;
+extern int tm_bgr_target;
+extern int tm_bgr_paper;
+extern int tm_bgr_gain;
+extern int tm_bgr_chroma;
+extern int force_eotf;
 bool sc0710_edid_header_valid(const u8 *p);
 int sc0710_i2c_read_hdmi_status(struct sc0710_dev *dev);
 int sc0710_i2c_read_status2(struct sc0710_dev *dev);
