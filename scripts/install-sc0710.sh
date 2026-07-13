@@ -972,6 +972,22 @@ else
     warning "scripts/sc0710-edid-config not found. EDID GUI not installed."
 fi
 
+# HDR / color-depth settings GUI (launched by `sc0710-cli --hdr-config`)
+if [[ -f "$SOURCE/scripts/sc0710-hdr-config" ]]; then
+    cp "$SOURCE/scripts/sc0710-hdr-config" /usr/local/bin/sc0710-hdr-config
+    chmod +x /usr/local/bin/sc0710-hdr-config
+else
+    warning "scripts/sc0710-hdr-config not found. HDR GUI not installed."
+fi
+
+# Driver manager GUI (launched by `sc0710-cli --gui`)
+if [[ -f "$SOURCE/scripts/sc0710-gui" ]]; then
+    cp "$SOURCE/scripts/sc0710-gui" /usr/local/bin/sc0710-gui
+    chmod +x /usr/local/bin/sc0710-gui
+else
+    warning "scripts/sc0710-gui not found. Manager GUI not installed."
+fi
+
 # Raw EDID writer helper — compiled here (never shipped as a binary).
 if [[ -f "$SOURCE/scripts/mk2-set-edid.c" ]]; then
     if { command -v cc >/dev/null 2>&1 && cc -O2 -o /usr/local/bin/mk2-set-edid "$SOURCE/scripts/mk2-set-edid.c"; } \
@@ -979,6 +995,16 @@ if [[ -f "$SOURCE/scripts/mk2-set-edid.c" ]]; then
         chmod +x /usr/local/bin/mk2-set-edid
     else
         warning "could not compile mk2-set-edid (no C compiler?); skipping the raw EDID writer."
+    fi
+fi
+
+# MK.2 HDR tonemap helper — compiled here (never shipped as a binary).
+if [[ -f "$SOURCE/scripts/mk2-set-tonemap.c" ]]; then
+    if { command -v cc >/dev/null 2>&1 && cc -O2 -lm -o /usr/local/bin/mk2-set-tonemap "$SOURCE/scripts/mk2-set-tonemap.c"; } \
+       || { command -v gcc >/dev/null 2>&1 && gcc -O2 -lm -o /usr/local/bin/mk2-set-tonemap "$SOURCE/scripts/mk2-set-tonemap.c"; }; then
+        chmod +x /usr/local/bin/mk2-set-tonemap
+    else
+        warning "could not compile mk2-set-tonemap (no C compiler?); skipping the tonemap helper."
     fi
 fi
 
@@ -1006,6 +1032,10 @@ echo -e "      ${BOLD}sc0710-cli --restart${NC}        Reload driver"
 echo -e "      ${BOLD}sc0710-cli -d${NC}  or  ${BOLD}--debug${NC}    Toggle debug output"
 echo -e "      ${BOLD}sc0710-cli -it${NC} or  ${BOLD}--image-toggle${NC}  Toggle status images"
 echo -e "      ${BOLD}sc0710-cli -pt${NC} or ${BOLD}--procedural-timings${NC} Toggle timing calculation mode"
+echo -e "      ${BOLD}sc0710-cli -ec${NC} or ${BOLD}--edid-config${NC} Open EDID configuration GUI"
+echo -e "      ${BOLD}sc0710-cli -hc${NC} or ${BOLD}--hdr-config${NC}  Open HDR / color settings GUI"
+echo -e "      ${BOLD}sc0710-cli -g${NC}  or ${BOLD}--gui${NC}         Open driver manager GUI"
+echo -e "      ${BOLD}sc0710-cli -ht${NC} or ${BOLD}--hdr-toggle${NC} Cycle HDR mode (tonemap ↔ passthrough ↔ SDR)"
 echo -e ""
 echo -e "      ${BOLD}sc0710-cli --rebuild${NC}        Force rebuild for current kernel"
 echo -e "      ${BOLD}sc0710-cli -U${NC}  or  ${BOLD}--update${NC}   Pull latest & rebuild"

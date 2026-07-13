@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# MCU hardware tonemap A/B: HW-only vs SW vs raw × YUYV/BGR24.
+# Auto-elevates via sc0710-cli; writes Desktop/HDR/hw-ab_<stamp>/.
+#
+# Usage (from repo or anywhere):
+#   ./scripts/sc0710-hdr-hw-ab-test
+#   sudo sc0710-cli --hdr-hw-test
+set -euo pipefail
+SELF="$(readlink -f "${BASH_SOURCE[0]}")"
+ROOT="$(cd "$(dirname "$SELF")/.." && pwd)"
+CLI=""
+for p in \
+    "$ROOT/scripts/sc0710-cli.sh" \
+    /usr/local/bin/sc0710-cli \
+    /usr/bin/sc0710-cli; do
+    [[ -x "$p" || -f "$p" ]] && { CLI="$p"; break; }
+done
+if [[ -z "$CLI" ]]; then
+    echo "sc0710-cli not found" >&2
+    exit 1
+fi
+exec bash "$CLI" --hdr-hw-test "$@"

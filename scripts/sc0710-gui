@@ -1,0 +1,1296 @@
+#!/usr/bin/env python3
+# sc0710-gui — driver management GUI for Elgato SC0710 cards.
+#
+# Launched by `sc0710-cli --gui` / `-g`. Pure Qt UI (no console panel).
+# Sysfs toggles write directly; load/unload use modprobe/rmmod via sudo.
+#
+# SPDX-License-Identifier: GPL-2.0-or-later
+
+import os
+import re
+import sys
+import glob
+import shutil
+import subprocess
+import time
+
+APP_NAME = "sc0710"
+
+CARDS = {
+    0x000e: "4K60 Pro MK.2",
+    0x0012: "4K Pro",
+}
+PARAM_DIR = "/sys/module/sc0710/parameters"
+PROC_STATE = "/proc/sc0710-state"
+PERSIST_FILE = "/etc/modprobe.d/sc0710-params.conf"
+
+TIMING_LABELS = {0: "Merge", 1: "Procedural", 2: "Static"}
+# Auto and explicit SW/HW both use module value 1 (HDMI-gated). They write the
+# same sysfs bits, so the GUI remembers the last dropdown choice in HDR_UI_FILE.
+HDR_MODES = [
+    ("auto", "Auto", None),
+    ("sw", "Software tonemap", {"hw_tonemap": 0, "sw_tonemap": 1, "hdr_bgr24": 0}),
+    ("hw", "Hardware tonemap", {"hw_tonemap": 1, "sw_tonemap": 0, "hdr_bgr24": 0}),
+    ("pass", "HDR passthrough", {"hw_tonemap": 0, "sw_tonemap": 0, "hdr_bgr24": 1}),
+    ("sdr", "SDR only", {"hw_tonemap": 0, "sw_tonemap": 0, "hdr_bgr24": 0}),
+]
+HDR_UI_FILE = os.path.expanduser("~/.config/sc0710/hdr-mode")
+
+
+def hdr_params_for_mode(key, prefer_sw=False):
+    """Map GUI HDR mode to module params. Auto follows HDMI: HDR→tonemap, SDR→SDR."""
+    base = {"force_eotf": 0, "hdr_bgr24": 0}
+    if key == "auto":
+        if prefer_sw:
+            return {**base, "hw_tonemap": 0, "sw_tonemap": 1}
+        return {**base, "hw_tonemap": 1, "sw_tonemap": 0}
+    for k, _lab, mapping in HDR_MODES:
+        if k == key and mapping:
+            return {**base, **mapping}
+    return None
+
+
+def save_hdr_ui_choice(key, prefer_sw=False):
+    path = HDR_UI_FILE
+    try:
+        os.makedirs(os.path.dirname(path), mode=0o755, exist_ok=True)
+        with open(path, "w") as f:
+            f.write(f"{key}\t{1 if prefer_sw else 0}\n")
+    except OSError:
+        pass
+
+
+def load_hdr_ui_choice():
+    try:
+        with open(HDR_UI_FILE) as f:
+            line = f.readline().strip()
+    except OSError:
+        return None, False
+    if not line:
+        return None, False
+    parts = line.split("\t")
+    key = parts[0].strip()
+    prefer = False
+    if len(parts) > 1:
+        prefer = parts[1].strip() in ("1", "true", "True")
+    if key not in {k for k, _, _ in HDR_MODES}:
+        return None, False
+    return key, prefer
+
+
+def _sysread(path):
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except OSError:
+        return None
+
+
+def module_loaded():
+    try:
+        with open("/proc/modules") as f:
+            return any(line.startswith("sc0710 ") for line in f)
+    except OSError:
+        return False
+
+
+def param(name, default=None):
+    v = _sysread(os.path.join(PARAM_DIR, name))
+    return default if v is None else v
+
+
+def param_int(name, default=0):
+    try:
+        return int(param(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
+def sudo_run(argv, timeout=120):
+    """Run argv under sudo -n; prime ticket once if needed."""
+    cmd = ["sudo", "-n", *argv]
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return False, str(e)
+    if p.returncode != 0 and "password" in ((p.stderr or "") + (p.stdout or "")).lower():
+        if subprocess.run(["sudo", "-v"]).returncode != 0:
+            return False, "sudo authentication failed"
+        try:
+            p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        except (OSError, subprocess.TimeoutExpired) as e:
+            return False, str(e)
+    out = ((p.stdout or "") + (p.stderr or "")).strip()
+    return p.returncode == 0, out
+
+
+def write_param(name, value):
+    path = os.path.join(PARAM_DIR, name)
+    try:
+        with open(path, "w") as f:
+            f.write(f"{value}\n")
+        return True, None
+    except PermissionError:
+        p = subprocess.run(
+            ["sudo", "-n", "bash", "-c", f"echo {int(value)} > '{path}'"],
+            capture_output=True, text=True, timeout=15)
+        if p.returncode != 0:
+            if subprocess.run(["sudo", "-v"]).returncode == 0:
+                p = subprocess.run(
+                    ["sudo", "-n", "bash", "-c",
+                     f"echo {int(value)} > '{path}'"],
+                    capture_output=True, text=True, timeout=15)
+        if p.returncode == 0:
+            return True, None
+        return False, (p.stderr or p.stdout or "write failed").strip()
+    except OSError as e:
+        return False, str(e)
+
+
+def write_params(mapping):
+    for k, v in mapping.items():
+        ok, err = write_param(k, v)
+        if not ok:
+            return False, f"{k}: {err}"
+    return True, None
+
+
+def persist_basic_params():
+    dbg = param_int("sc0710_debug_mode", 0)
+    img = param_int("use_status_images", 1)
+    pt = param_int("procedural_timings", 0)
+    body = (
+        f"options sc0710 sc0710_debug_mode={dbg} "
+        f"use_status_images={img} procedural_timings={pt}\n"
+    )
+    try:
+        with open(PERSIST_FILE, "w") as f:
+            f.write(body)
+        return True
+    except PermissionError:
+        p = subprocess.run(
+            ["sudo", "-n", "tee", PERSIST_FILE],
+            input=body, capture_output=True, text=True, timeout=15)
+        return p.returncode == 0
+    except OSError:
+        return False
+
+
+def find_tool(name):
+    self_dir = os.path.dirname(os.path.realpath(__file__))
+    for p in (
+        os.path.join(self_dir, name),
+        f"/usr/local/bin/{name}",
+        f"/usr/lib/sc0710/{name}",
+        f"/usr/bin/{name}",
+    ):
+        if os.path.isfile(p):
+            return p
+    return shutil.which(name)
+
+
+def detect_cards():
+    cards = []
+    for uevent in glob.glob("/sys/bus/pci/devices/*/uevent"):
+        try:
+            data = open(uevent).read()
+        except OSError:
+            continue
+        if "PCI_ID=12AB:0710" not in data.upper():
+            continue
+        bdf = os.path.basename(os.path.dirname(uevent))
+        subsys = None
+        for line in data.splitlines():
+            if line.startswith("PCI_SUBSYS_ID="):
+                try:
+                    subsys = int(line.split("=", 1)[1].split(":")[1], 16)
+                except (IndexError, ValueError):
+                    pass
+        cards.append(dict(
+            bdf=bdf,
+            name=CARDS.get(subsys, "SC0710"),
+            full=f"Elgato {CARDS.get(subsys, 'SC0710')}",
+            subsys=subsys,
+        ))
+    return cards
+
+
+def parse_state():
+    """Pull useful fields from /proc/sc0710-state."""
+    info = {
+        "hdmi": None,
+        "eotf": None,
+        "colorspace": None,
+        "colorimetry": None,
+        "mode": None,
+        "deliver": None,
+        "irq": None,
+        "timing": None,
+        "locked": False,
+    }
+    raw = _sysread(PROC_STATE)
+    if not raw:
+        return info
+    for line in raw.splitlines():
+        s = line.strip()
+        if s.startswith("HDMI:"):
+            info["hdmi"] = s.split(":", 1)[1].strip()
+            info["locked"] = "No Signal" not in s and "—" not in s and bool(s)
+        elif "eotf:" in s:
+            info["eotf"] = s.split(":", 1)[1].strip()
+        elif "colorspace:" in s:
+            info["colorspace"] = s.split(":", 1)[1].strip()
+        elif "colorimetry:" in s:
+            info["colorimetry"] = s.split(":", 1)[1].strip()
+        elif "color_deep:" in s:
+            # deliver=YUYV mode=sw-tonemap
+            if "mode=" in s:
+                info["mode"] = s.split("mode=", 1)[1].strip().split()[0]
+            if "deliver=" in s:
+                info["deliver"] = s.split("deliver=", 1)[1].strip().split()[0]
+        elif s.startswith("irq:"):
+            info["irq"] = s.split(":", 1)[1].strip()
+        elif s.startswith("timing calc:"):
+            info["timing"] = s.split(":", 1)[1].strip()
+    return info
+
+
+def sc0710_video_nodes():
+    nodes = []
+    for v in glob.glob("/sys/class/video4linux/video*"):
+        drv = os.path.realpath(os.path.join(v, "device", "driver"))
+        if drv.endswith("/sc0710"):
+            nodes.append(f"/dev/{os.path.basename(v)}")
+    return nodes
+
+
+def stop_pipewire_holders():
+    uids = []
+    try:
+        out = subprocess.check_output(["pgrep", "-x", "pipewire"], text=True)
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return []
+    for pid in out.split():
+        try:
+            uids.append(os.stat(f"/proc/{pid}").st_uid)
+        except OSError:
+            pass
+    uniq = sorted(set(uids))
+    for uid in uniq:
+        subprocess.run(
+            ["sudo", "-n", "-u", f"#{uid}", "bash", "-c",
+             f"export XDG_RUNTIME_DIR=/run/user/{uid}; "
+             f"export DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/{uid}/bus; "
+             "systemctl --user stop pipewire.socket pipewire-pulse.socket "
+             "pipewire.service pipewire-pulse.service wireplumber.service "
+             "2>/dev/null || true"],
+            capture_output=True, timeout=30)
+    return uniq
+
+
+def start_pipewire(uids):
+    for uid in uids:
+        subprocess.run(
+            ["sudo", "-n", "-u", f"#{uid}", "bash", "-c",
+             f"export XDG_RUNTIME_DIR=/run/user/{uid}; "
+             f"export DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/{uid}/bus; "
+             "systemctl --user start pipewire.socket pipewire-pulse.socket"],
+            capture_output=True, timeout=30)
+
+
+def module_unload():
+    if not module_loaded():
+        return True, "Already unloaded"
+    ok, err = sudo_run(["rmmod", "sc0710"], timeout=30)
+    if ok:
+        return True, "Driver unloaded"
+    uids = stop_pipewire_holders()
+    nodes = sc0710_video_nodes()
+    if nodes:
+        subprocess.run(["sudo", "-n", "fuser", "-k", *nodes],
+                       capture_output=True, timeout=15)
+    time.sleep(1)
+    ok, err = sudo_run(["rmmod", "sc0710"], timeout=30)
+    if not ok:
+        time.sleep(2)
+        ok, err = sudo_run(["rmmod", "sc0710"], timeout=30)
+    start_pipewire(uids)
+    if ok:
+        return True, "Driver unloaded"
+    return False, err or "Module still in use — close capture apps and retry"
+
+
+def module_load():
+    if module_loaded():
+        return True, "Already loaded"
+    ok, err = sudo_run(["modprobe", "sc0710"], timeout=60)
+    if module_loaded():
+        return True, "Driver loaded"
+    return False, err or "modprobe sc0710 failed"
+
+
+def module_restart():
+    ok, msg = module_unload()
+    if not ok and module_loaded():
+        return False, msg
+    time.sleep(0.8)
+    return module_load()
+
+
+def current_hdr_mode():
+    """Return (mode_key, prefer_sw) for the HDR dropdown + checkbox.
+
+    Auto (prefer HW) and Hardware tonemap both write hw=1/sw=0.
+    Auto (prefer SW) and Software tonemap both write hw=0/sw=1.
+    Use the remembered GUI choice when it still matches those params.
+    """
+    hw = param_int("hw_tonemap")
+    sw = param_int("sw_tonemap")
+    bgr = param_int("hdr_bgr24")
+    remembered, rem_prefer = load_hdr_ui_choice()
+
+    if bgr == 1 and sw == 0 and hw == 0:
+        return "pass", False
+    if hw == 0 and sw == 0 and bgr == 0:
+        return "sdr", False
+
+    # Ambiguous pairs: resolve via remembered UI selection when consistent.
+    if hw == 1 and sw == 0 and bgr == 0:
+        if remembered in ("auto", "hw"):
+            return remembered, False if remembered == "hw" else rem_prefer
+        return "hw", False
+    if hw == 0 and sw == 1 and bgr == 0:
+        if remembered in ("auto", "sw"):
+            return remembered, True if remembered == "sw" else rem_prefer
+        return "sw", False
+
+    if hw in (1, 2) and sw == 0:
+        return "hw", False
+    if sw in (1, 2) and hw == 0:
+        return "sw", False
+    return None, False
+
+
+def current_hdr_mode_key():
+    key, _ = current_hdr_mode()
+    return key
+
+
+def open_config(kind):
+    name = "sc0710-hdr-config" if kind == "hdr" else "sc0710-edid-config"
+    path = find_tool(name)
+    if not path:
+        return False, f"{name} not found"
+    subprocess.Popen([sys.executable, path], start_new_session=True,
+                     env=os.environ.copy())
+    return True, None
+
+
+VERSION_URL = "https://raw.githubusercontent.com/Nakildias/sc0710/main/version"
+
+
+def local_version():
+    candidates = [
+        "/sys/module/sc0710/version",
+        "/var/lib/sc0710/version",
+    ]
+    for p in candidates:
+        v = _sysread(p)
+        if v:
+            return v
+    for p in sorted(glob.glob("/usr/src/sc0710-*/version")):
+        v = _sysread(p)
+        if v:
+            return v
+    return None
+
+
+def version_state(local, remote):
+    if not local or not remote:
+        return "unknown"
+    if local == remote:
+        return "current"
+    try:
+        p = subprocess.run(
+            ["bash", "-c",
+             "printf '%s\\n' \"$1\" \"$2\" | sort -V | head -1",
+             "_", local, remote],
+            capture_output=True, text=True, timeout=5)
+        first = (p.stdout or "").strip()
+    except (OSError, subprocess.TimeoutExpired):
+        return "unknown"
+    if first == local:
+        return "behind"
+    return "ahead"
+
+
+def fetch_remote_version(timeout=8):
+    try:
+        import urllib.request
+        with urllib.request.urlopen(VERSION_URL, timeout=timeout) as r:
+            return r.read().decode("utf-8", "replace").strip()
+    except Exception:
+        return None
+
+
+def sc0710_dmesg_lines(max_lines=300, allow_sudo=False):
+    text = None
+    for argv in (
+        ["journalctl", "-k", "-b", "--no-pager", "-n", "800"],
+        ["dmesg", "-T"],
+        ["dmesg"],
+    ):
+        try:
+            p = subprocess.run(argv, capture_output=True, text=True, timeout=8)
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        out = (p.stdout or "") + (p.stderr or "")
+        if p.returncode == 0 and out.strip():
+            text = out
+            break
+    if not text and allow_sudo:
+        ok, out = sudo_run(["dmesg", "-T"], timeout=10)
+        if not ok:
+            ok, out = sudo_run(["dmesg"], timeout=10)
+        text = out if ok else ""
+    if not text:
+        return "(no kernel log access — try Reload, or: journalctl -k | grep sc0710)\n"
+    lines = [ln for ln in text.splitlines() if "sc0710" in ln.lower()]
+    if not lines:
+        return "(no sc0710 lines in kernel log yet)\n"
+    return "\n".join(lines[-max_lines:]) + "\n"
+
+
+PREVIEW_FORMATS = (
+    {
+        "fourcc": "BGR3",
+        "label": "4:4:4 — BGR24",
+        "hint": "Full chroma, higher bandwidth",
+        "ff_input": "bgr24",
+        "gst_format": "BGR",
+    },
+    {
+        "fourcc": "YUYV",
+        "label": "4:2:2 — YUYV",
+        "hint": "Default packed 4:2:2",
+        "ff_input": "yuyv422",
+        "gst_format": "YUY2",
+    },
+)
+
+
+def _parse_v4l2_fmt(text):
+    info = {"fourcc": None, "width": None, "height": None}
+    for line in text.splitlines():
+        s = line.strip()
+        if "Pixel Format" in s and "'" in s:
+            info["fourcc"] = s.split("'", 2)[1]
+        elif "Width/Height" in s and ":" in s:
+            wh = s.split(":", 1)[1].strip().replace(" ", "")
+            if "/" in wh:
+                w, h = wh.split("/", 1)
+                if w.isdigit() and h.isdigit():
+                    info["width"], info["height"] = int(w), int(h)
+    return info
+
+
+def get_v4l2_video_size(dev):
+    if shutil.which("v4l2-ctl"):
+        try:
+            p = subprocess.run(
+                ["v4l2-ctl", "-d", dev, "--get-fmt-video"],
+                capture_output=True, text=True, timeout=10)
+            if p.returncode == 0:
+                info = _parse_v4l2_fmt(p.stdout or "")
+                if info["width"] and info["height"]:
+                    return info["width"], info["height"]
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    state = parse_state()
+    hdmi = state.get("hdmi") or ""
+    m = re.search(r"(\d+)x(\d+)", hdmi)
+    if m:
+        return int(m.group(1)), int(m.group(2))
+    return 1920, 1080
+
+
+def get_v4l2_format(dev):
+    if not shutil.which("v4l2-ctl"):
+        return None
+    try:
+        p = subprocess.run(
+            ["v4l2-ctl", "-d", dev, "--get-fmt-video"],
+            capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if p.returncode != 0:
+        return None
+    return _parse_v4l2_fmt(p.stdout or "")
+
+
+def set_v4l2_format(dev, fourcc):
+    if not shutil.which("v4l2-ctl"):
+        return False, "v4l2-ctl not found (install v4l-utils)"
+    w, h = get_v4l2_video_size(dev)
+    fmt_arg = f"width={w},height={h},pixelformat={fourcc}"
+    try:
+        p = subprocess.run(
+            ["v4l2-ctl", "-d", dev, f"--set-fmt-video={fmt_arg}"],
+            capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return False, str(e)
+    if p.returncode != 0:
+        err = (p.stderr or p.stdout or "format set failed").strip()
+        return False, err
+    time.sleep(0.4)
+    got = get_v4l2_format(dev)
+    if not got or not got.get("fourcc"):
+        return False, "Could not verify pixel format after set"
+    actual = got["fourcc"].upper()
+    want = fourcc.upper()
+    if actual != want and not (want == "BGR3" and actual in ("BGR3", "BGR24")):
+        return False, (
+            f"Driver kept {actual} instead of {fourcc}.\n"
+            "Close other capture apps, or check HDR mode (passthrough "
+            "prefers BGR24 on HDR signals).")
+    return True, None
+
+
+def _preview_format_meta(fourcc):
+    for meta in PREVIEW_FORMATS:
+        if meta["fourcc"] == fourcc:
+            return meta
+    return None
+
+
+def open_v4l2_preview_stream(dev=None, fourcc="YUYV"):
+    """Launch a real video preview stream (not qv4l2 control utility)."""
+    if not dev:
+        nodes = sc0710_video_nodes()
+        if not nodes:
+            return False, "No sc0710 /dev/video* node — load the driver first"
+        dev = sorted(nodes)[0]
+
+    meta = _preview_format_meta(fourcc)
+    if not meta:
+        return False, f"Unknown format {fourcc}"
+
+    ok, err = set_v4l2_format(dev, meta["fourcc"])
+    if not ok:
+        return False, err or f"Could not set {meta['fourcc']}"
+
+    w, h = get_v4l2_video_size(dev)
+    label = meta["label"].split(" — ", 1)[0]
+    size = f"{w}x{h}"
+
+    launchers = []
+    if shutil.which("gst-launch-1.0"):
+        caps = (
+            f"video/x-raw,format={meta['gst_format']},"
+            f"width={w},height={h}")
+        launchers.append([
+            "gst-launch-1.0", "-e",
+            "v4l2src", f"device={dev}", "io-mode=2",
+            "!", caps,
+            "!", "queue", "max-size-buffers=2", "leaky=downstream",
+            "!", "videoconvert",
+            "!", "autovideosink", "sync=false",
+        ])
+    if shutil.which("ffplay"):
+        launchers.append([
+            "ffplay", "-hide_banner", "-loglevel", "error",
+            "-window_title", f"sc0710 preview — {label} ({dev})",
+            "-fflags", "nobuffer", "-flags", "low_delay",
+            "-framedrop", "-alwaysontop",
+            "-f", "v4l2",
+            "-input_format", meta["ff_input"],
+            "-video_size", size,
+            "-i", dev,
+        ])
+    if not launchers:
+        return False, (
+            "No video preview tool found.\n"
+            "Install ffmpeg (ffplay) or gstreamer (gst-launch-1.0).")
+    err = None
+    for cmd in launchers:
+        try:
+            subprocess.Popen(cmd, start_new_session=True,
+                             stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL,
+                             env=os.environ.copy())
+            return True, f"Preview ({label}, {meta['fourcc']}) → {dev}"
+        except OSError as e:
+            err = str(e)
+    return False, err or "Failed to launch preview"
+
+
+def _import_qt():
+    try:
+        import PySide6.QtCore as C
+        import PySide6.QtWidgets as W
+        import PySide6.QtGui as G
+        return dict(C=C, W=W, G=G, Signal=C.Signal, binding="PySide6")
+    except ImportError:
+        import PyQt6.QtCore as C
+        import PyQt6.QtWidgets as W
+        import PyQt6.QtGui as G
+        return dict(C=C, W=W, G=G, Signal=C.pyqtSignal, binding="PyQt6")
+
+
+def gui_main():
+    try:
+        qt = _import_qt()
+    except ImportError:
+        sys.stderr.write(
+            "sc0710-gui needs PySide6 or PyQt6.\n"
+            "  Arch: sudo pacman -S pyside6\n")
+        return 3
+    return _run_gui(qt)
+
+
+def _run_gui(qt):
+    C, W, G = qt["C"], qt["W"], qt["G"]
+    Qt = C.Qt
+    Signal = qt["Signal"]
+
+    class Job(C.QObject):
+        done = Signal(bool, str)
+
+        def __init__(self, fn):
+            super().__init__()
+            self.fn = fn
+
+        def run(self):
+            try:
+                ok, msg = self.fn()
+            except Exception as e:
+                ok, msg = False, str(e)
+            self.done.emit(ok, msg or "")
+
+    class Main(W.QMainWindow):
+        def __init__(self):
+            super().__init__()
+            self.setWindowTitle("sc0710 Driver Manager")
+            self.setMinimumSize(900, 560)
+            self.resize(1200, 720)
+            self._busy = False
+            self._thread = None
+            self._ver_state = "unknown"
+            self._local_ver = None
+            self._remote_ver = None
+            self._dmesg_text = ""
+            self._build()
+            self.refresh()
+            self._refresh_dmesg()
+            self._check_updates_async()
+            self._timer = C.QTimer(self)
+            self._timer.timeout.connect(self.refresh)
+            self._timer.start(1500)
+            self._dmesg_timer = C.QTimer(self)
+            self._dmesg_timer.timeout.connect(self._refresh_dmesg)
+            self._dmesg_timer.start(2000)
+
+        def _build(self):
+            central = W.QWidget()
+            self.setCentralWidget(central)
+            root = W.QVBoxLayout(central)
+            root.setContentsMargins(10, 10, 10, 6)
+            root.setSpacing(8)
+
+            head = W.QHBoxLayout()
+            self.card_label = W.QLabel("—")
+            fl = self.card_label.font()
+            fl.setBold(True)
+            fl.setPointSize(fl.pointSize() + 1)
+            self.card_label.setFont(fl)
+            head.addWidget(self.card_label, 1)
+            self.badge = W.QLabel("—")
+            head.addWidget(self.badge)
+            self.refresh_btn = W.QPushButton("Refresh")
+            self.refresh_btn.clicked.connect(self.refresh)
+            head.addWidget(self.refresh_btn)
+            root.addLayout(head)
+
+            # Update / pre-release banner
+            self.ver_banner = W.QFrame()
+            self.ver_banner.setFrameShape(W.QFrame.Shape.StyledPanel)
+            self.ver_banner.hide()
+            vb = W.QHBoxLayout(self.ver_banner)
+            vb.setContentsMargins(10, 6, 10, 6)
+            self.ver_label = W.QLabel("")
+            self.ver_label.setWordWrap(True)
+            vb.addWidget(self.ver_label, 1)
+            self.update_btn = W.QPushButton("Update…")
+            self.update_btn.setToolTip("Pull latest source, rebuild, and reload")
+            self.update_btn.clicked.connect(self.do_update)
+            self.update_btn.hide()
+            vb.addWidget(self.update_btn)
+            root.addWidget(self.ver_banner)
+
+            panes = W.QHBoxLayout()
+            panes.setContentsMargins(0, 0, 0, 0)
+            panes.setSpacing(root.spacing())
+
+            sig = W.QGroupBox("Signal")
+            sl = W.QFormLayout(sig)
+            sl.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+            sl.setHorizontalSpacing(16)
+            sl.setVerticalSpacing(10)
+            sl.setContentsMargins(12, 12, 12, 12)
+            self.st_format = W.QLabel("—")
+            self.st_eotf = W.QLabel("—")
+            self.st_space = W.QLabel("—")
+            self.st_deliver = W.QLabel("—")
+            self.st_mode = W.QLabel("—")
+            self.st_irq = W.QLabel("—")
+            for lab in (self.st_format, self.st_eotf, self.st_space,
+                        self.st_deliver, self.st_mode, self.st_irq):
+                lab.setWordWrap(True)
+                lab.setTextInteractionFlags(
+                    Qt.TextInteractionFlag.TextSelectableByMouse)
+                f = lab.font()
+                f.setBold(True)
+                lab.setFont(f)
+            sl.addRow("Format", self.st_format)
+            sl.addRow("EOTF", self.st_eotf)
+            sl.addRow("Color", self.st_space)
+            sl.addRow("Deliver", self.st_deliver)
+            sl.addRow("Pipe mode", self.st_mode)
+            sl.addRow("IRQ", self.st_irq)
+            panes.addWidget(sig, 3)
+
+            right = W.QWidget()
+            rl = W.QVBoxLayout(right)
+            rl.setContentsMargins(0, 0, 0, 0)
+            rl.setSpacing(root.spacing())
+
+            mod = W.QGroupBox("Module")
+            ml = W.QHBoxLayout(mod)
+            self.load_btn = W.QPushButton("Load")
+            self.load_btn.setDefault(True)
+            self.load_btn.clicked.connect(self.do_load)
+            self.unload_btn = W.QPushButton("Unload")
+            self.unload_btn.clicked.connect(self.do_unload)
+            self.restart_btn = W.QPushButton("Restart")
+            self.restart_btn.clicked.connect(self.do_restart)
+            for b in (self.load_btn, self.unload_btn, self.restart_btn):
+                ml.addWidget(b, 1)
+            rl.addWidget(mod)
+
+            sett = W.QGroupBox("Settings")
+            se = W.QFormLayout(sett)
+            se.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+            se.setHorizontalSpacing(12)
+            se.setVerticalSpacing(8)
+            toggles = W.QHBoxLayout()
+            self.debug_cb = W.QCheckBox("Debug logging")
+            self.debug_cb.toggled.connect(self._toggle_debug)
+            self.images_cb = W.QCheckBox("Status images")
+            self.images_cb.toggled.connect(self._toggle_images)
+            toggles.addWidget(self.debug_cb)
+            toggles.addWidget(self.images_cb)
+            toggles.addStretch(1)
+            se.addRow(toggles)
+            self.timing_box = W.QComboBox()
+            for k, lab in TIMING_LABELS.items():
+                self.timing_box.addItem(lab, k)
+            self.timing_box.currentIndexChanged.connect(self._timing_changed)
+            se.addRow("Timing calc", self.timing_box)
+            self.hdr_box = W.QComboBox()
+            for key, lab, _ in HDR_MODES:
+                self.hdr_box.addItem(lab, key)
+            self.hdr_box.setToolTip(
+                "Auto: tonemap when HDMI is HDR-PQ, plain SDR when it is not")
+            self.hdr_box.currentIndexChanged.connect(self._hdr_mode_ui)
+            self.hdr_box.currentIndexChanged.connect(self._hdr_changed)
+            se.addRow("HDR mode", self.hdr_box)
+            self.hdr_prefer_sw_cb = W.QCheckBox("Prefer software tonemap")
+            self.hdr_prefer_sw_cb.setToolTip(
+                "When Auto is selected: use host CPU tonemap instead of the "
+                "MK.2 MCU (hardware tonemap is the default)")
+            self.hdr_prefer_sw_cb.toggled.connect(self._hdr_prefer_sw_changed)
+            se.addRow("", self.hdr_prefer_sw_cb)
+            rl.addWidget(sett)
+
+            cfg = W.QGroupBox("Configuration")
+            cl = W.QHBoxLayout(cfg)
+            self.edid_btn = W.QPushButton("EDID…")
+            self.edid_btn.setToolTip("Open EDID configuration")
+            self.edid_btn.clicked.connect(lambda: self._open("edid"))
+            self.hdr_btn = W.QPushButton("HDR / tonemap…")
+            self.hdr_btn.setToolTip("Open HDR fine-tune and presets")
+            self.hdr_btn.clicked.connect(lambda: self._open("hdr"))
+            self.preview_btn = W.QPushButton("Preview…")
+            self.preview_btn.setToolTip(
+                "Open a live V4L2 video stream (GStreamer / ffplay)")
+            self.preview_btn.clicked.connect(self.do_preview)
+            cl.addWidget(self.edid_btn, 1)
+            cl.addWidget(self.hdr_btn, 1)
+            cl.addWidget(self.preview_btn, 1)
+            rl.addWidget(cfg)
+
+            tools = W.QGroupBox("Tools")
+            tl = W.QHBoxLayout(tools)
+            self.dump_btn = W.QPushButton("Dump")
+            self.dump_btn.setToolTip(
+                "Save a debug report to the Desktop for GitHub issues")
+            self.dump_btn.clicked.connect(self.do_dump)
+            self.hw_ab_btn = W.QPushButton("MCU A/B test")
+            self.hw_ab_btn.setToolTip(
+                "HW vs SW vs raw screenshots → Desktop/HDR/")
+            self.hw_ab_btn.clicked.connect(self.do_hw_ab)
+            self.remove_btn = W.QPushButton("Uninstall…")
+            self.remove_btn.clicked.connect(self.do_remove)
+            tl.addWidget(self.dump_btn, 1)
+            tl.addWidget(self.hw_ab_btn, 1)
+            tl.addWidget(self.remove_btn, 1)
+            rl.addWidget(tools)
+
+            rl.addStretch(1)
+            panes.addWidget(right, 2)
+            root.addLayout(panes, 2)
+
+            logbox = W.QGroupBox("Kernel log (sc0710)")
+            ll = W.QVBoxLayout(logbox)
+            log_bar = W.QHBoxLayout()
+            self.dmesg_follow = W.QCheckBox("Auto-scroll")
+            self.dmesg_follow.setChecked(True)
+            log_bar.addWidget(self.dmesg_follow)
+            log_bar.addStretch(1)
+            self.dmesg_copy_btn = W.QPushButton("Copy")
+            self.dmesg_copy_btn.clicked.connect(self._copy_dmesg)
+            self.dmesg_refresh_btn = W.QPushButton("Reload")
+            self.dmesg_refresh_btn.clicked.connect(
+                lambda: self._refresh_dmesg(allow_sudo=True))
+            log_bar.addWidget(self.dmesg_copy_btn)
+            log_bar.addWidget(self.dmesg_refresh_btn)
+            ll.addLayout(log_bar)
+            self.dmesg_view = W.QPlainTextEdit()
+            self.dmesg_view.setReadOnly(True)
+            self.dmesg_view.setMaximumBlockCount(500)
+            mono = G.QFontDatabase.systemFont(
+                G.QFontDatabase.SystemFont.FixedFont)
+            self.dmesg_view.setFont(mono)
+            self.dmesg_view.setPlaceholderText("sc0710 kernel messages…")
+            ll.addWidget(self.dmesg_view, 1)
+            root.addWidget(logbox, 3)
+
+            self.status = self.statusBar()
+            self._toast("Ready")
+            self._suppress = False
+
+        def _toast(self, msg, ms=4000):
+            self.status.showMessage(msg, ms)
+
+        def _set_badge(self, text, kind):
+            tips = {
+                "ok": "HDMI signal is locked",
+                "warn": "Driver loaded but no usable signal",
+                "bad": "Error",
+                "idle": "Module not loaded",
+            }
+            self.badge.setText(f"<b>{text}</b>")
+            self.badge.setToolTip(tips.get(kind, ""))
+
+        def refresh(self):
+            if self._busy:
+                return
+            cards = detect_cards()
+            loaded = module_loaded()
+            state = parse_state() if loaded else {}
+            ver = _sysread("/sys/module/sc0710/version") if loaded else None
+
+            if cards:
+                c = cards[0]
+                self.card_label.setText(
+                    f"{c['full']}  ({c['bdf']})"
+                    + (f"  ·  driver {ver}" if ver else ""))
+            elif loaded:
+                self.card_label.setText(f"SC0710  ·  driver {ver or '?'}")
+            else:
+                self.card_label.setText("No driver loaded")
+
+            if not loaded:
+                self._set_badge("Unloaded", "idle")
+            elif state.get("locked") and state.get("hdmi"):
+                self._set_badge("Signal locked", "ok")
+            else:
+                self._set_badge("No signal", "warn")
+
+            self.st_format.setText(state.get("hdmi") or "—")
+            self.st_eotf.setText(state.get("eotf") or "—")
+            color = " · ".join(
+                x for x in (state.get("colorspace"), state.get("colorimetry")) if x)
+            self.st_space.setText(color or "—")
+            self.st_deliver.setText(state.get("deliver") or "—")
+            self.st_mode.setText(state.get("mode") or "—")
+            self.st_irq.setText(state.get("irq") or "—")
+
+            self._suppress = True
+            self.debug_cb.setChecked(param_int("sc0710_debug_mode") == 1)
+            self.images_cb.setChecked(param_int("use_status_images", 1) == 1)
+            pt = param_int("procedural_timings", 0)
+            idx = self.timing_box.findData(pt)
+            if idx >= 0:
+                self.timing_box.setCurrentIndex(idx)
+            hk, prefer_sw = current_hdr_mode()
+            if hk:
+                idx = self.hdr_box.findData(hk)
+                if idx >= 0:
+                    self.hdr_box.setCurrentIndex(idx)
+            self.hdr_prefer_sw_cb.setChecked(prefer_sw)
+            self._hdr_mode_ui()
+            self._suppress = False
+
+            self.load_btn.setEnabled(not loaded and not self._busy)
+            self.unload_btn.setEnabled(loaded and not self._busy)
+            self.restart_btn.setEnabled(not self._busy)
+            self.dump_btn.setEnabled(not self._busy)
+            self.update_btn.setEnabled(not self._busy)
+            self.preview_btn.setEnabled(loaded and not self._busy)
+            for w in (self.debug_cb, self.images_cb, self.timing_box,
+                      self.hdr_box, self.hdr_prefer_sw_cb, self.hw_ab_btn,
+                      self.edid_btn, self.hdr_btn):
+                w.setEnabled(loaded and not self._busy)
+
+        def _apply_version_banner(self):
+            state = self._ver_state
+            local = self._local_ver or "?"
+            remote = self._remote_ver or "?"
+            if state == "behind":
+                self.ver_label.setText(
+                    f"<b>Update available</b> — installed "
+                    f"<b>{local}</b>, latest <b>{remote}</b>. "
+                    f"Run Update to pull, rebuild, and reload.")
+                self.update_btn.show()
+                self.ver_banner.show()
+            elif state == "ahead":
+                self.ver_label.setText(
+                    f"<b>Pre-release</b> — installed <b>{local}</b> is newer "
+                    f"than published <b>{remote}</b>. No update needed.")
+                self.update_btn.hide()
+                self.ver_banner.show()
+            else:
+                self.ver_banner.hide()
+                self.update_btn.hide()
+
+        def _check_updates_async(self):
+            if getattr(self, "_ver_busy", False):
+                return
+            self._ver_busy = True
+
+            class VerJob(C.QObject):
+                done = Signal(str, object, object)
+
+                def run(self_inner):
+                    local = local_version()
+                    remote = fetch_remote_version()
+                    state = version_state(local, remote)
+                    self_inner.done.emit(state, local, remote)
+
+            self._ver_thread = C.QThread(self)
+            self._ver_worker = VerJob()
+            self._ver_worker.moveToThread(self._ver_thread)
+            self._ver_thread.started.connect(self._ver_worker.run)
+
+            def _done(state, local, remote):
+                self._ver_busy = False
+                self._ver_state = state
+                self._local_ver = local
+                self._remote_ver = remote
+                self._apply_version_banner()
+
+            self._ver_worker.done.connect(_done)
+            self._ver_worker.done.connect(self._ver_thread.quit)
+            self._ver_thread.finished.connect(self._ver_worker.deleteLater)
+            self._ver_thread.start()
+
+        def _refresh_dmesg(self, allow_sudo=False):
+            try:
+                text = sc0710_dmesg_lines(allow_sudo=allow_sudo)
+            except Exception as e:
+                text = f"(failed to read kernel log: {e})\n"
+            if text == self._dmesg_text:
+                return
+            self._dmesg_text = text
+            bar = self.dmesg_view.verticalScrollBar()
+            at_bottom = bar.value() >= bar.maximum() - 4
+            self.dmesg_view.setPlainText(text.rstrip("\n"))
+            if self.dmesg_follow.isChecked() or at_bottom:
+                bar.setValue(bar.maximum())
+
+        def _copy_dmesg(self):
+            self.dmesg_view.selectAll()
+            self.dmesg_view.copy()
+            cursor = self.dmesg_view.textCursor()
+            cursor.clearSelection()
+            self.dmesg_view.setTextCursor(cursor)
+            self._toast("Kernel log copied")
+
+        def _job(self, fn, busy_msg="Working…"):
+            if self._busy:
+                return
+            self._busy = True
+            self._toast(busy_msg, 0)
+            self.refresh()
+            self._prog = W.QProgressDialog(busy_msg, None, 0, 0, self)
+            self._prog.setWindowTitle("sc0710")
+            self._prog.setCancelButton(None)
+            self._prog.setMinimumDuration(400)
+            self._prog.show()
+
+            self._thread = C.QThread(self)
+            self._worker = Job(fn)
+            self._worker.moveToThread(self._thread)
+            self._thread.started.connect(self._worker.run)
+            self._worker.done.connect(self._job_done)
+            self._worker.done.connect(self._thread.quit)
+            self._thread.finished.connect(self._worker.deleteLater)
+            self._thread.start()
+
+        def _job_done(self, ok, msg):
+            if getattr(self, "_prog", None):
+                self._prog.close()
+                self._prog = None
+            self._busy = False
+            self.refresh()
+            self._refresh_dmesg(allow_sudo=True)
+            self._check_updates_async()
+            if ok:
+                self._toast(msg or "Done")
+            else:
+                W.QMessageBox.warning(self, "sc0710", msg or "Failed")
+                self._toast("Failed")
+
+        def do_load(self):
+            self._job(module_load, "Loading driver…")
+
+        def do_unload(self):
+            self._job(module_unload, "Unloading driver…")
+
+        def do_restart(self):
+            self._job(module_restart, "Restarting driver…")
+
+        def _toggle_debug(self, on):
+            if self._suppress:
+                return
+            ok, err = write_param("sc0710_debug_mode", 1 if on else 0)
+            if ok:
+                persist_basic_params()
+                self._toast("Debug " + ("on" if on else "off"))
+            else:
+                self._suppress = True
+                self.debug_cb.setChecked(not on)
+                self._suppress = False
+                W.QMessageBox.warning(self, "sc0710", err or "Write failed")
+
+        def _toggle_images(self, on):
+            if self._suppress:
+                return
+            ok, err = write_param("use_status_images", 1 if on else 0)
+            if ok:
+                persist_basic_params()
+                self._toast("Status images " + ("on" if on else "off"))
+            else:
+                self._suppress = True
+                self.images_cb.setChecked(not on)
+                self._suppress = False
+                W.QMessageBox.warning(self, "sc0710", err or "Write failed")
+
+        def _timing_changed(self, _idx):
+            if self._suppress:
+                return
+            val = self.timing_box.currentData()
+            ok, err = write_param("procedural_timings", val)
+            if ok:
+                persist_basic_params()
+                self._toast(f"Timing: {TIMING_LABELS.get(val, val)}")
+            else:
+                W.QMessageBox.warning(self, "sc0710", err or "Write failed")
+                self.refresh()
+
+        def _hdr_mode_ui(self, _idx=None):
+            auto = self.hdr_box.currentData() == "auto"
+            self.hdr_prefer_sw_cb.setVisible(auto)
+            loaded = module_loaded()
+            self.hdr_prefer_sw_cb.setEnabled(
+                auto and loaded and not self._busy)
+
+        def _apply_hdr_params(self, key, prefer_sw=False):
+            mapping = hdr_params_for_mode(key, prefer_sw)
+            if not mapping:
+                return False, "Unknown HDR mode"
+            ok, err = write_params(mapping)
+            if ok:
+                save_hdr_ui_choice(key, prefer_sw if key == "auto" else False)
+            return ok, err
+
+        def _hdr_prefer_sw_changed(self, _on):
+            if self._suppress or self.hdr_box.currentData() != "auto":
+                return
+            ok, err = self._apply_hdr_params("auto", self.hdr_prefer_sw_cb.isChecked())
+            if ok:
+                who = "software" if self.hdr_prefer_sw_cb.isChecked() else "hardware"
+                self._toast(f"Auto HDR → prefer {who} tonemap")
+                self.refresh()
+            else:
+                self._suppress = True
+                self.hdr_prefer_sw_cb.setChecked(not self.hdr_prefer_sw_cb.isChecked())
+                self._suppress = False
+                W.QMessageBox.warning(self, "sc0710", err or "Write failed")
+
+        def _hdr_changed(self, _idx):
+            if self._suppress:
+                return
+            key = self.hdr_box.currentData()
+            self._hdr_mode_ui()
+            prefer_sw = (
+                self.hdr_prefer_sw_cb.isChecked() if key == "auto" else False)
+            ok, err = self._apply_hdr_params(key, prefer_sw)
+            if ok:
+                self._toast(self.hdr_box.currentText())
+                self.refresh()
+            else:
+                W.QMessageBox.warning(self, "sc0710", err or "Write failed")
+                self.refresh()
+
+        def _open(self, kind):
+            ok, err = open_config(kind)
+            if ok:
+                self._toast(f"Opened {kind.upper()} settings")
+            else:
+                W.QMessageBox.warning(self, "sc0710", err or "Not found")
+
+        def do_preview(self):
+            nodes = sc0710_video_nodes()
+            if not nodes:
+                W.QMessageBox.warning(
+                    self, "sc0710",
+                    "No sc0710 /dev/video* node — load the driver first")
+                return
+            dev = sorted(nodes)[0]
+
+            dlg = W.QDialog(self)
+            dlg.setWindowTitle("Preview format")
+            lay = W.QVBoxLayout(dlg)
+            lay.addWidget(W.QLabel(f"Choose pixel format for {dev}:"))
+
+            group = W.QButtonGroup(dlg)
+            deliver = (parse_state().get("deliver") or "").upper()
+            default_idx = 0 if "BGR" in deliver else 1
+            for i, meta in enumerate(PREVIEW_FORMATS):
+                rb = W.QRadioButton(meta["label"])
+                rb.setToolTip(meta["hint"])
+                group.addButton(rb, i)
+                lay.addWidget(rb)
+                if i == default_idx:
+                    rb.setChecked(True)
+
+            btns = W.QDialogButtonBox(
+                W.QDialogButtonBox.StandardButton.Ok |
+                W.QDialogButtonBox.StandardButton.Cancel)
+            btns.accepted.connect(dlg.accept)
+            btns.rejected.connect(dlg.reject)
+            lay.addWidget(btns)
+
+            if dlg.exec() != W.QDialog.DialogCode.Accepted:
+                return
+            idx = group.checkedId()
+            if idx < 0 or idx >= len(PREVIEW_FORMATS):
+                return
+            fourcc = PREVIEW_FORMATS[idx]["fourcc"]
+            ok, msg = open_v4l2_preview_stream(dev, fourcc)
+            if ok:
+                self._toast(msg)
+            else:
+                W.QMessageBox.warning(self, "sc0710", msg)
+
+        def do_update(self):
+            r = W.QMessageBox.question(
+                self, "Update driver?",
+                "This pulls the latest source, rebuilds the module, and "
+                "reloads it. Capture apps may be interrupted.\n\nContinue?",
+                W.QMessageBox.StandardButton.Yes |
+                W.QMessageBox.StandardButton.No,
+                W.QMessageBox.StandardButton.No)
+            if r != W.QMessageBox.StandardButton.Yes:
+                return
+            cli = find_tool("sc0710-cli") or find_tool("sc0710-cli.sh")
+            if not cli:
+                W.QMessageBox.warning(self, "sc0710", "sc0710-cli not found")
+                return
+
+            def work():
+                ok, out = sudo_run([cli, "--update"], timeout=900)
+                if ok:
+                    return True, "Driver updated"
+                return False, out or "Update failed"
+
+            self._job(work, "Updating driver…")
+
+        def do_dump(self):
+            cli = find_tool("sc0710-cli") or find_tool("sc0710-cli.sh")
+            if not cli:
+                W.QMessageBox.warning(self, "sc0710", "sc0710-cli not found")
+                return
+
+            def work():
+                ok, out = sudo_run([cli, "--dump"], timeout=90)
+                if ok:
+                    return True, "Debug dump saved to your Desktop"
+                return False, out or "Dump failed"
+
+            self._job(work, "Collecting debug dump…")
+
+        def do_hw_ab(self):
+            cli = find_tool("sc0710-cli") or find_tool("sc0710-cli.sh")
+            if not cli:
+                W.QMessageBox.warning(self, "sc0710", "sc0710-cli not found")
+                return
+
+            def work():
+                ok, out = sudo_run([cli, "--hdr-hw-test"], timeout=180)
+                if ok:
+                    return True, "A/B shots saved under Desktop/HDR/"
+                return False, out or "Test failed"
+
+            self._job(work, "Running MCU A/B capture…")
+
+        def do_remove(self):
+            r = W.QMessageBox.warning(
+                self, "Uninstall driver?",
+                "This removes the driver package and CLI from the system.\n\n"
+                "Continue?",
+                W.QMessageBox.StandardButton.Yes |
+                W.QMessageBox.StandardButton.No,
+                W.QMessageBox.StandardButton.No)
+            if r != W.QMessageBox.StandardButton.Yes:
+                return
+            cli = find_tool("sc0710-cli") or find_tool("sc0710-cli.sh")
+            if not cli:
+                W.QMessageBox.warning(self, "sc0710", "sc0710-cli not found")
+                return
+
+            def work():
+                return sudo_run([cli, "--remove"], timeout=300)
+
+            self._job(work, "Uninstalling…")
+
+    app = W.QApplication(sys.argv)
+    app.setApplicationName("sc0710")
+    # Do not force Fusion or a stylesheet — follow the desktop Qt theme.
+    win = Main()
+    win.show()
+    return app.exec()
+
+
+def main(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if argv and argv[0] in ("-h", "--help"):
+        print(f"{APP_NAME} driver GUI\n  sc0710-cli --gui")
+        return 0
+    return gui_main()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

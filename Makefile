@@ -3,7 +3,7 @@ sc0710-objs := \
 	lib/sc0710-dma-channel.o lib/sc0710-dma-channels.o \
 	lib/sc0710-dma-chains.o lib/sc0710-dma-chain.o \
 	lib/sc0710-things-per-second.o lib/sc0710-video.o \
-	lib/sc0710-audio.o
+	lib/sc0710-audio.o lib/sc0710-tonemap.o
 
 obj-m += sc0710.o
 

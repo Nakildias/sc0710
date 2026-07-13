@@ -26,7 +26,68 @@
 #include <linux/module.h>
 #include <linux/idr.h>
 #include <linux/interrupt.h>
+#include <linux/sysfs.h>
 #include "sc0710.h"
+
+/* Binary sysfs write of the 1024-byte HDR→SDR tonemap blob (MK.2 MCU fn 0x63).
+ * Empirically on/off patterns; path: .../sc0710/<bdf>/hdr_tonemap */
+static ssize_t hdr_tonemap_write(struct file *filp, struct kobject *kobj,
+	const struct bin_attribute *attr, char *buf, loff_t off, size_t count)
+{
+	struct device *device = kobj_to_dev(kobj);
+	struct pci_dev *pdev = to_pci_dev(device);
+	struct sc0710_dev *dev = pci_get_drvdata(pdev);
+	int rc;
+
+	if (!dev)
+		return -ENODEV;
+	if (off != 0 || count != 1024)
+		return -EINVAL;
+
+	rc = sc0710_i2c_set_hdr_tonemap(dev, buf, 1024);
+	return rc < 0 ? rc : (ssize_t)count;
+}
+
+static BIN_ATTR_WO(hdr_tonemap, 1024);
+
+static ssize_t color_deep_show(struct device *device,
+	struct device_attribute *attr, char *buf)
+{
+	struct pci_dev *pdev = to_pci_dev(device);
+	struct sc0710_dev *dev = pci_get_drvdata(pdev);
+
+	if (!dev)
+		return -ENODEV;
+	return sysfs_emit(buf, "%u\n", dev->color_deep);
+}
+
+static ssize_t color_deep_store(struct device *device,
+	struct device_attribute *attr, const char *buf, size_t count)
+{
+	struct pci_dev *pdev = to_pci_dev(device);
+	struct sc0710_dev *dev = pci_get_drvdata(pdev);
+	unsigned long val;
+	int rc;
+
+	if (!dev)
+		return -ENODEV;
+	rc = kstrtoul(buf, 0, &val);
+	if (rc)
+		return rc;
+	if (val > 2)
+		return -EINVAL;
+
+	dev->color_deep = (u32)val;
+	color_deep = (int)val; /* keep module param mirror for new probes */
+	rc = sc0710_i2c_apply_color_deep(dev);
+	if (rc < 0)
+		return rc;
+	sc0710_sync_hdr_deliver(dev);
+
+	return count;
+}
+
+static DEVICE_ATTR_RW(color_deep);
 
 MODULE_DESCRIPTION("Elgato 4K60 Pro MK.2 / 4K Pro capture driver");
 MODULE_AUTHOR("Steven Toth <stoth@kernellabs.com>, Nakildias <nakildiaspro@gmail.com>");
@@ -140,6 +201,19 @@ MODULE_PARM_DESC(card, "card type");
 static DEFINE_MUTEX(devlist);
 LIST_HEAD(sc0710_devlist);
 
+void sc0710_sync_hdr_deliver_all(void)
+{
+	struct list_head *list;
+	struct sc0710_dev *dev;
+
+	mutex_lock(&devlist);
+	list_for_each(list, &sc0710_devlist) {
+		dev = list_entry(list, struct sc0710_dev, devlist);
+		sc0710_sync_hdr_deliver(dev);
+	}
+	mutex_unlock(&devlist);
+}
+
 /* dev->nr allocator.
  * nr indexes the SC0710_MAXBOARDS-sized module-param arrays and must stay
  * unique among live devices, so slots are reclaimed on remove and on every
@@ -242,6 +316,9 @@ static int sc0710_dev_setup(struct sc0710_dev *dev)
 	init_waitqueue_head(&dev->dma_wq);
 	atomic_set(&dev->dma_irq_pending, 0);
 	dev->pixfmt = &sc0710_pixfmts[0];
+	/* Unknown until first sync — forces MCU 0x11 clear/set so a sticky
+	 * hardware tonemap from a prior session cannot double-map SW BGR24. */
+	dev->hdr_pipe_hw_tonemap = 0xff;
 
 	if (get_resources(dev) < 0) {
 		printk(KERN_ERR "%s No more PCIe resources for "
@@ -379,6 +456,16 @@ static int sc0710_proc_state_show(struct seq_file *m, void *v)
 
 		seq_printf(m, " colorimetry: %s\n", sc0710_colorimetry_ascii(dev->colorimetry));
 		seq_printf(m, "  colorspace: %s\n", sc0710_colorspace_ascii(dev->colorspace));
+		seq_printf(m, "        eotf: %s\n",
+			sc0710_effective_eotf(dev) == EOTF_HDR_PQ ? "HDR-PQ" :
+			sc0710_effective_eotf(dev) == EOTF_HDR_HLG ? "HLG" :
+			sc0710_effective_eotf(dev) == EOTF_SDR ? "SDR" : "unknown");
+		seq_printf(m, "  color_deep: prefer=%u active_10bit=%u deliver=%s mode=%s\n",
+			dev->color_deep, dev->active_10bit,
+			(dev->pixfmt && dev->pixfmt->rgb) ? "BGR24" : "YUYV",
+			sc0710_want_hw_tonemap(dev) ? "hw-tonemap" :
+			sc0710_want_sw_tonemap(dev) ? "sw-tonemap" :
+			(sc0710_prefer_hdr_bgr24(dev) ? "passthrough" : "sdr"));
 		seq_printf(m, "     procamp: brightness  %d\n", dev->brightness);
 		seq_printf(m, "     procamp: contrast    %d\n", dev->contrast);
 		seq_printf(m, "     procamp: saturation  %d\n", dev->saturation);
@@ -838,6 +925,11 @@ static int sc0710_initdev(struct pci_dev *pci_dev,
 
 	pci_set_drvdata(pci_dev, dev);
 
+	/* Sync module param → per-device preference before I2C bring-up. */
+	if (color_deep < 0 || color_deep > 2)
+		color_deep = 2;
+	dev->color_deep = color_deep;
+
 	printk(KERN_INFO "sc0710 device at %s\n", pci_name(pci_dev));
 	printk(KERN_INFO "sc0710 page-size %lu bytes\n", PAGE_SIZE);
 
@@ -895,6 +987,23 @@ static int sc0710_initdev(struct pci_dev *pci_dev,
 	} else
 		dprintk(1, "%s() Created the DMA thread\n", __func__);
 
+	if (dev->board == SC0710_BOARD_ELGATEO_4KP60_MK2) {
+		err = device_create_bin_file(&pci_dev->dev, &bin_attr_hdr_tonemap);
+		if (err < 0)
+			printk(KERN_WARNING "%s: hdr_tonemap sysfs attr unavailable (%d)\n",
+				dev->name, err);
+		else
+			printk(KERN_INFO "%s: HDR tonemap LUT via sysfs hdr_tonemap (1024 bytes)\n",
+				dev->name);
+		err = device_create_file(&pci_dev->dev, &dev_attr_color_deep);
+		if (err < 0)
+			printk(KERN_WARNING "%s: color_deep sysfs attr unavailable (%d)\n",
+				dev->name, err);
+		else
+			printk(KERN_INFO "%s: color_deep via sysfs (0=8bit 1=10bit 2=auto)\n",
+				dev->name);
+	}
+
 	return 0;
 
 fail_dev:
@@ -916,6 +1025,11 @@ static void sc0710_finidev(struct pci_dev *pci_dev)
 {
 	struct sc0710_dev *dev = pci_get_drvdata(pci_dev);
 	int i;
+
+	if (dev->board == SC0710_BOARD_ELGATEO_4KP60_MK2) {
+		device_remove_bin_file(&pci_dev->dev, &bin_attr_hdr_tonemap);
+		device_remove_file(&pci_dev->dev, &dev_attr_color_deep);
+	}
 
 	if (dev->kthread_dma) {
 		kthread_stop(dev->kthread_dma);

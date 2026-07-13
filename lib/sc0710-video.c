@@ -31,8 +31,21 @@ static int video_debug = 1;
 /* Module parameter to override EOTF detection
  * 0 = auto-detect (default), 1 = force SDR, 2 = force HDR/PQ, 3 = force HLG
  */
-static int force_eotf = 0;
-module_param(force_eotf, int, 0644);
+int force_eotf = 0;
+static int sc0710_param_set_force_eotf(const char *val,
+				       const struct kernel_param *kp)
+{
+	int ret = param_set_int(val, kp);
+
+	if (!ret)
+		sc0710_sync_hdr_deliver_all();
+	return ret;
+}
+static const struct kernel_param_ops sc0710_force_eotf_ops = {
+	.set = sc0710_param_set_force_eotf,
+	.get = param_get_int,
+};
+module_param_cb(force_eotf, &sc0710_force_eotf_ops, &force_eotf, 0644);
 MODULE_PARM_DESC(force_eotf, "Force EOTF: 0=auto, 1=SDR, 2=HDR-PQ, 3=HLG");
 
 /* Module parameter to override quantization range
@@ -41,6 +54,159 @@ MODULE_PARM_DESC(force_eotf, "Force EOTF: 0=auto, 1=SDR, 2=HDR-PQ, 3=HLG");
 static int force_quantization = 0;
 module_param(force_quantization, int, 0644);
 MODULE_PARM_DESC(force_quantization, "Force quantization: 0=auto, 1=limited, 2=full");
+
+/* Windows CustomAnalogVideoNativeColorDeepProperty:
+ * 0 = 8-bit preference, 1 = request 10-bit from MCU, 2 = AUTO (when HDMI HDR).
+ */
+int color_deep = 2;
+module_param(color_deep, int, 0644);
+MODULE_PARM_DESC(color_deep, "MCU color depth prefer: 0=8-bit, 1=10-bit request, 2=auto");
+
+/* Prefer native BGR24 4:4:4 while HDMI is HDR (when not tonemapping).
+ * 0=off (leave format alone), 1=auto (BGR24 while HDR), 2=force when 10-bit prefer.
+ */
+int hdr_bgr24 = 1;
+static int sc0710_param_set_hdr_bgr24(const char *val,
+				      const struct kernel_param *kp)
+{
+	int ret = param_set_int(val, kp);
+
+	if (!ret)
+		sc0710_sync_hdr_deliver_all();
+	return ret;
+}
+static const struct kernel_param_ops sc0710_hdr_bgr24_ops = {
+	.set = sc0710_param_set_hdr_bgr24,
+	.get = param_get_int,
+};
+module_param_cb(hdr_bgr24, &sc0710_hdr_bgr24_ops, &hdr_bgr24, 0644);
+MODULE_PARM_DESC(hdr_bgr24,
+	"BGR24 while HDR: 0=off, 1=auto(HDR→BGR24 when not tonemapping), 2=force");
+
+/*
+ * MK.2 hardware HDR→SDR tonemap (MCU 0x32 sub 0x11).
+ * Matches Windows KS property XET_HDMI_HDR_TO_SDR (722): uint32 on/off.
+ * 0=off, 1=auto (HDR-PQ), 2=force. Takes priority over sw_tonemap.
+ */
+int hw_tonemap = 0;
+static int sc0710_param_set_hw_tonemap(const char *val,
+				       const struct kernel_param *kp)
+{
+	int ret = param_set_int(val, kp);
+
+	if (!ret)
+		sc0710_sync_hdr_deliver_all();
+	return ret;
+}
+static const struct kernel_param_ops sc0710_hw_tonemap_ops = {
+	.set = sc0710_param_set_hw_tonemap,
+	.get = param_get_int,
+};
+module_param_cb(hw_tonemap, &sc0710_hw_tonemap_ops, &hw_tonemap, 0644);
+MODULE_PARM_DESC(hw_tonemap,
+	"MK.2 MCU HDR→SDR tonemap: 0=off, 1=auto(HDR-PQ), 2=force (Windows prop 722)");
+
+/*
+ * Host-side HDR→SDR tonemap on the captured buffer (CPU).
+ * 0=off, 1=auto (when HDMI HDR-PQ), 2=force on.
+ * Ignored while hw_tonemap is active (card already mapped).
+ */
+int sw_tonemap = 1;
+static int sc0710_param_set_sw_tonemap(const char *val,
+				      const struct kernel_param *kp)
+{
+	int ret = param_set_int(val, kp);
+
+	if (!ret)
+		sc0710_sync_hdr_deliver_all();
+	return ret;
+}
+static const struct kernel_param_ops sc0710_sw_tonemap_ops = {
+	.set = sc0710_param_set_sw_tonemap,
+	.get = param_get_int,
+};
+module_param_cb(sw_tonemap, &sc0710_sw_tonemap_ops, &sw_tonemap, 0644);
+MODULE_PARM_DESC(sw_tonemap,
+	"SW HDR→SDR tonemap (CPU): 0=off, 1=auto(HDR-PQ), 2=force. Disabled while hw_tonemap active.");
+
+/*
+ * YUYV host-tonemap fine-tune (sc0710-hdr-config).
+ * Defaults: T=0.80, paper 225, gain 100%, sat 300%.
+ */
+int tm_yuyv_target = 80;
+module_param(tm_yuyv_target, int, 0644);
+MODULE_PARM_DESC(tm_yuyv_target,
+	"YUYV Reinhard target T×100 (10-80, default 80). Higher = brighter midtones.");
+
+int tm_paper_nits = 225;
+module_param(tm_paper_nits, int, 0644);
+MODULE_PARM_DESC(tm_paper_nits,
+	"YUYV tonemap paper-white nits (50-400, default 225). Higher = dimmer highlights.");
+
+int tm_yuyv_gain = 100;
+module_param(tm_yuyv_gain, int, 0644);
+MODULE_PARM_DESC(tm_yuyv_gain,
+	"YUYV post-tonemap Y gain percent (50-150, default 100).");
+
+int tm_yuyv_chroma = 300;
+module_param(tm_yuyv_chroma, int, 0644);
+MODULE_PARM_DESC(tm_yuyv_chroma,
+	"YUYV host-tonemap chroma percent (0-300, default 300). 100=unity, >100 boosts.");
+
+int tm_yuyv_black = 0;
+module_param(tm_yuyv_black, int, 0644);
+MODULE_PARM_DESC(tm_yuyv_black,
+	"YUYV output black lift above code 16 (0-40, default 0).");
+
+int tm_yuyv_white = 235;
+module_param(tm_yuyv_white, int, 0644);
+MODULE_PARM_DESC(tm_yuyv_white,
+	"YUYV output white clip (180-235, default 235).");
+
+int tm_yuyv_u = 100;
+module_param(tm_yuyv_u, int, 0644);
+MODULE_PARM_DESC(tm_yuyv_u,
+	"YUYV Cb/U scale percent after chroma retain (50-150, default 100).");
+
+int tm_yuyv_v = 100;
+module_param(tm_yuyv_v, int, 0644);
+MODULE_PARM_DESC(tm_yuyv_v,
+	"YUYV Cr/V scale percent after chroma retain (50-150, default 100).");
+
+int tm_yuyv_pq_bias = 0;
+module_param(tm_yuyv_pq_bias, int, 0644);
+MODULE_PARM_DESC(tm_yuyv_pq_bias,
+	"YUYV PQ index bias before nits lookup (-40..40, default 0).");
+
+int tm_yuyv_oetf = 0;
+module_param(tm_yuyv_oetf, int, 0644);
+MODULE_PARM_DESC(tm_yuyv_oetf,
+	"YUYV output OETF: 0=Rec.709 limited, 1=sRGB→limited, 2=linear→limited.");
+
+/*
+ * BGR24 host-tonemap fine-tune (sc0710-hdr-config 4:4:4 section).
+ * Defaults: T=0.50, paper 400 nits, gain 150%, sat 150% (user-tuned look).
+ * Baked gold path (T=0.58 / paper 203) still used when knobs match those.
+ */
+int tm_bgr_target = 50;
+module_param(tm_bgr_target, int, 0644);
+MODULE_PARM_DESC(tm_bgr_target,
+	"BGR24 Reinhard target T×100 (10-80, default 50). Higher = brighter midtones.");
+
+int tm_bgr_paper = 400;
+module_param(tm_bgr_paper, int, 0644);
+MODULE_PARM_DESC(tm_bgr_paper,
+	"BGR24 tonemap paper-white nits (50-400, default 400). Higher = dimmer highlights.");
+
+int tm_bgr_gain = 150;
+module_param(tm_bgr_gain, int, 0644);
+MODULE_PARM_DESC(tm_bgr_gain,
+	"BGR24 post-tonemap RGB gain percent (50-150, default 150).");
+
+int tm_bgr_chroma = 150;
+module_param(tm_bgr_chroma, int, 0644);
+MODULE_PARM_DESC(tm_bgr_chroma,
+	"BGR24 post-tonemap saturation percent (0-300, default 150). 100=unity, >100 boosts.");
 
 /* Module parameter to enable status images (No Signal/No Device BMP)
  * 1 = show BMP images (default), 0 = show colorbars
@@ -83,6 +249,11 @@ const char *sc0710_colorspace_ascii(enum sc0710_colorspace_e val)
 /* Map detected colorimetry to V4L2 colorspace */
 static enum v4l2_colorspace sc0710_get_v4l2_colorspace(struct sc0710_dev *dev)
 {
+	/* Host tonemap produces SDR Rec.709-looking pixels. Passthrough
+	 * (tonemap off) keeps the source colorimetry — typically BT.2020. */
+	if (sc0710_want_hw_tonemap(dev) || sc0710_want_sw_tonemap(dev))
+		return V4L2_COLORSPACE_REC709;
+
 	switch (dev->colorimetry) {
 	case BT_601:  return V4L2_COLORSPACE_SMPTE170M;
 	case BT_709:  return V4L2_COLORSPACE_REC709;
@@ -92,28 +263,21 @@ static enum v4l2_colorspace sc0710_get_v4l2_colorspace(struct sc0710_dev *dev)
 }
 
 /* Map detected colorimetry to V4L2 transfer function.
- * BT.2020 can be SDR (gamma ~2.4), HDR10 (PQ/SMPTE 2084), or HLG.
- * Use detected EOTF from InfoFrame, or allow manual override via force_eotf.
+ * Tonemap path: pixels are SDR → advertise default transfer.
+ * Passthrough: keep PQ/HLG from effective EOTF (force_eotf or detect).
  */
 static enum v4l2_xfer_func sc0710_get_v4l2_xfer_func(struct sc0710_dev *dev)
 {
-	/* Allow manual override via module parameter */
-	switch (force_eotf) {
-	case 1: return V4L2_XFER_FUNC_DEFAULT;     /* Force SDR */
-	case 2: return V4L2_XFER_FUNC_SMPTE2084;   /* Force HDR-PQ */
-	case 3: return V4L2_XFER_FUNC_SMPTE2084;   /* HLG (V4L2 lacks specific HLG) */
-	}
+	if (sc0710_want_hw_tonemap(dev) || sc0710_want_sw_tonemap(dev))
+		return V4L2_XFER_FUNC_DEFAULT;
 
-	/* Auto-detection based on detected EOTF from HDMI InfoFrame */
-	switch (dev->eotf) {
+	switch (sc0710_effective_eotf(dev)) {
 	case EOTF_HDR_PQ:
-		return V4L2_XFER_FUNC_SMPTE2084;
 	case EOTF_HDR_HLG:
-		return V4L2_XFER_FUNC_SMPTE2084;  /* Closest V4L2 approximation */
+		return V4L2_XFER_FUNC_SMPTE2084;
 	case EOTF_SDR:
 	case EOTF_UNKNOWN:
 	default:
-		/* SDR: use default gamma (~2.2/2.4) */
 		return V4L2_XFER_FUNC_DEFAULT;
 	}
 }
@@ -121,6 +285,9 @@ static enum v4l2_xfer_func sc0710_get_v4l2_xfer_func(struct sc0710_dev *dev)
 /* Map detected colorimetry to V4L2 Y'CbCr encoding */
 static enum v4l2_ycbcr_encoding sc0710_get_v4l2_ycbcr_enc(struct sc0710_dev *dev)
 {
+	if (sc0710_want_hw_tonemap(dev) || sc0710_want_sw_tonemap(dev))
+		return V4L2_YCBCR_ENC_709;
+
 	switch (dev->colorimetry) {
 	case BT_2020: return V4L2_YCBCR_ENC_BT2020;
 	case BT_709:  return V4L2_YCBCR_ENC_709;
@@ -140,6 +307,9 @@ static enum v4l2_quantization sc0710_get_v4l2_quantization(struct sc0710_dev *de
 	case 1: return V4L2_QUANTIZATION_LIM_RANGE;  /* Force limited (16-235) */
 	case 2: return V4L2_QUANTIZATION_FULL_RANGE; /* Force full (0-255) */
 	}
+
+	if (sc0710_want_hw_tonemap(dev) || sc0710_want_sw_tonemap(dev))
+		return V4L2_QUANTIZATION_LIM_RANGE;
 
 	/* Auto: BT.2020 typically uses limited range, sRGB uses full */
 	if (dev->colorimetry == BT_2020)
@@ -179,14 +349,25 @@ static const struct sc0710_pixfmt *sc0710_pixfmt_find(u32 fourcc)
 }
 
 /* Fill the colorimetry fields for the negotiated pixel format.
- * RGB formats reach userspace as full-range bytes (measured black 0, white
- * 254-255), so they are tagged full-range sRGB; the detected YCbCr
- * colorimetry does not describe the RGB output and would make color-managed
- * apps range-expand it. */
+ * RGB + HDR passthrough (no host tonemap): BT.2020 / PQ / limited.
+ * RGB otherwise: full-range sRGB (measured black 0, white 254-255).
+ * YUYV + tonemap: Rec.709 / default transfer / limited.
+ * Else: detected path via effective EOTF. */
 static void sc0710_fill_colorimetry(struct sc0710_dev *dev,
 	const struct sc0710_pixfmt *pf, struct v4l2_pix_format *pix)
 {
 	if (pf->rgb) {
+		if (sc0710_hdmi_is_hdr(dev) &&
+		    !sc0710_want_hw_tonemap(dev) &&
+		    !sc0710_want_sw_tonemap(dev)) {
+			pix->colorspace = V4L2_COLORSPACE_BT2020;
+			pix->xfer_func = V4L2_XFER_FUNC_SMPTE2084;
+			pix->ycbcr_enc = V4L2_YCBCR_ENC_DEFAULT;
+			pix->quantization = force_quantization == 2 ?
+				V4L2_QUANTIZATION_FULL_RANGE :
+				V4L2_QUANTIZATION_LIM_RANGE;
+			return;
+		}
 		pix->colorspace = V4L2_COLORSPACE_SRGB;
 		pix->xfer_func = V4L2_XFER_FUNC_SRGB;
 		pix->ycbcr_enc = V4L2_YCBCR_ENC_DEFAULT;
