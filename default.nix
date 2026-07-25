@@ -1,6 +1,6 @@
 { config, pkgs, lib, ... }:
 let
-    compatibleKernels = [ "6.12" "6.13" "6.14" "6.15" "6.16" "6.17" "6.18" "6.19" "7.0" ];
+    compatibleKernels = [ "6.12" "6.13" "6.14" "6.15" "6.16" "6.17" "6.18" "6.19" "7.0" "7.1" ];
     currentKernelMajorMinor = lib.versions.majorMinor config.hardware.sc0710.kernel.version;
 
     package-version = lib.fileContents ./version;
