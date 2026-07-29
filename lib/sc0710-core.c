@@ -29,10 +29,18 @@
 #include <linux/sysfs.h>
 #include "sc0710.h"
 
+/* bin_attribute callbacks became const-qualified in Linux 6.16. */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 16, 0)
+#define SC0710_BIN_ATTR_CONST const
+#else
+#define SC0710_BIN_ATTR_CONST
+#endif
+
 /* Binary sysfs write of the 1024-byte HDR→SDR tonemap blob (MK.2 MCU fn 0x63).
  * Empirically on/off patterns; path: .../sc0710/<bdf>/hdr_tonemap */
 static ssize_t hdr_tonemap_write(struct file *filp, struct kobject *kobj,
-	const struct bin_attribute *attr, char *buf, loff_t off, size_t count)
+	SC0710_BIN_ATTR_CONST struct bin_attribute *attr, char *buf, loff_t off,
+	size_t count)
 {
 	struct device *device = kobj_to_dev(kobj);
 	struct pci_dev *pdev = to_pci_dev(device);
@@ -49,6 +57,7 @@ static ssize_t hdr_tonemap_write(struct file *filp, struct kobject *kobj,
 }
 
 static BIN_ATTR_WO(hdr_tonemap, 1024);
+#undef SC0710_BIN_ATTR_CONST
 
 static ssize_t color_deep_show(struct device *device,
 	struct device_attribute *attr, char *buf)
