@@ -1,6 +1,6 @@
 { config, pkgs, lib, ... }:
 let
-    compatibleKernels = [ "6.12" "6.13" "6.14" "6.15" "6.16" "6.17" "6.18" "6.19" "7.0" "7.1" ];
+    minimumKernel = "6.12";
     currentKernelMajorMinor = lib.versions.majorMinor config.hardware.sc0710.kernel.version;
 
     package-version = lib.fileContents ./version;
@@ -38,8 +38,8 @@ in
     config = (lib.mkIf (config.hardware.sc0710.enable) {
         assertions = [
             {
-                assertion = lib.elem currentKernelMajorMinor compatibleKernels;
-                message = "sc0710 driver is not compatible with kernel ${currentKernelMajorMinor}. Compatible versions: ${lib.concatStringsSep ", " compatibleKernels}";
+                assertion = lib.versionAtLeast currentKernelMajorMinor minimumKernel;
+                message = "sc0710 driver is not compatible with kernel ${currentKernelMajorMinor}. It requires at least version ${minimumKernel}.";
             }
         ];
 
