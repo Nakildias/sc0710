@@ -82,7 +82,7 @@ sc0710_pci_subsys() {
 
 sc0710_board_name_from_subsys() {
     case "$1" in
-        1cfa:000e) printf '%s' 'Elgato 4k60 Pro MK.2' ;;
+        1cfa:000e) printf '%s' 'Elgato 4K60 Pro MK.2' ;;
         1cfa:0012) printf '%s' 'Elgato 4K Pro' ;;
         1cfa:0006) printf '%s' 'Elgato HD60 Pro (1cfa:0006)' ;;
         *) printf '%s' 'UNKNOWN/GENERIC' ;;

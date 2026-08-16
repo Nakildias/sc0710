@@ -1166,6 +1166,7 @@ static int vidioc_enum_framesizes(struct file *file, void *priv, struct v4l2_frm
 {
 	struct sc0710_dma_channel *ch = video_drvdata(file);
 	struct sc0710_dev *dev = ch->dev;
+	const struct sc0710_format *fmt;
 	u32 eff_w, eff_h, eff_fs;
 
 	if (!sc0710_pixfmt_find(fsize->pixel_format))
@@ -1175,10 +1176,14 @@ static int vidioc_enum_framesizes(struct file *file, void *priv, struct v4l2_frm
 	if (fsize->index != 0)
 		return -EINVAL;
 
-	if (dev->fmt == NULL)
-		return -EINVAL;
+	/* Same fallback chain as g_fmt/queue_setup: with no signal the node
+	 * still reports a format, so it must enumerate that format's geometry
+	 * too. Returning -EINVAL here instead makes applications fall back to
+	 * hardcoded stepwise defaults - OBS lands on 3600fps and then spins on
+	 * a ~1.4ms select deadline against the 1Hz placeholder timer. */
+	fmt = dev->fmt ? dev->fmt : (dev->last_fmt ? dev->last_fmt : sc0710_get_default_format());
 
-	sc0710_get_effective_size(dev, dev->fmt, &eff_w, &eff_h, &eff_fs);
+	sc0710_get_effective_size(dev, fmt, &eff_w, &eff_h, &eff_fs);
 
 	fsize->type = V4L2_FRMSIZE_TYPE_DISCRETE;
 	fsize->discrete.width = eff_w;
@@ -1191,6 +1196,7 @@ static int vidioc_enum_frameintervals(struct file *file, void *priv, struct v4l2
 {
 	struct sc0710_dma_channel *ch = video_drvdata(file);
 	struct sc0710_dev *dev = ch->dev;
+	const struct sc0710_format *fmt;
 	u32 eff_w, eff_h, eff_fs;
 
 	if (!sc0710_pixfmt_find(fival->pixel_format))
@@ -1199,17 +1205,18 @@ static int vidioc_enum_frameintervals(struct file *file, void *priv, struct v4l2
 	if (fival->index != 0)
 		return -EINVAL;
 
-	if (dev->fmt == NULL)
-		return -EINVAL;
+	/* See vidioc_enum_framesizes: enumerate the same format g_fmt reports,
+	 * including the no-signal fallback. */
+	fmt = dev->fmt ? dev->fmt : (dev->last_fmt ? dev->last_fmt : sc0710_get_default_format());
 
-	sc0710_get_effective_size(dev, dev->fmt, &eff_w, &eff_h, &eff_fs);
+	sc0710_get_effective_size(dev, fmt, &eff_w, &eff_h, &eff_fs);
 
 	if (fival->width != eff_w || fival->height != eff_h)
 		return -EINVAL;
 
 	fival->type = V4L2_FRMIVAL_TYPE_DISCRETE;
-	fival->discrete.numerator = dev->fmt->fpsden;
-	fival->discrete.denominator = dev->fmt->fpsnum;
+	fival->discrete.numerator = fmt->fpsden;
+	fival->discrete.denominator = fmt->fpsnum;
 
 	return 0;
 }
@@ -1218,6 +1225,7 @@ static int vidioc_g_parm(struct file *file, void *priv, struct v4l2_streamparm *
 {
 	struct sc0710_dma_channel *ch = video_drvdata(file);
 	struct sc0710_dev *dev = ch->dev;
+	const struct sc0710_format *fmt;
 
 	if (parm->type != V4L2_BUF_TYPE_VIDEO_CAPTURE)
 		return -EINVAL;
@@ -1226,13 +1234,13 @@ static int vidioc_g_parm(struct file *file, void *priv, struct v4l2_streamparm *
 	parm->parm.capture.capability = V4L2_CAP_TIMEPERFRAME;
 	parm->parm.capture.readbuffers = 2;
 
-	if (dev->fmt) {
-		parm->parm.capture.timeperframe.numerator = dev->fmt->fpsden;
-		parm->parm.capture.timeperframe.denominator = dev->fmt->fpsnum;
-	} else {
-		parm->parm.capture.timeperframe.numerator = 1;
-		parm->parm.capture.timeperframe.denominator = 30;
-	}
+	/* Same fallback chain as g_fmt and the enum ioctls: a hardcoded
+	 * no-signal rate here would contradict what enum_frameintervals
+	 * advertises for the very same format. */
+	fmt = dev->fmt ? dev->fmt : (dev->last_fmt ? dev->last_fmt : sc0710_get_default_format());
+
+	parm->parm.capture.timeperframe.numerator = fmt->fpsden;
+	parm->parm.capture.timeperframe.denominator = fmt->fpsnum;
 
 	return 0;
 }
@@ -1442,19 +1450,23 @@ static int sc0710_start_streaming(struct vb2_queue *q, unsigned int count)
 		return -EBUSY;
 	}
 
-	/* Only start DMA if we're the first streaming client AND have signal.
+	/* Only touch DMA if we're the first streaming client.
 	 * kthread_dma_lock serializes this against the HDMI thread's resync:
 	 * without it a resync between the refcount increment and the resize
 	 * could start the channel first, and the resize would then skip a
-	 * running channel and stream from a stale ring. */
-	if (refcount == 1 && dev->fmt != NULL) {
+	 * running channel and stream from a stale ring.
+	 * sc0710_dma_sync_session starts video DMA only when a signal is
+	 * present, and leaves an ALSA-held audio session running if one is
+	 * already up. */
+	if (refcount == 1) {
 		mutex_lock(&dev->kthread_dma_lock);
 		if (READ_ONCE(dev->disconnected)) {
 			ret = -ENODEV;
 		} else {
-			ret = sc0710_dma_channels_resize(dev);
-			if (ret == 0)
-				ret = sc0710_dma_channels_start(dev);
+			if (dev->fmt == NULL)
+				dprintk(1, "%s() No signal - will deliver placeholder frames\n",
+					__func__);
+			ret = sc0710_dma_sync_session(dev);
 		}
 		mutex_unlock(&dev->kthread_dma_lock);
 		if (ret < 0) {
@@ -1489,7 +1501,11 @@ static void sc0710_stop_streaming(struct vb2_queue *q)
 	refcount = atomic_dec_return(&ch->streaming_refcount);
 	dprintk(1, "%s() streaming refcount now %d\n", __func__, refcount);
 
-	/* Only stop DMA if we're the last streaming client.
+	/* Only drop video from the DMA session if we're the last streaming
+	 * client. Audio may still hold the session open via ALSA (audio_users,
+	 * keep_audio_alive); sc0710_dma_sync_session keeps the audio channel
+	 * and the GO bit alive in that case instead of tearing the whole
+	 * pipeline down.
 	 * kthread_dma_lock serializes against an in-flight resync, whose
 	 * client snapshot would otherwise go stale here and restart DMA with
 	 * no clients left.  Stop the channels first (serialized against the
@@ -1502,11 +1518,12 @@ static void sc0710_stop_streaming(struct vb2_queue *q)
 		 * engines are stopped, the BARs may be unmapped): only the
 		 * software teardown below remains ours. */
 		if (!READ_ONCE(dev->disconnected)) {
-			sc0710_dma_channels_stop(dev);
+			sc0710_dma_sync_session(dev);
 			/* Point the chains back at the scratch ring: vb2 is
 			 * about to unmap the client's buffers, and no
-			 * descriptor may retain their DMA addresses (the stop
-			 * above quiesced the engine). */
+			 * descriptor may retain their DMA addresses (the sync
+			 * above quiesced the video engine when it was
+			 * running). */
 			if (zero_copy)
 				sc0710_dma_channel_untarget_all(ch);
 		}

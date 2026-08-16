@@ -17,7 +17,7 @@ High-performance, multi-client Linux driver for the Elgato 4K60 Pro MK.2 and Elg
 
 | Card | Subsystem ID | Notes |
 |------|-------------|-------|
-| **Elgato 4k60 Pro MK.2** | `1cfa:000e` | Plug-and-play after driver load. No FPGA firmware step. |
+| **Elgato 4K60 Pro MK.2** | `1cfa:000e` | Plug-and-play after driver load. No FPGA firmware step. |
 | **Elgato 4K Pro** | `1cfa:0012` | Requires **ECP5 FPGA firmware** programming on every **cold boot**. Handled automatically by the installer and the AUR package; manual `insmod` builds need extra steps (see below). |
 
 Both cards share the same `12ab:0710` Magewell chipset but use different board profiles in the driver.
@@ -170,6 +170,7 @@ Installed by the automatic installer, the AUR package, and the NixOS module. Pro
 | `--debug` | `-d` | Toggle verbose `dmesg` logging |
 | `--image-toggle` | `-it` | Toggle No Signal images vs colorbars |
 | `--procedural-timings` | `-pt` | Cycle timing mode: merge → procedural-only → static-only |
+| `--keep-audio-alive` | `-kaa` | Toggle always-on audio capture (off by default). See below |
 | `--update` | `-U` | Pull latest source, rebuild, reload. On 4K Pro, re-runs ECP5 programming with retries |
 | `--rebuild` | | *(Atomic only)* Force rebuild the module for the running kernel |
 | `--dump` | | Save a debug report to the Desktop (`dump-DD-MM-YYYY.txt`) for GitHub issues |
@@ -233,6 +234,33 @@ mid-session under `BGR24` the driver delivers no frames until the format or sign
 For **bit-accurate** RGB capture, also present an RGB-only EDID (below): on a YCbCr wire the
 card round-trips RGB→YCbCr→RGB and loses ~2 codes; on an RGB wire it captures within ±1 of
 bit-perfect.
+
+### Always-on audio capture
+
+By default the card's audio DMA starts and stops with video streaming: the ALSA capture
+device only produces samples while something is capturing video from `/dev/videoN`. That is
+fine for a normal OBS setup, but it breaks always-on uses — routing the HDMI audio through
+a hardware mixer, or monitoring it without a video client running.
+
+`keep_audio_alive=1` decouples the two. An ALSA client then holds the audio session open on
+its own, so the input stays live with no video capture in progress. Video is unaffected
+either way.
+
+```bash
+sc0710-cli --keep-audio-alive     # or -kaa; toggles and persists to modprobe.d
+```
+
+It can also be set directly, or at load time:
+
+```bash
+echo 1 | sudo tee /sys/module/sc0710/parameters/keep_audio_alive
+# or:  modprobe sc0710 keep_audio_alive=1
+```
+
+The value is read when an audio client starts the PCM, so a change applies the next time
+something opens the capture device — not to a stream already running. `/proc/sc0710-state`
+reports the current hold under `aud users`. Off by default, since holding the DMA session
+open keeps the card's pipeline running when nothing is capturing.
 
 ### Choosing the presented EDID
 
@@ -319,7 +347,7 @@ For GitHub issues, attach output from `sc0710-cli --dump`.
 
 ## Help wanted
 
-Maintainer **[Nakildias](https://github.com/Nakildias)** only has an **Elgato 4k60 Pro MK.2** available for hands-on testing. That limits how much can be validated on other hardware.
+Maintainer **[Nakildias](https://github.com/Nakildias)** only has an **Elgato 4K60 Pro MK.2** available for hands-on testing. That limits how much can be validated on other hardware.
 
 Contributions and testing help are especially welcome for:
 

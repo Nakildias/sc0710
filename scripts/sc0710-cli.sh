@@ -117,7 +117,11 @@ save_config() {
     if [[ -f /sys/module/sc0710/parameters/procedural_timings ]]; then
         pt=$(cat /sys/module/sc0710/parameters/procedural_timings 2>/dev/null || echo 0)
     fi
-    echo "options sc0710 sc0710_debug_mode=$dbg use_status_images=$img procedural_timings=$pt" > /etc/modprobe.d/sc0710-params.conf
+    local kaa=0
+    if [[ -f /sys/module/sc0710/parameters/keep_audio_alive ]]; then
+        kaa=$(cat /sys/module/sc0710/parameters/keep_audio_alive 2>/dev/null || echo 0)
+    fi
+    echo "options sc0710 sc0710_debug_mode=$dbg use_status_images=$img procedural_timings=$pt keep_audio_alive=$kaa" > /etc/modprobe.d/sc0710-params.conf
     echo -e "${BLUE}[PERSIST]${NC} Settings saved to /etc/modprobe.d/sc0710-params.conf"
 }
 
@@ -1180,6 +1184,7 @@ show_help() {
     echo -e "    ${BOLD}-d, --debug${NC}      Toggle debug mode on/off"
     echo -e "    ${BOLD}-it, --image-toggle${NC} Toggle status images on/off"
     echo -e "    ${BOLD}-pt, --procedural-timings${NC} Toggle timing calculation mode (merge/procedural/static)"
+    echo -e "    ${BOLD}-kaa, --keep-audio-alive${NC} Toggle always-on audio capture (off by default; for mixers)"
     echo -e "    ${BOLD}-ec, --edid-config${NC} Open the EDID configuration GUI (4K Pro / MK.2)"
     echo -e "    ${BOLD}-hc, --hdr-config${NC}  Open the HDR / color-depth settings GUI"
     echo -e "    ${BOLD}-g, --gui${NC}         Open the driver manager GUI (load/unload/tools)"
@@ -1453,7 +1458,7 @@ case "$1" in
                             BOARD_NAME=$(sc0710_board_name_from_subsys "${SUBVEN}:${SUBDEV}")
                         else
                             case "$SUBVEN:$SUBDEV" in
-                                1cfa:000e) BOARD_NAME="Elgato 4k60 Pro MK.2" ;;
+                                1cfa:000e) BOARD_NAME="Elgato 4K60 Pro MK.2" ;;
                                 1cfa:0012) BOARD_NAME="Elgato 4K Pro" ;;
                                 1cfa:0006) BOARD_NAME="Elgato HD60 Pro (1cfa:0006)" ;;
                                 *) BOARD_NAME="UNKNOWN/GENERIC" ;;
@@ -1620,6 +1625,22 @@ case "$1" in
             echo 1 > /sys/module/sc0710/parameters/use_status_images
             echo -e "${GREEN}[OK]${NC} Status images enabled"
         fi
+        save_config
+        ;;
+    -kaa|--keep-audio-alive)
+        if [[ ! -f /sys/module/sc0710/parameters/keep_audio_alive ]]; then
+            echo -e "${RED}[ERROR]${NC} keep_audio_alive parameter not available. Load the driver first with: sc0710-cli --load"
+            exit 1
+        fi
+        CURRENT=$(cat /sys/module/sc0710/parameters/keep_audio_alive)
+        if [[ "${CURRENT:-0}" == "0" ]]; then
+            echo 1 > /sys/module/sc0710/parameters/keep_audio_alive
+            echo -e "${GREEN}[OK]${NC} Keep-audio-alive enabled - the card's audio input stays active without a video capture client"
+        else
+            echo 0 > /sys/module/sc0710/parameters/keep_audio_alive
+            echo -e "${YELLOW}[OK]${NC} Keep-audio-alive disabled - audio follows video streaming (default)"
+        fi
+        echo -e "${BLUE}[NOTE]${NC} Takes effect the next time an audio client opens the capture device."
         save_config
         ;;
     -pt|--procedural-timings)

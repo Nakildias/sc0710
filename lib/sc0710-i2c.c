@@ -428,9 +428,14 @@ void sc0710_reset_dma_frame_sync(struct sc0710_dev *dev)
 		printk(KERN_ERR "%s: DMA resize failed during resync; leaving channels stopped\n",
 			dev->name);
 
-		/* Phase 1 stopped the video XDMA engines; clear GO to match
-		 * (mirrors sc0710_dma_channels_stop). */
-		sc_clr(dev, 0, BAR0_00D0, 0x0001);
+		/* Phase 1 stopped the video XDMA engines; clear GO only when
+		 * ALSA is not holding the audio session (mirrors
+		 * sc0710_dma_sync_session). Audio DMA uses a fixed ring and
+		 * survives the failed video resize. */
+		if (atomic_read(&dev->audio_users) > 0)
+			sc_set(dev, 0, BAR0_00D0, 0x0001);
+		else
+			sc_clr(dev, 0, BAR0_00D0, 0x0001);
 
 		/* Phase 1 deleted the frame timers; re-arm them so streaming
 		 * clients get placeholder frames instead of blocking in DQBUF.
@@ -464,16 +469,17 @@ void sc0710_reset_dma_frame_sync(struct sc0710_dev *dev)
 		}
 	}
 
-	/* Phase 4: Full restart via the canonical path (prep, pipeline
+	/* Phase 4: Full restart via the session sync path (prep, pipeline
 	 * registers, enable, channel start).  This uses the single
 	 * authoritative sc0710_program_pipeline_regs() so that the
-	 * register sequence is never partially applied.
+	 * register sequence is never partially applied, and only brings up
+	 * channels that still have users (video streaming and/or ALSA).
 	 * Verify video DMA run bit and retry once if needed.
 	 */
 	for (retry = 0; retry < 2; retry++) {
 		int dma_running_ok = 1;
 
-		sc0710_dma_channels_start(dev);
+		sc0710_dma_sync_session(dev);
 
 		for (ch_idx = 0; ch_idx < SC0710_MAX_CHANNELS; ch_idx++) {
 			u32 dma_ctrl;

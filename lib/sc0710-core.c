@@ -173,6 +173,15 @@ MODULE_PARM_DESC(zc_split,
 	"coherent scratch allocations more reliable. 0 = keep the vendor 4 MiB "
 	"segmenting.");
 
+unsigned int keep_audio_alive;
+module_param(keep_audio_alive, uint, 0644);
+MODULE_PARM_DESC(keep_audio_alive,
+	"Keep the ALSA capture session alive independently of V4L2 (0=off, default). "
+	"Off, audio DMA starts and stops with video streaming, so the card's audio "
+	"input only runs while something is capturing video. On, an ALSA client holds "
+	"the audio session open by itself - useful for hardware mixers and always-on "
+	"monitoring. Read at PCM start, so a change takes effect on the next open.");
+
 unsigned int dma_resync_validate_frames = 8;
 module_param(dma_resync_validate_frames, int, 0644);
 MODULE_PARM_DESC(dma_resync_validate_frames,
@@ -324,6 +333,7 @@ static int sc0710_dev_setup(struct sc0710_dev *dev)
 	mutex_init(&dev->kthread_dma_lock);
 	init_waitqueue_head(&dev->dma_wq);
 	atomic_set(&dev->dma_irq_pending, 0);
+	atomic_set(&dev->audio_users, 0);
 	dev->pixfmt = &sc0710_pixfmts[0];
 	/* Unknown until first sync — forces MCU 0x11 clear/set so a sticky
 	 * hardware tonemap from a prior session cannot double-map SW BGR24. */
@@ -519,6 +529,8 @@ static int sc0710_proc_state_show(struct seq_file *m, void *v)
 			if (ch->mediatype == CHTYPE_AUDIO) {
 				seq_printf(m, "  aud sam ps: %lld\n",
 					sc0710_things_per_second_query(&ch->audioSamplesPerSecond) / 2);
+				seq_printf(m, "  aud users: %d (alsa hold, keep_audio_alive=%u)\n",
+					atomic_read(&dev->audio_users), keep_audio_alive);
 			}
 		}
 
@@ -1060,6 +1072,9 @@ static void sc0710_finidev(struct pci_dev *pci_dev)
 	 * bails with -ENODEV. */
 	mutex_lock(&dev->kthread_dma_lock);
 	WRITE_ONCE(dev->disconnected, true);
+
+	/* Drop any ALSA hold before the hard stop so sync paths see idle. */
+	atomic_set(&dev->audio_users, 0);
 
 	/* Stop the DMA engines explicitly rather than relying on
 	 * pci_disable_device clearing bus-master while they still run. */
