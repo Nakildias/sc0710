@@ -32,7 +32,7 @@ struct sc0710_board sc0710_boards[] = {
 		/* Ensure safe default for unknown boards */
 	},
 	[SC0710_BOARD_ELGATEO_4KP60_MK2] = {
-		.name		= "Elgato 4k60 Pro MK.2",
+		.name		= "Elgato 4K60 Pro MK.2",
 		.bar1_index	= 1,
 	},
 

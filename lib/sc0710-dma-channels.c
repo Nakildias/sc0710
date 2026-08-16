@@ -151,6 +151,118 @@ int sc0710_dma_channels_start(struct sc0710_dev *dev)
 	return 0;
 }
 
+/* Align the running DMA engines with who actually wants them:
+ *  - video: a V4L2 client is streaming (streaming_refcount > 0) and a signal
+ *    is present (dev->fmt).
+ *  - audio: an ALSA client holds the session (audio_users > 0, only ever taken
+ *    while keep_audio_alive is set), or the video session is up. The second
+ *    term is what makes the default path identical to the old
+ *    channels_start/channels_stop coupling.
+ * Either user keeps the shared FPGA GO bit asserted. Caller holds
+ * kthread_dma_lock; may sleep (start_prep).
+ */
+int sc0710_dma_sync_session(struct sc0710_dev *dev)
+{
+	struct sc0710_dma_channel *vch = NULL;
+	struct sc0710_dma_channel *ach = NULL;
+	bool want_video = false;
+	bool alsa_hold = atomic_read(&dev->audio_users) > 0;
+	bool need_video_dma, want_audio;
+	bool any_running = false;
+	int i, ret;
+
+	for (i = 0; i < SC0710_MAX_CHANNELS; i++) {
+		struct sc0710_dma_channel *ch = &dev->channel[i];
+
+		if (!ch->enabled)
+			continue;
+		if (ch->mediatype == CHTYPE_VIDEO) {
+			vch = ch;
+			if (atomic_read(&ch->streaming_refcount) > 0)
+				want_video = true;
+		} else if (ch->mediatype == CHTYPE_AUDIO) {
+			ach = ch;
+		}
+		if (ch->state == STATE_RUNNING)
+			any_running = true;
+	}
+
+	need_video_dma = want_video && READ_ONCE(dev->fmt) != NULL;
+	want_audio = alsa_hold || need_video_dma;
+
+	if (!need_video_dma && !want_audio) {
+		if (any_running)
+			sc0710_dma_channels_stop(dev);
+		return 0;
+	}
+
+	/* Bring video buffers to the current resolution before (re)starting it. */
+	if (need_video_dma && vch && vch->state != STATE_RUNNING) {
+		ret = sc0710_dma_channels_resize(dev);
+		if (ret < 0) {
+			printk(KERN_ERR "%s: DMA resize failed during session sync (%d)\n",
+				dev->name, ret);
+			/* Still try to keep audio alive if that is all we need. */
+			if (!alsa_hold)
+				return ret;
+			need_video_dma = false;
+		}
+	}
+
+	if (!any_running) {
+		/* Cold start: prep only the channels we need, then GO. */
+		if (need_video_dma) {
+			ret = sc0710_dma_channel_start_prep(vch);
+			if (ret < 0)
+				return ret;
+		}
+		if (want_audio && ach) {
+			ret = sc0710_dma_channel_start_prep(ach);
+			if (ret < 0) {
+				if (need_video_dma)
+					sc0710_dma_channel_stop(vch);
+				return ret;
+			}
+		}
+
+		sc0710_program_pipeline_regs(dev);
+
+		if (need_video_dma)
+			sc0710_dma_channel_start(vch);
+		if (want_audio && ach)
+			sc0710_dma_channel_start(ach);
+
+		sc_set(dev, 0, BAR0_00D0, 0x0001);
+		if (dev->board == SC0710_BOARD_ELGATEO_4KP)
+			sc0710_4kp_wait_pipeline(dev);
+		return 0;
+	}
+
+	/* Session already up: add or drop individual channels. */
+	if (need_video_dma && vch && vch->state != STATE_RUNNING) {
+		ret = sc0710_dma_channel_start_prep(vch);
+		if (ret < 0)
+			return ret;
+		sc0710_program_pipeline_regs(dev);
+		sc0710_dma_channel_start(vch);
+		sc_set(dev, 0, BAR0_00D0, 0x0001);
+	} else if (!need_video_dma && vch && vch->state == STATE_RUNNING) {
+		sc0710_dma_channel_stop(vch);
+	}
+
+	if (want_audio && ach && ach->state != STATE_RUNNING) {
+		ret = sc0710_dma_channel_start_prep(ach);
+		if (ret < 0)
+			return ret;
+		sc0710_dma_channel_start(ach);
+		sc_set(dev, 0, BAR0_00D0, 0x0001);
+	} else if (!want_audio && ach && ach->state == STATE_RUNNING) {
+		sc0710_dma_channel_stop(ach);
+	}
+
+	return 0;
+}
+
 /* Check each dma channel. If writeback metadata suggests a transfer
  * has completed, process it and hand the audio/video to linux
  * subsystems. Returns the number of chain completions consumed.

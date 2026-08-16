@@ -94,6 +94,13 @@ extern unsigned int zero_copy;
  * descriptors per video chain; 0 = keep the default 4 MiB segmenting. */
 extern unsigned int zc_split;
 
+/* Keep the ALSA capture session alive independently of V4L2 (keep_audio_alive=
+ * module param, runtime writable). 0 (default) couples audio DMA to video
+ * streaming as before; 1 lets an ALSA client hold the audio session open on
+ * its own, so mixers and always-on monitoring keep working with no video
+ * client. Takes effect on the next PCM start. */
+extern unsigned int keep_audio_alive;
+
 #define SC0710_MAX_CHANNELS 2
 
 /* A chain contains 1..SC0710_MAX_CHAIN_DESCRIPTORS descriptors,
@@ -449,6 +456,13 @@ struct sc0710_audio_dev
 	bool                       running;
 	unsigned long              last_sample_jiffies; /* Last real-sample delivery */
 	struct delayed_work        silence_work;
+
+	/* keep_audio_alive only. The ALSA trigger callback runs under
+	 * snd_pcm_stream_lock (atomic) but starting/stopping DMA needs
+	 * kthread_dma_lock and may sleep, so trigger just flips dma_want and
+	 * kicks this work. */
+	struct work_struct         dma_work;
+	atomic_t                   dma_want; /* 1 = ALSA wants capture DMA */
 };
 
 struct sc0710_dev {
@@ -493,6 +507,13 @@ struct sc0710_dev {
 	 * the mutex.
 	 */
 	struct mutex               signalMutex;
+
+	/* ALSA capture hold, only ever taken while keep_audio_alive is set:
+	 * non-zero keeps the audio DMA channel (and the shared FPGA GO bit)
+	 * running with no V4L2 streaming client. Set from the ALSA trigger
+	 * work path, cleared on PCM STOP / close. */
+	atomic_t                   audio_users;
+
 	u32                        locked;
 	u32                        pixelLineH, pixelLineV; /* HDMI line format */
 	u32                        width, height;    /* Actual display */
@@ -698,6 +719,11 @@ int  sc0710_dma_channels_service(struct sc0710_dev *dev);
 void sc0710_dma_channels_stop(struct sc0710_dev *dev);
 int  sc0710_dma_channels_resize(struct sc0710_dev *dev);
 void sc0710_program_pipeline_regs(struct sc0710_dev *dev);
+/* Bring the DMA engines in line with current users. Video DMA runs while
+ * streaming_refcount > 0 and a signal (fmt) is present; audio DMA runs while
+ * an ALSA hold is active (keep_audio_alive) or, in the default coupled mode,
+ * alongside the video session. Caller must hold kthread_dma_lock; may sleep. */
+int  sc0710_dma_sync_session(struct sc0710_dev *dev);
 
 /* things-per-second.c */
 void sc0710_things_per_second_reset(struct sc0710_things_per_second *tps);

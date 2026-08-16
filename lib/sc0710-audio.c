@@ -144,6 +144,78 @@ static void sc0710_audio_init_silence_work(struct sc0710_audio_dev *chip)
 	INIT_DELAYED_WORK(&chip->silence_work, sc0710_audio_silence_work_fn);
 }
 
+/* Process-context DMA hold (keep_audio_alive). The ALSA trigger callback runs
+ * under snd_pcm_stream_lock and may not sleep, so it only flips dma_want and
+ * schedules this; here we can take kthread_dma_lock and start/stop the audio
+ * channel (and the shared GO bit) without tying audio lifetime to V4L2
+ * STREAMON. */
+static void sc0710_audio_dma_work_fn(struct work_struct *work)
+{
+	struct sc0710_audio_dev *chip =
+		container_of(work, struct sc0710_audio_dev, dma_work);
+	struct sc0710_dev *dev = chip->dev;
+	int want = atomic_read(&chip->dma_want);
+
+	if (READ_ONCE(dev->disconnected))
+		return;
+
+	mutex_lock(&dev->kthread_dma_lock);
+	if (READ_ONCE(dev->disconnected)) {
+		mutex_unlock(&dev->kthread_dma_lock);
+		return;
+	}
+
+	atomic_set(&dev->audio_users, want ? 1 : 0);
+	if (sc0710_dma_sync_session(dev) < 0 && want)
+		printk_ratelimited(KERN_WARNING
+			"%s: failed to start audio DMA session for ALSA\n",
+			dev->name);
+	mutex_unlock(&dev->kthread_dma_lock);
+}
+
+static void sc0710_audio_stop_dma_work(struct sc0710_audio_dev *chip)
+{
+	if (!chip)
+		return;
+
+	cancel_work_sync(&chip->dma_work);
+}
+
+/* Drop the ALSA hold and resync. Safe to call when no hold was ever taken
+ * (keep_audio_alive off), in which case audio_users is already 0 and the
+ * sync is a no-op. */
+static void sc0710_audio_release_dma(struct sc0710_audio_dev *chip)
+{
+	struct sc0710_dev *dev;
+
+	if (!chip || !chip->dev)
+		return;
+
+	dev = chip->dev;
+	atomic_set(&chip->dma_want, 0);
+	sc0710_audio_stop_dma_work(chip);
+
+	if (!atomic_read(&dev->audio_users))
+		return;
+
+	if (READ_ONCE(dev->disconnected)) {
+		atomic_set(&dev->audio_users, 0);
+		return;
+	}
+
+	mutex_lock(&dev->kthread_dma_lock);
+	atomic_set(&dev->audio_users, 0);
+	if (!READ_ONCE(dev->disconnected))
+		sc0710_dma_sync_session(dev);
+	mutex_unlock(&dev->kthread_dma_lock);
+}
+
+static void sc0710_audio_init_dma_work(struct sc0710_audio_dev *chip)
+{
+	INIT_WORK(&chip->dma_work, sc0710_audio_dma_work_fn);
+	atomic_set(&chip->dma_want, 0);
+}
+
 int sc0710_audio_deliver_samples(struct sc0710_dev *dev, struct sc0710_dma_channel *ch,
 	const u8 *buf, int bitdepth, int strideBytes, int channels, int samplesPerChannel)
 {
@@ -246,6 +318,10 @@ static int snd_sc0710_pcm_close(struct snd_pcm_substream *substream)
 	 * above, so any pending work bails. */
 	sc0710_audio_stop_silence(chip);
 
+	/* Drop the ALSA DMA hold even if trigger STOP never ran (abrupt close):
+	 * without this, audio_users would keep the FPGA session up forever. */
+	sc0710_audio_release_dma(chip);
+
 	return 0;
 }
 
@@ -325,12 +401,24 @@ static int snd_sc0710_capture_trigger(struct snd_pcm_substream *substream, int c
 		chip->running = true;
 		mod_delayed_work(system_wq, &chip->silence_work,
 				 msecs_to_jiffies(SC0710_AUDIO_GAP_MS));
+		/* keep_audio_alive: take the DMA hold so the audio session
+		 * survives with no V4L2 client. Read once here so flipping the
+		 * param mid-stream can't leave a hold nobody drops - it takes
+		 * effect on the next PCM start. */
+		if (keep_audio_alive) {
+			atomic_set(&chip->dma_want, 1);
+			schedule_work(&chip->dma_work);
+		}
 		return 0;
 
 	case SNDRV_PCM_TRIGGER_STOP:
 		/* atomic context: async cancel only; pcm_close() does the sync teardown */
 		chip->running = false;
 		cancel_delayed_work(&chip->silence_work);
+		if (atomic_read(&chip->dma_want)) {
+			atomic_set(&chip->dma_want, 0);
+			schedule_work(&chip->dma_work);
+		}
 		return 0;
 
 	default:
@@ -367,6 +455,17 @@ static struct snd_pcm_ops pcm_capture_ops =
 	.page      = snd_pcm_pd_get_page,
 };
 
+/* Human-readable card name for ALSA, taken from the same board table V4L2
+ * reports through VIDIOC_QUERYCAP so the two agree. Unknown boards fall back
+ * to a generic Elgato string rather than the table's "UNKNOWN/GENERIC". */
+static const char *sc0710_audio_card_name(struct sc0710_dev *dev)
+{
+	if (dev->board != SC0710_BOARD_UNKNOWN && dev->board < sc0710_bcount)
+		return sc0710_boards[dev->board].name;
+
+	return "Elgato HDMI Capture";
+}
+
 /* Final card free (last handle closed, or immediately when none were open):
  * drop the device reference the card held. */
 static void sc0710_audio_private_free(struct snd_card *card)
@@ -389,6 +488,9 @@ void sc0710_audio_unregister(struct sc0710_dev *dev)
 		return;
 
 	sc0710_audio_stop_silence(chip);
+	/* Release any ALSA DMA hold and sync-cancel dma_work before the card
+	 * goes away: the work dereferences chip->dev. */
+	sc0710_audio_release_dma(chip);
 	/* Disconnects immediately (open PCM/ctl handles start erroring) and
 	 * defers the card free to the last close, so a handle held open across
 	 * remove - PipeWire keeps one persistently - neither blocks remove nor
@@ -442,6 +544,7 @@ int sc0710_audio_register(struct sc0710_dev *dev)
 	chip->buffer_ptr = 0;
 	chip->running = false;
 	sc0710_audio_init_silence_work(chip);
+	sc0710_audio_init_dma_work(chip);
 
 	/* The PCM/ctl callbacks reach into dev; pin it until the card is truly
 	 * freed. private_free fires exactly once on every card-free path,
@@ -449,14 +552,22 @@ int sc0710_audio_register(struct sc0710_dev *dev)
 	v4l2_device_get(&dev->v4l2_dev);
 	card->private_free = sc0710_audio_private_free;
 
-	err = snd_sc0710_pcm(chip, 0, "sc0710 HDMI");
+	err = snd_sc0710_pcm(chip, 0, "HDMI Capture");
 	if (err < 0)
 		goto error;
 
+	/* Present the detected board, matching what V4L2 reports in
+	 * VIDIOC_QUERYCAP - "Elgato 4K60 Pro MK.2" / "Elgato 4K Pro" rather
+	 * than the silicon vendor. PipeWire/PulseAudio surface shortname as
+	 * the device description, so this is the string users actually see in
+	 * their mixer. card->driver stays "sc0710", which is what the ALSA
+	 * card id (hw:CARD=sc0710) is derived from, so device identifiers and
+	 * the PCI-path-based PipeWire node names are unchanged. */
 	strcpy(card->driver, "sc0710");
-	sprintf(card->shortname, "Elgato (Yuan sc0710)");
-	sprintf(card->longname, "%s at %s", card->shortname, dev->name);
-	strcpy(card->mixername, "sc0710");
+	strscpy(card->shortname, sc0710_audio_card_name(dev), sizeof(card->shortname));
+	snprintf(card->longname, sizeof(card->longname), "%s at %s",
+		 card->shortname, dev->name);
+	strscpy(card->mixername, card->shortname, sizeof(card->mixername));
 
 	err = snd_card_register(card);
 	if (err < 0)
