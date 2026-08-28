@@ -137,10 +137,20 @@ if command -v pacman &>/dev/null; then
   [[ "$aur_pkg_found" == "false" ]] && trace_clear "No sc0710 AUR package installed"
 fi
 
-if [[ -d "/var/lib/sc0710" ]]; then
+if [[ -L "/var/lib/sc0710" ]]; then
+    trace_found "Install directory symlink (SteamOS)" "/var/lib/sc0710 -> $(readlink /var/lib/sc0710)"
+elif [[ -d "/var/lib/sc0710" ]]; then
     trace_found "Atomic install directory" "/var/lib/sc0710"
 else
     trace_clear "No /var/lib/sc0710"
+fi
+
+# SteamOS keeps the driver tree on /home so it survives A/B system updates;
+# an uninstall that only cleared /var/lib would leave the whole tree behind.
+if [[ -d "/home/sc0710" ]]; then
+    trace_found "SteamOS persistent driver tree" "/home/sc0710"
+else
+    trace_clear "No /home/sc0710"
 fi
 
 if [[ -d "/usr/lib/sc0710" ]]; then
@@ -157,7 +167,11 @@ for libexec in \
     /usr/local/libexec/sc0710-firmware-lib.sh \
     /var/lib/sc0710/sc0710-firmware.sh \
     /var/lib/sc0710/sc0710-firmware-lib.sh \
-    /var/lib/sc0710/build-and-load.sh; do
+    /var/lib/sc0710/build-and-load.sh \
+    /home/sc0710/sc0710-firmware-lib.sh \
+    /home/sc0710/sc0710-steamos-lib.sh \
+    /home/sc0710/build-and-load.sh \
+    /home/sc0710/steamos-restore.sh; do
     if [[ -f "$libexec" ]]; then
         trace_found "Firmware/build script present" "$libexec"
     fi
@@ -217,6 +231,7 @@ section "4K Pro firmware"
 firmware_any=false
 for fw in \
     "/var/lib/sc0710/firmware/SC0710.FWI.HEX" \
+    "/home/sc0710/firmware/SC0710.FWI.HEX" \
     "/lib/firmware/sc0710/SC0710.FWI.HEX" \
     "/etc/firmware/sc0710/SC0710.FWI.HEX"; do
     if [[ -f "$fw" || -L "$fw" ]]; then
