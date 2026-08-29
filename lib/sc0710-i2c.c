@@ -820,6 +820,9 @@ int sc0710_i2c_read_hdmi_status(struct sc0710_dev *dev)
 	}
 
 	mutex_unlock(&dev->signalMutex);
+	if (dev->board == SC0710_BOARD_ELGATO_CAMLINK_PRO &&
+	    was_locked && !dev->locked)
+		sc0710_i2c_apply_4k_mode(dev);
 	return 0; /* Success */
 
 confirmed_timing_change:
@@ -946,6 +949,8 @@ confirmed_timing_change:
 	}
 
 	mutex_unlock(&dev->signalMutex);
+	if (dev->board == SC0710_BOARD_ELGATO_CAMLINK_PRO)
+		sc0710_i2c_apply_4k_mode(dev);
 
 	/* AUTO color_deep / HDR deliver may flip with metadata on this commit. */
 	sc0710_i2c_apply_color_deep(dev);
@@ -1040,19 +1045,20 @@ void sc0710_i2c_set_input_path(struct sc0710_dev *dev)
  * source >= 3840x2160 on HDMI input 1 (zero-based index 0), the vendor
  * driver does a read-modify-write of MCU (0x32) subaddress 0x03, setting
  * bit 0; index 2 uses bit 1. Dropping below 4K clears the bit. This is
- * the only 4K-specific MCU transaction; everything else (0xC8 height,
- * 0xD0=0x4100) already follows the detected timing we program.
+ * the MCU half of 4K setup. BAR0 0xD0 bit 0x80 separately bypasses the
+ * horizontal half-scaler and is programmed by the pipeline setup.
  *
  * Reversible and non-destructive: one control byte on the safe status
- * port, exactly as Windows toggles it on every 4K lock. Trigger with
+ * port, exactly as Windows toggles it on every 4K lock. The timing detector
+ * applies it automatically. These diagnostic triggers remain available:
  *   echo 1 > /sys/module/sc0710/parameters/clp_4k_switch   (enable)
  *   echo 2 > /sys/module/sc0710/parameters/clp_4k_switch   (force disable)
  * and watch dmesg; then capture a raw tap (clp_raw=1) to learn the 4K
- * chunk geometry. Default 0 = never touch subaddress 0x03. */
+ * chunk geometry. */
 unsigned int clp_4k_switch;
 module_param_named(clp_4k_switch, clp_4k_switch, int, 0644);
 MODULE_PARM_DESC(clp_4k_switch,
-	"Cam Link Pro M4: 1 = set the 4K bit for the active input on MCU 0x03 (if >=3840x2160), 2 = clear it; 0 = leave alone");
+	"Cam Link Pro diagnostic: 1 = reapply automatic MCU 4K bit, 2 = force clear once");
 
 void sc0710_i2c_apply_4k_mode(struct sc0710_dev *dev)
 {
@@ -1061,6 +1067,9 @@ void sc0710_i2c_apply_4k_mode(struct sc0710_dev *dev)
 	u8 wbuf[2] = { 0x03, 0 };
 	u8 rbuf[1] = { 0 };
 	int ret;
+
+	if (dev->board != SC0710_BOARD_ELGATO_CAMLINK_PRO)
+		return;
 
 	/* The vendor maps input index 0 -> bit 0, index 2 -> bit 1. Other
 	 * inputs have no documented 4K bit; refuse rather than guess. */
@@ -1079,12 +1088,7 @@ void sc0710_i2c_apply_4k_mode(struct sc0710_dev *dev)
 	} else {
 		/* Enable only when the detected source really is >= 4K, the
 		 * same geometry gate the Windows driver applies. */
-		if (dev->width < 3840 || dev->height < 2160) {
-			printk(KERN_WARNING "%s: 4K switch: detected %ux%u is below 3840x2160; not enabling\n",
-				dev->name, dev->width, dev->height);
-			return;
-		}
-		want = 1;
+		want = sc0710_clp_native_4k(dev);
 	}
 
 	mutex_lock(&dev->signalMutex);
@@ -2411,4 +2415,3 @@ int sc0710_i2c_initialize(struct sc0710_dev *dev)
 
 	return 0;
 }
-

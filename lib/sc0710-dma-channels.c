@@ -111,14 +111,15 @@ void sc0710_program_pipeline_regs(struct sc0710_dev *dev)
 {
 	u32 c8 = dev->fmt ? dev->fmt->height : 0x438;
 	u32 d0 = dev->pixfmt->pipeline_d0;
-
-	/* Cam Link Pro: the FPGA's NV12 output was mapped with the YUYV
-	 * selector value; other values reconfigure the front end into
-	 * layouts that have not been decoded. Pin it. */
-	if (dev->board == SC0710_BOARD_ELGATO_CAMLINK_PRO)
-		d0 = 0x4100;
 	int scaler = dev->board == SC0710_BOARD_ELGATEO_4KP ||
 		     (dev->board == SC0710_BOARD_ELGATO_CAMLINK_PRO && sc400_scaler);
+
+	/* Cam Link Pro: bit 0x80 bypasses the FPGA's horizontal half-scaler.
+	 * It changes the wire payload from 1920 to native 3840 bytes per line.
+	 * Keep the old selector for smaller inputs, whose native layout has not
+	 * been mapped. */
+	if (dev->board == SC0710_BOARD_ELGATO_CAMLINK_PRO)
+		d0 = sc0710_clp_native_4k(dev) ? 0x4180 : 0x4100;
 
 	sc_write(dev, 0, BAR0_00C8, c8);
 

@@ -308,12 +308,12 @@ static void sc0710_clp_upscale_y_line(const u8 *src, u8 *dst)
 {
 	u32 x;
 
-	for (x = 0; x + 1 < SC0710_CLP_SRC_WIDTH; x++) {
+	for (x = 0; x + 1 < SC0710_CLP_LEGACY_WIDTH; x++) {
 		dst[2 * x] = src[x];
 		dst[2 * x + 1] = (src[x] + src[x + 1] + 1) >> 1;
 	}
-	dst[SC0710_CLP_WIDTH - 2] = src[SC0710_CLP_SRC_WIDTH - 1];
-	dst[SC0710_CLP_WIDTH - 1] = src[SC0710_CLP_SRC_WIDTH - 1];
+	dst[SC0710_CLP_WIDTH - 2] = src[SC0710_CLP_LEGACY_WIDTH - 1];
+	dst[SC0710_CLP_WIDTH - 1] = src[SC0710_CLP_LEGACY_WIDTH - 1];
 }
 
 /* Expand one NV12 chroma line without mixing the interleaved U and V
@@ -322,16 +322,16 @@ static void sc0710_clp_upscale_uv_line(const u8 *src, u8 *dst)
 {
 	u32 x;
 
-	for (x = 0; x + 2 < SC0710_CLP_SRC_WIDTH; x += 2) {
+	for (x = 0; x + 2 < SC0710_CLP_LEGACY_WIDTH; x += 2) {
 		dst[2 * x] = src[x];
 		dst[2 * x + 1] = src[x + 1];
 		dst[2 * x + 2] = (src[x] + src[x + 2] + 1) >> 1;
 		dst[2 * x + 3] = (src[x + 1] + src[x + 3] + 1) >> 1;
 	}
-	dst[SC0710_CLP_WIDTH - 4] = src[SC0710_CLP_SRC_WIDTH - 2];
-	dst[SC0710_CLP_WIDTH - 3] = src[SC0710_CLP_SRC_WIDTH - 1];
-	dst[SC0710_CLP_WIDTH - 2] = src[SC0710_CLP_SRC_WIDTH - 2];
-	dst[SC0710_CLP_WIDTH - 1] = src[SC0710_CLP_SRC_WIDTH - 1];
+	dst[SC0710_CLP_WIDTH - 4] = src[SC0710_CLP_LEGACY_WIDTH - 2];
+	dst[SC0710_CLP_WIDTH - 3] = src[SC0710_CLP_LEGACY_WIDTH - 1];
+	dst[SC0710_CLP_WIDTH - 2] = src[SC0710_CLP_LEGACY_WIDTH - 2];
+	dst[SC0710_CLP_WIDTH - 1] = src[SC0710_CLP_LEGACY_WIDTH - 1];
 }
 
 /* Unpack the legacy Cam Link Pro row-triplet stream into packed NV12.
@@ -339,22 +339,36 @@ static void sc0710_clp_upscale_uv_line(const u8 *src, u8 *dst)
  * current 3840x2160 delivery shape. This old bring-up fallback only has
  * 1080 luma lines in one gather, so it doubles them vertically; normal
  * capture uses the header framer below and keeps all native lines. */
-static void sc0710_clp_unpack_nv12(const u8 *src, u8 *dst)
+static void sc0710_clp_unpack_nv12(const u8 *src, u8 *dst,
+	u32 source_width, u32 chunk_size)
 {
 	u8 *y = dst;
 	u8 *uv = dst + SC0710_CLP_WIDTH * SC0710_CLP_HEIGHT;
 	u32 t;
 
 	for (t = 0; t < 540; t++) {
-		const u8 *row = src + (size_t)t * SC0710_CLP_ROW;
+		const u8 *row = src + (size_t)t * 3 * chunk_size;
 
-		sc0710_clp_upscale_y_line(row, y);
+		if (source_width == SC0710_CLP_SRC_WIDTH)
+			memcpy(y, row + SC0710_CLP_HDR, SC0710_CLP_WIDTH);
+		else
+			sc0710_clp_upscale_y_line(row + SC0710_CLP_HDR, y);
 		memcpy(y + SC0710_CLP_WIDTH, y, SC0710_CLP_WIDTH);
 		y += 2 * SC0710_CLP_WIDTH;
-		sc0710_clp_upscale_y_line(row + SC0710_CLP_CHUNK, y);
+		if (source_width == SC0710_CLP_SRC_WIDTH)
+			memcpy(y, row + chunk_size + SC0710_CLP_HDR,
+				SC0710_CLP_WIDTH);
+		else
+			sc0710_clp_upscale_y_line(row + chunk_size +
+				SC0710_CLP_HDR, y);
 		memcpy(y + SC0710_CLP_WIDTH, y, SC0710_CLP_WIDTH);
 		y += 2 * SC0710_CLP_WIDTH;
-		sc0710_clp_upscale_uv_line(row + 2 * SC0710_CLP_CHUNK, uv);
+		if (source_width == SC0710_CLP_SRC_WIDTH)
+			memcpy(uv, row + 2 * chunk_size + SC0710_CLP_HDR,
+				SC0710_CLP_WIDTH);
+		else
+			sc0710_clp_upscale_uv_line(row + 2 * chunk_size +
+				SC0710_CLP_HDR, uv);
 		memcpy(uv + SC0710_CLP_WIDTH, uv, SC0710_CLP_WIDTH);
 		uv += 2 * SC0710_CLP_WIDTH;
 	}
@@ -395,32 +409,41 @@ MODULE_PARM_DESC(clp_wbm_debug,
 /* Rows probed by the alignment checks, spread over the frame. */
 static const u16 sc0710_clp_probe_rows[] = { 1, 13, 67, 131, 263, 389, 487, 539 };
 
+static bool sc0710_clp_pad_bad(const u8 *pad, u32 source_width)
+{
+	u8 expected = source_width == SC0710_CLP_SRC_WIDTH ? 0xff : 0x00;
+	u32 x;
+
+	for (x = 0; x < 8; x++)
+		if (pad[x] != expected)
+			return true;
+	return false;
+}
+
 /* Alignment gate for a gathered SC0710_CLP_DMA_FRAMESIZE frame.
  * The stream carries no framing, so a frame is trusted only if (a) the 8
- * zero pad bytes closing every 1936-byte chunk land where the grid says
+ * fixed pad bytes closing every chunk land where the grid says
  * (catches sub-chunk slips) and (b) the chunk ROLES hold: interleaved UV
  * data correlates better at 2-byte than 1-byte steps (U with U, V with V),
  * luma the other way round, so the most chroma-like chunk of a triplet must
  * be the third (catches whole-chunk role rotations, which pads survive).
  * On flat grey content the role test scores near zero and abstains.
  * Returns non-zero when the frame is misaligned. */
-static int sc0710_clp_frame_misaligned(const u8 *buf, bool check_roles)
+static int sc0710_clp_frame_misaligned(const u8 *buf, bool check_roles,
+	u32 chunk_size, u32 source_width)
 {
 	unsigned int k;
 
 	for (k = 0; k < ARRAY_SIZE(sc0710_clp_probe_rows); k++) {
 		const u8 *t = buf +
-			(size_t)sc0710_clp_probe_rows[k] * SC0710_CLP_ROW;
+			(size_t)sc0710_clp_probe_rows[k] * 3 * chunk_size;
 		unsigned int c;
 
 		for (c = 0; c < 3; c++) {
-			const u8 *pad = t + c * SC0710_CLP_CHUNK +
-				SC0710_CLP_CHUNK - 8;
-			unsigned int x;
+			const u8 *pad = t + c * chunk_size + chunk_size - 8;
 
-			for (x = 0; x < 8; x++)
-				if (pad[x])
-					return 1;
+			if (sc0710_clp_pad_bad(pad, source_width))
+				return 1;
 		}
 	}
 
@@ -435,10 +458,10 @@ static int sc0710_clp_frame_misaligned(const u8 *buf, bool check_roles)
 
 		for (k = 0; k < ARRAY_SIZE(sc0710_clp_probe_rows); k++) {
 			const u8 *t = buf +
-				(size_t)sc0710_clp_probe_rows[k] * SC0710_CLP_ROW;
+				(size_t)sc0710_clp_probe_rows[k] * 3 * chunk_size;
 
 			for (c = 0; c < 3; c++) {
-				const u8 *d = t + c * SC0710_CLP_CHUNK + 256;
+				const u8 *d = t + c * chunk_size + 256;
 
 				for (x = 0; x < 512; x += 2)
 					roleScore[c] +=
@@ -518,6 +541,7 @@ static void sc0710_clp_raw_deliver(struct sc0710_dma_channel *ch)
 		unsigned long bf;
 		u8 *dst;
 		unsigned long bs;
+		u32 raw_size = 540 * 3 * cv->chunk_size;
 
 		if (!client->streaming)
 			continue;
@@ -530,7 +554,7 @@ static void sc0710_clp_raw_deliver(struct sc0710_dma_channel *ch)
 		dst = vb2_plane_vaddr(&vb_buf->vb.vb2_buf, 0);
 		bs = vb2_plane_size(&vb_buf->vb.vb2_buf, 0);
 		if (dst) {
-			u32 n = min_t(u32, SC0710_CLP_DMA_FRAMESIZE, (u32)bs);
+			u32 n = min_t(u32, raw_size, (u32)bs);
 
 			memcpy(dst, cv->frame, n);
 			vb2_set_plane_payload(&vb_buf->vb.vb2_buf, 0, n);
@@ -547,15 +571,16 @@ static void sc0710_clp_raw_deliver(struct sc0710_dma_channel *ch)
 	mod_timer(&ch->timeout, jiffies + VBUF_TIMEOUT);
 }
 
-/* A picture is complete when the next one's line 1 arrives. Keep every
- * native source line and expand only the FPGA-halved horizontal axis.
- * Lines that never arrived keep the previous picture's content. */
+/* A picture is complete when the next one's line 1 arrives. Native 4K is
+ * already packed NV12 and can be delivered directly. The old selector's
+ * 1920-wide fallback is expanded horizontally. Lines that never arrived
+ * keep the previous picture's content. */
 static void sc0710_clp_deliver_picture(struct sc0710_dma_channel *ch)
 {
 	struct sc0710_clp_conveyor *cv = &ch->cv;
 	const u8 *ysrc = cv->frame;
 	const u8 *uvsrc = cv->frame +
-		SC0710_CLP_SRC_WIDTH * SC0710_CLP_SRC_HEIGHT;
+		cv->source_width * SC0710_CLP_SRC_HEIGHT;
 	u8 *yd = cv->out;
 	u8 *uvd = cv->out + SC0710_CLP_WIDTH * SC0710_CLP_HEIGHT;
 	u32 i;
@@ -571,14 +596,20 @@ static void sc0710_clp_deliver_picture(struct sc0710_dma_channel *ch)
 		return;
 	}
 
+	if (cv->source_width == SC0710_CLP_SRC_WIDTH) {
+		cv->pictures++;
+		sc0710_clp_broadcast_frame(ch, cv->frame);
+		return;
+	}
+
 	for (i = 0; i < SC0710_CLP_SRC_HEIGHT; i++) {
 		sc0710_clp_upscale_y_line(ysrc, yd);
-		ysrc += SC0710_CLP_SRC_WIDTH;
+		ysrc += cv->source_width;
 		yd += SC0710_CLP_WIDTH;
 	}
 	for (i = 0; i < SC0710_CLP_SRC_UV_HEIGHT; i++) {
 		sc0710_clp_upscale_uv_line(uvsrc, uvd);
-		uvsrc += SC0710_CLP_SRC_WIDTH;
+		uvsrc += cv->source_width;
 		uvd += SC0710_CLP_WIDTH;
 	}
 
@@ -586,8 +617,8 @@ static void sc0710_clp_deliver_picture(struct sc0710_dma_channel *ch)
 	sc0710_clp_broadcast_frame(ch, cv->out);
 }
 
-/* One complete 1936-byte chunk: validate its header and place its 1920
- * payload bytes by line number. */
+/* Validate one complete chunk and place its 1920- or 3840-byte payload by
+ * line number. */
 static void sc0710_clp_process_chunk(struct sc0710_dma_channel *ch)
 {
 	struct sc0710_clp_conveyor *cv = &ch->cv;
@@ -604,10 +635,7 @@ static void sc0710_clp_process_chunk(struct sc0710_dma_channel *ch)
 		return;
 	}
 
-	if (c[SC0710_CLP_CHUNK - 8] | c[SC0710_CLP_CHUNK - 7] |
-	    c[SC0710_CLP_CHUNK - 6] | c[SC0710_CLP_CHUNK - 5] |
-	    c[SC0710_CLP_CHUNK - 4] | c[SC0710_CLP_CHUNK - 3] |
-	    c[SC0710_CLP_CHUNK - 2] | c[SC0710_CLP_CHUNK - 1])
+	if (sc0710_clp_pad_bad(c + cv->chunk_size - 8, cv->source_width))
 		cv->pad_errors++;
 
 	if (c[7] == 0x4f) {
@@ -617,8 +645,8 @@ static void sc0710_clp_process_chunk(struct sc0710_dma_channel *ch)
 		 * duplicated/reordered header from splitting a picture. */
 		if (line == 1 && cv->lines_placed > SC0710_CLP_SRC_HEIGHT / 4)
 			sc0710_clp_deliver_picture(ch);
-		memcpy(cv->frame + (size_t)(line - 1) * SC0710_CLP_SRC_WIDTH,
-			c + SC0710_CLP_HDR, SC0710_CLP_SRC_WIDTH);
+		memcpy(cv->frame + (size_t)(line - 1) * cv->source_width,
+			c + SC0710_CLP_HDR, cv->source_width);
 		cv->lines_placed++;
 	} else {
 		/* Chroma chunks are numbered with the ODD luma line they pair
@@ -629,9 +657,9 @@ static void sc0710_clp_process_chunk(struct sc0710_dma_channel *ch)
 		    uvline > SC0710_CLP_SRC_UV_HEIGHT)
 			return;
 		memcpy(cv->frame +
-			(size_t)SC0710_CLP_SRC_WIDTH * SC0710_CLP_SRC_HEIGHT +
-			(size_t)(uvline - 1) * SC0710_CLP_SRC_WIDTH,
-			c + SC0710_CLP_HDR, SC0710_CLP_SRC_WIDTH);
+			(size_t)cv->source_width * SC0710_CLP_SRC_HEIGHT +
+			(size_t)(uvline - 1) * cv->source_width,
+			c + SC0710_CLP_HDR, cv->source_width);
 	}
 }
 
@@ -643,14 +671,16 @@ static void sc0710_clp_framer_append(struct sc0710_dma_channel *ch,
 	struct sc0710_clp_conveyor *cv = &ch->cv;
 
 	if (clp_raw) {
+		u32 raw_size = 540 * 3 * cv->chunk_size;
+
 		while (len) {
-			u32 n = min(len, SC0710_CLP_DMA_FRAMESIZE - cv->fill);
+			u32 n = min(len, raw_size - cv->fill);
 
 			memcpy(cv->frame + cv->fill, src, n);
 			cv->fill += n;
 			src += n;
 			len -= n;
-			if (cv->fill == SC0710_CLP_DMA_FRAMESIZE) {
+			if (cv->fill == raw_size) {
 				cv->fill = 0;
 				sc0710_clp_raw_deliver(ch);
 			}
@@ -683,12 +713,12 @@ static void sc0710_clp_framer_append(struct sc0710_dma_channel *ch,
 			len -= i;
 		}
 
-		n = min(len, SC0710_CLP_CHUNK - cv->chunk_fill);
+		n = min(len, cv->chunk_size - cv->chunk_fill);
 		memcpy(cv->chunk + cv->chunk_fill, src, n);
 		cv->chunk_fill += n;
 		src += n;
 		len -= n;
-		if (cv->chunk_fill == SC0710_CLP_CHUNK) {
+		if (cv->chunk_fill == cv->chunk_size) {
 			cv->chunk_fill = 0;
 			sc0710_clp_process_chunk(ch);
 		}
@@ -809,6 +839,8 @@ static int sc0710_clp_conveyor_build(struct sc0710_dma_channel *ch)
 	u32 spb, i;
 
 	sc0710_clp_conveyor_free(ch);
+	cv->source_width = sc0710_clp_source_width(dev);
+	cv->chunk_size = sc0710_clp_chunk_size(dev);
 
 	seg = clamp_t(u32, seg & ~0xfu, 0x200, 0x10000);
 	ndesc = clamp_t(u32, ndesc, 16, 2048);
@@ -846,8 +878,9 @@ static int sc0710_clp_conveyor_build(struct sc0710_dma_channel *ch)
 	cv->seg = seg;
 	cv->ndesc = ndesc;
 
-	printk(KERN_INFO "%s: [ch%d] conveyor: %u descriptors x %u bytes (%u KiB ring, %u blocks)\n",
-		dev->name, ch->nr, ndesc, seg, (ndesc * seg) >> 10, cv->nblocks);
+	printk(KERN_INFO "%s: [ch%d] conveyor: %u descriptors x %u bytes (%u KiB ring, %u blocks), %u-byte source lines\n",
+		dev->name, ch->nr, ndesc, seg, (ndesc * seg) >> 10, cv->nblocks,
+		cv->source_width);
 	return 0;
 }
 
@@ -1117,7 +1150,8 @@ static void sc0710_dma_dequeue_video(struct sc0710_dma_channel *ch,
 		 * whole raster out of the ring grid; two bad gathers in a row
 		 * schedule the existing DMA resync, whose fresh pipeline GO
 		 * restarts the stream frame-aligned. */
-		misaligned = sc0710_clp_frame_misaligned(dev->frame_staging_buf, true);
+		misaligned = sc0710_clp_frame_misaligned(dev->frame_staging_buf, true,
+			sc0710_clp_chunk_size(dev), sc0710_clp_source_width(dev));
 
 		if (misaligned) {
 			ch->clp_aligned_streak = 0;
@@ -1195,7 +1229,9 @@ static void sc0710_dma_dequeue_video(struct sc0710_dma_channel *ch,
 				spin_unlock_irqrestore(&client->buffer_lock, buf_flags);
 				continue;
 			}
-			sc0710_clp_unpack_nv12(dev->frame_staging_buf, dst);
+			sc0710_clp_unpack_nv12(dev->frame_staging_buf, dst,
+				sc0710_clp_source_width(dev),
+				sc0710_clp_chunk_size(dev));
 			vb2_set_plane_payload(&vb_buf->vb.vb2_buf, 0, deliver_framesize);
 		} else if (src_frame) {
 			if (source_framesize <= buffer_size) {

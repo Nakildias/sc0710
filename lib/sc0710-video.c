@@ -591,18 +591,19 @@ static void sc0710_clp_fill_status_nv12(u8 *dst, unsigned long buf_size,
 static void sc0710_get_effective_size(struct sc0710_dev *dev,
 	const struct sc0710_format *fmt, u32 *width, u32 *height, u32 *framesize)
 {
-	/* Cam Link Pro: the card's chunk stream assembles to fixed anamorphic
-	 * 1920x2160 NV12 and is delivered as 3840x2160; the detected format only
-	 * drives the FPGA input programming. Everything that negotiates
+	/* Cam Link Pro: native 4K is a 3840x2160 NV12 chunk stream. The older
+	 * 1920-wide scaler path remains a fallback for smaller inputs and is
+	 * expanded to the same delivered shape. Everything that negotiates
 	 * with userspace (g/try/s_fmt, enum ioctls, queue sizing, the
 	 * client's stream-lifetime lock) funnels through here. */
 	if (dev->board == SC0710_BOARD_ELGATO_CAMLINK_PRO) {
 		if (clp_raw) {
 			/* Bring-up microscope: expose the DMA ring 1:1. */
 			u32 ring = sc0710_dma_framesize(dev, fmt);
+			u32 chunk = sc0710_clp_chunk_size(dev);
 
-			*width = SC0710_CLP_CHUNK;
-			*height = ring / SC0710_CLP_CHUNK;
+			*width = chunk;
+			*height = ring / chunk;
 			*framesize = ring;
 			return;
 		}

@@ -127,16 +127,18 @@ extern unsigned int keep_audio_alive;
 #define SC0710_BOARD_ELGATO_CAMLINK_PRO  3
 
 /* Cam Link Pro source and delivery geometry, mapped on real hardware.
- * Chunk headers describe an anamorphic 1920x2160 NV12 picture: the FPGA
- * halves a 4K input horizontally but keeps all 2160 luma lines. Userspace
- * gets a correctly proportioned 3840x2160 frame, with only the horizontal
- * axis interpolated. */
-#define SC0710_CLP_SRC_WIDTH     1920
+ * With BAR0 0xD0 bit 0x80 set, a 4K input is native 3840x2160 NV12 on the
+ * wire. Each line is [8-byte header][3840 pixels][8-byte 0xff pad]. The old
+ * selector remains as a fallback for smaller inputs and emits the same
+ * headers around a horizontally scaled 1920x2160 picture. */
+#define SC0710_CLP_SRC_WIDTH     3840
+#define SC0710_CLP_LEGACY_WIDTH  1920
 #define SC0710_CLP_SRC_HEIGHT    2160  /* luma lines per picture */
 #define SC0710_CLP_SRC_UV_HEIGHT 1080  /* chroma lines per picture */
 #define SC0710_CLP_WIDTH         3840
 #define SC0710_CLP_HEIGHT        2160
-#define SC0710_CLP_CHUNK        1936
+#define SC0710_CLP_CHUNK         3856  /* maximum/native chunk size */
+#define SC0710_CLP_LEGACY_CHUNK  1936
 #define SC0710_CLP_ROW          (3 * SC0710_CLP_CHUNK)
 /* Legacy DMA/raw-tap slab size. Picture boundaries come from chunk headers. */
 #define SC0710_CLP_DMA_FRAMESIZE (540 * SC0710_CLP_ROW)
@@ -303,18 +305,19 @@ struct sc0710_clp_conveyor
 	u64         consumed;       /* descriptors consumed since engine start */
 	u64         stream_bytes;   /* payload bytes consumed since engine start */
 
-	/* Header framer. Every 1936-byte chunk of the stream is
-	 * [8-byte header][1920 pixel bytes][8 zero pad], the header being
+	/* Header framer. Each chunk is
+	 * [8-byte header][1920 or 3840 pixel bytes][8-byte pad], the header being
 	 * ff ff ff 00, a little-endian line counter << 3, 00, and a type tag
 	 * (0x4f = luma, 0x6f = chroma). Line counters run 1..2160 (luma) /
 	 * 1..1080 (chroma) and restart at every picture, so the stream is
-	 * self-describing: chunks are placed by line number into an
-	 * anamorphic 1920x2160 picture (half-width 4K), then horizontally
-	 * interpolated to 3840x2160 for delivery. Losing bytes costs exactly
-	 * the lines they carried. Sync recovery is a header scan. */
-	u8         *frame;          /* Y plane 1920x2160 then UV 1920x1080 */
+	 * self-describing. Native 4K is delivered directly; the old 1920-wide
+	 * fallback is horizontally interpolated. Losing bytes costs exactly the
+	 * lines they carried. Sync recovery is a header scan. */
+	u8         *frame;          /* source Y plane then source UV plane */
 	u8         *out;            /* delivered NV12 3840x2160 */
 	u8          chunk[SC0710_CLP_CHUNK]; /* chunk spanning segments */
+	u32         source_width;   /* 3840 native or 1920 fallback */
+	u32         chunk_size;     /* source_width + header + fixed pad */
 	u32         chunk_fill;
 	bool        synced;         /* chunk grid locked to the stream */
 	u32         lines_placed;   /* luma lines landed in this picture */
@@ -681,10 +684,27 @@ static inline u32 sc0710_framesize(const struct sc0710_dev *dev,
 	return fmt ? fmt->width * dev->pixfmt->bpp * fmt->height : 0;
 }
 
-/* Bytes the DMA engine delivers per frame. On the Cam Link Pro this is a
- * board constant (see SC0710_CLP_*): the FPGA's output geometry is fixed
- * and is not the detected input timing, which only steers the pipeline
- * input registers. Everywhere else it is the packed frame size. */
+static inline bool sc0710_clp_native_4k(const struct sc0710_dev *dev)
+{
+	return dev->width >= SC0710_CLP_WIDTH &&
+	       dev->height >= SC0710_CLP_HEIGHT;
+}
+
+static inline u32 sc0710_clp_source_width(const struct sc0710_dev *dev)
+{
+	return sc0710_clp_native_4k(dev) ? SC0710_CLP_SRC_WIDTH :
+		SC0710_CLP_LEGACY_WIDTH;
+}
+
+static inline u32 sc0710_clp_chunk_size(const struct sc0710_dev *dev)
+{
+	return sc0710_clp_native_4k(dev) ? SC0710_CLP_CHUNK :
+		SC0710_CLP_LEGACY_CHUNK;
+}
+
+/* Bytes the DMA engine delivers per frame. The Cam Link Pro uses a mapped
+ * chunk-stream slab sized for its native or fallback selector. Everywhere
+ * else this is the packed frame size. */
 extern unsigned int clp_dma_override;
 
 static inline u32 sc0710_dma_framesize(const struct sc0710_dev *dev,
@@ -694,7 +714,7 @@ static inline u32 sc0710_dma_framesize(const struct sc0710_dev *dev,
 		if (!fmt)
 			return 0;
 		return clp_dma_override ? clp_dma_override :
-			SC0710_CLP_DMA_FRAMESIZE;
+			540 * 3 * sc0710_clp_chunk_size(dev);
 	}
 	return sc0710_framesize(dev, fmt);
 }
