@@ -679,6 +679,8 @@ extern int tm_bgr_chroma;
 extern int force_eotf;
 bool sc0710_edid_header_valid(const u8 *p);
 int sc0710_i2c_read_hdmi_status(struct sc0710_dev *dev);
+void sc0710_i2c_mcu_scan(struct sc0710_dev *dev);
+extern unsigned int sc0710_mcu_scan;
 int sc0710_i2c_read_status2(struct sc0710_dev *dev);
 int sc0710_i2c_read_status3(struct sc0710_dev *dev);
 int sc0710_i2c_read_procamp(struct sc0710_dev *dev);

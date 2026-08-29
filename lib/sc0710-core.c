@@ -815,6 +815,10 @@ static int sc0710_thread_hdmi_function(void *data)
 		}
 
 		sc0710_i2c_read_hdmi_status(dev);
+		if (sc0710_mcu_scan) {
+			sc0710_mcu_scan = 0;
+			sc0710_i2c_mcu_scan(dev);
+		}
 		/* Keep the procamp cache fresh: /proc/sc0710-state prints it but is
 		 * forbidden from running I2C itself. The values are user controls
 		 * that rarely change, so every 10th tick (~2 s at the default

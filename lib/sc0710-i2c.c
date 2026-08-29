@@ -540,6 +540,16 @@ static enum sc0710_eotf_e sc0710_eotf_from_hdmi(u8 hint_flags,
 	return EOTF_SDR;
 }
 
+/* Cam Link Pro: the MCU keeps one status block per HDMI input in a flat
+ * buffer, 0x3C bytes apart (found by scanning the subaddress space with a
+ * camera on HDMI-3: input i's block sits at subaddress i * 0x3C, same
+ * field layout as the MK.2's single block, plus what look like the procamp
+ * defaults at block offset 0x13). Until the driver grows four video nodes,
+ * this picks which input the single pipeline watches. */
+unsigned int sc0710_hdmi_input;
+module_param_named(hdmi_input, sc0710_hdmi_input, int, 0644);
+MODULE_PARM_DESC(hdmi_input, "Cam Link Pro: HDMI input to capture, 0-3 (default 0 = HDMI-1)");
+
 int sc0710_i2c_read_hdmi_status(struct sc0710_dev *dev)
 {
 	int ret;
@@ -558,8 +568,11 @@ int sc0710_i2c_read_hdmi_status(struct sc0710_dev *dev)
        Use trylock or lock - check precedent. core.c calls this with kthread_hdmi_lock held,
        but dev->signalMutex protects the fmt.
     */
+	if (dev->board == SC0710_BOARD_ELGATO_CAMLINK_PRO)
+		wbuf[0] = (sc0710_hdmi_input & 3) * 0x3c;
+
 	mutex_lock(&dev->signalMutex);
-	
+
 	/* Remember previous lock state to detect signal restoration */
 	was_locked = dev->locked;
 
@@ -963,6 +976,49 @@ confirmed_timing_change:
 	sc0710_video_notify_source_change(dev);
 
 	return 0;
+}
+
+/* One-shot diagnostic for the Cam Link Pro: hexdump the MCU's status
+ * subaddress space so the per-input (4x HDMI) status layout can be found.
+ * Read-only: same transaction shape as the normal status poll, just at
+ * every subaddress. Trigger with
+ *   echo 1 > /sys/module/sc0710/parameters/mcu_scan
+ * and read the result from dmesg. */
+unsigned int sc0710_mcu_scan;
+module_param_named(mcu_scan, sc0710_mcu_scan, int, 0644);
+MODULE_PARM_DESC(mcu_scan, "Set to 1 to hexdump MCU subaddresses 0x00-0x7f once (read-only diagnostic)");
+
+void sc0710_i2c_mcu_scan(struct sc0710_dev *dev)
+{
+	u8 wbuf[1];
+	u8 rbuf[0x14];
+	char line[3 * sizeof(rbuf) + 1];
+	int sub, i, n, ret, nonzero;
+
+	printk(KERN_INFO "%s: MCU subaddress scan (0x14 bytes each):\n", dev->name);
+	for (sub = 0; sub < 0x80; sub++) {
+		wbuf[0] = sub;
+		memset(rbuf, 0, sizeof(rbuf));
+		ret = sc0710_i2c_writeread(dev, I2C_DEV__ARM_MCU,
+					   &wbuf[0], 1, &rbuf[0], sizeof(rbuf));
+		if (ret < 0) {
+			printk(KERN_INFO "%s:   sub %02x: i2c error %d\n",
+				dev->name, sub, ret);
+			continue;
+		}
+		nonzero = 0;
+		for (i = 0; i < sizeof(rbuf); i++)
+			nonzero |= rbuf[i];
+		if (!nonzero)
+			continue; /* all-zero rows are noise; log only data */
+		n = 0;
+		for (i = 0; i < sizeof(rbuf); i++)
+			n += scnprintf(line + n, sizeof(line) - n, "%02x ", rbuf[i]);
+		printk(KERN_INFO "%s:   sub %02x: %s\n", dev->name, sub, line);
+		msleep(2);
+	}
+	printk(KERN_INFO "%s: MCU subaddress scan complete (all-zero rows omitted)\n",
+		dev->name);
 }
 
 int sc0710_i2c_read_status2(struct sc0710_dev *dev)
