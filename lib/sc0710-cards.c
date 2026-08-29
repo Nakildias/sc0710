@@ -484,7 +484,7 @@ static int sc0710_ecp5_firmware_check(struct sc0710_dev *dev)
 {
 	u8 *fw_data;
 	size_t fw_size;
-	u32 idcode, half_size, status;
+	u32 idcode, payload, first_len, second_len, status;
 	u8 *decoded;
 	int ret, i;
 
@@ -525,30 +525,37 @@ static int sc0710_ecp5_firmware_check(struct sc0710_dev *dev)
 		return -EINVAL;
 	}
 
-	half_size = (fw_size - FWI_HEADER_SIZE) / 2;
-
-	/* FWI format: 16-byte header + two halves with swapped order.
-	 * Full .bit file = (second half XOR 0xA5) + (first half XOR 0x5A).
-	 * Windows sends all 356,448 bytes including text header.
+	/* FWI format: 16-byte header + the bitstream stored as two halves in
+	 * swapped order. Full .bit file = (second half XOR 0xA5) + (first
+	 * half XOR 0x5A). When the payload length is odd (Cam Link Pro:
+	 * 622,035 bytes) the FIRST stored half is the longer one; a floor
+	 * split starts the stream one byte early and truncates its tail,
+	 * and the ECP5 rejects the result with a CRC error at the end of
+	 * the burst. The 4K Pro blob is even-sized, so both splits agree
+	 * there. Windows sends every decoded byte including text header.
 	 */
-	decoded = vmalloc(half_size * 2);
+	payload = fw_size - FWI_HEADER_SIZE;
+	first_len = (payload + 1) / 2;
+	second_len = payload - first_len;
+
+	decoded = vmalloc(payload);
 	if (!decoded) {
 		vfree(fw_data);
 		return -ENOMEM;
 	}
 
 	/* First part of bitstream: FWI second half XOR 0xA5 */
-	for (i = 0; i < half_size; i++)
-		decoded[i] = fw_data[FWI_HEADER_SIZE + half_size + i] ^ FWI_XOR_SECOND;
+	for (i = 0; i < second_len; i++)
+		decoded[i] = fw_data[FWI_HEADER_SIZE + first_len + i] ^ FWI_XOR_SECOND;
 
 	/* Second part of bitstream: FWI first half XOR 0x5A */
-	for (i = 0; i < half_size; i++)
-		decoded[half_size + i] = fw_data[FWI_HEADER_SIZE + i] ^ FWI_XOR_FIRST;
+	for (i = 0; i < first_len; i++)
+		decoded[second_len + i] = fw_data[FWI_HEADER_SIZE + i] ^ FWI_XOR_FIRST;
 
 	vfree(fw_data);
 
 	for (i = 0; i < 3; i++) {
-		ret = ecp5_program_bitstream(dev, decoded, half_size * 2);
+		ret = ecp5_program_bitstream(dev, decoded, payload);
 		if (!ret)
 			break;
 		printk(KERN_WARNING "%s: ECP5 programming attempt %d failed, retrying...\n",
