@@ -111,6 +111,12 @@ void sc0710_program_pipeline_regs(struct sc0710_dev *dev)
 {
 	u32 c8 = dev->fmt ? dev->fmt->height : 0x438;
 	u32 d0 = dev->pixfmt->pipeline_d0;
+
+	/* Cam Link Pro: the FPGA's NV12 output was mapped with the YUYV
+	 * selector value; other values reconfigure the front end into
+	 * layouts that have not been decoded. Pin it. */
+	if (dev->board == SC0710_BOARD_ELGATO_CAMLINK_PRO)
+		d0 = 0x4100;
 	int scaler = dev->board == SC0710_BOARD_ELGATEO_4KP ||
 		     (dev->board == SC0710_BOARD_ELGATO_CAMLINK_PRO && sc400_scaler);
 
@@ -226,6 +232,19 @@ int sc0710_dma_sync_session(struct sc0710_dev *dev)
 				return ret;
 			need_video_dma = false;
 		}
+	}
+
+	/* Cam Link Pro: the FPGA only frame-aligns its output stream on a
+	 * fresh pipeline GO. A video start joining a running audio-only
+	 * session would arm its ring mid-stream and every frame would arrive
+	 * vertically wrapped at a random line. Restart the whole session so
+	 * video always begins at a frame boundary (one audible dropout on
+	 * the audio side, same as a session start). */
+	if (dev->board == SC0710_BOARD_ELGATO_CAMLINK_PRO &&
+	    need_video_dma && vch && vch->state != STATE_RUNNING &&
+	    any_running) {
+		sc0710_dma_channels_stop(dev);
+		any_running = false;
 	}
 
 	if (!any_running) {

@@ -211,6 +211,7 @@ MODULE_PARM_DESC(tm_bgr_chroma,
 /* Module parameter to enable status images (No Signal/No Device BMP)
  * 1 = show BMP images (default), 0 = show colorbars
  */
+extern unsigned int clp_raw;
 int use_status_images = 1;
 module_param(use_status_images, int, 0644);
 MODULE_PARM_DESC(use_status_images, "Show status images (1) or colorbars (0)");
@@ -555,6 +556,26 @@ void sc0710_video_free_status_frames(void)
 static void sc0710_get_effective_size(struct sc0710_dev *dev,
 	const struct sc0710_format *fmt, u32 *width, u32 *height, u32 *framesize)
 {
+	/* Cam Link Pro: the card's output is a fixed NV12 1080p stream no
+	 * matter what timing the MCU detects; the detected format only
+	 * drives the FPGA input programming. Everything that negotiates
+	 * with userspace (g/try/s_fmt, enum ioctls, queue sizing, the
+	 * client's stream-lifetime lock) funnels through here. */
+	if (dev->board == SC0710_BOARD_ELGATO_CAMLINK_PRO) {
+		if (clp_raw) {
+			/* Bring-up microscope: expose the DMA ring 1:1. */
+			u32 ring = sc0710_dma_framesize(dev, fmt);
+
+			*width = SC0710_CLP_CHUNK;
+			*height = ring / SC0710_CLP_CHUNK;
+			*framesize = ring;
+			return;
+		}
+		*width = SC0710_CLP_WIDTH;
+		*height = SC0710_CLP_HEIGHT;
+		*framesize = SC0710_CLP_SIZEIMAGE;
+		return;
+	}
 	*width = fmt->width;
 	*height = fmt->height;
 	*framesize = sc0710_framesize(dev, fmt);
@@ -1063,6 +1084,15 @@ static int vidioc_g_input(struct file *file, void *priv, unsigned int *i)
 
 static int vidioc_enum_fmt_vid_cap(struct file *file, void *priv, struct v4l2_fmtdesc *f)
 {
+	struct sc0710_dma_channel *ch = video_drvdata(file);
+
+	/* Cam Link Pro delivers NV12 and nothing else. */
+	if (ch->dev->board == SC0710_BOARD_ELGATO_CAMLINK_PRO) {
+		if (f->index != 0)
+			return -EINVAL;
+		f->pixelformat = V4L2_PIX_FMT_NV12;
+		return 0;
+	}
 	if (f->index >= sc0710_pixfmts_count)
 		return -EINVAL;
 	f->pixelformat = sc0710_pixfmts[f->index].fourcc;
@@ -1089,6 +1119,14 @@ static int vidioc_g_fmt_vid_cap(struct file *file, void *priv, struct v4l2_forma
 	f->fmt.pix.bytesperline = eff_w * sc0710_bpp(dev);
 	f->fmt.pix.sizeimage = eff_fs;
 	sc0710_fill_colorimetry(dev, dev->pixfmt, &f->fmt.pix);
+
+	if (dev->board == SC0710_BOARD_ELGATO_CAMLINK_PRO) {
+		/* Fixed NV12 delivery; the FPGA output is always progressive
+		 * (it deinterlaces/scales internally). */
+		f->fmt.pix.pixelformat = V4L2_PIX_FMT_NV12;
+		f->fmt.pix.field = V4L2_FIELD_NONE;
+		f->fmt.pix.bytesperline = eff_w;
+	}
 
 	return 0;
 }
@@ -1121,6 +1159,14 @@ static int vidioc_try_fmt_vid_cap(struct file *file, void *priv, struct v4l2_for
 	f->fmt.pix.bytesperline = eff_w * pf->bpp;
 	f->fmt.pix.sizeimage = eff_w * pf->bpp * eff_h;
 	sc0710_fill_colorimetry(dev, pf, &f->fmt.pix);
+
+	if (dev->board == SC0710_BOARD_ELGATO_CAMLINK_PRO) {
+		/* Whatever was asked for, the answer is NV12 1080p. */
+		f->fmt.pix.pixelformat = V4L2_PIX_FMT_NV12;
+		f->fmt.pix.field = V4L2_FIELD_NONE;
+		f->fmt.pix.bytesperline = eff_w;
+		f->fmt.pix.sizeimage = eff_fs;
+	}
 
 	return 0;
 }
@@ -1158,6 +1204,12 @@ static int vidioc_s_fmt_vid_cap(struct file *file, void *priv, struct v4l2_forma
 	if (busy)
 		return f->fmt.pix.pixelformat == dev->pixfmt->fourcc ? 0 : -EBUSY;
 
+	/* Cam Link Pro: try_fmt normalised the request to NV12, which has no
+	 * entry in the packed-format table; dev->pixfmt stays on the YUYV
+	 * entry, whose pipeline_d0 is what the hardware must keep running. */
+	if (dev->board == SC0710_BOARD_ELGATO_CAMLINK_PRO)
+		return 0;
+
 	dev->pixfmt = sc0710_pixfmt_find(f->fmt.pix.pixelformat);
 	return 0;
 }
@@ -1169,7 +1221,10 @@ static int vidioc_enum_framesizes(struct file *file, void *priv, struct v4l2_frm
 	const struct sc0710_format *fmt;
 	u32 eff_w, eff_h, eff_fs;
 
-	if (!sc0710_pixfmt_find(fsize->pixel_format))
+	if (dev->board == SC0710_BOARD_ELGATO_CAMLINK_PRO) {
+		if (fsize->pixel_format != V4L2_PIX_FMT_NV12)
+			return -EINVAL;
+	} else if (!sc0710_pixfmt_find(fsize->pixel_format))
 		return -EINVAL;
 
 	/* Only support the currently detected resolution */
@@ -1199,7 +1254,10 @@ static int vidioc_enum_frameintervals(struct file *file, void *priv, struct v4l2
 	const struct sc0710_format *fmt;
 	u32 eff_w, eff_h, eff_fs;
 
-	if (!sc0710_pixfmt_find(fival->pixel_format))
+	if (dev->board == SC0710_BOARD_ELGATO_CAMLINK_PRO) {
+		if (fival->pixel_format != V4L2_PIX_FMT_NV12)
+			return -EINVAL;
+	} else if (!sc0710_pixfmt_find(fival->pixel_format))
 		return -EINVAL;
 
 	if (fival->index != 0)
@@ -2068,7 +2126,27 @@ static void sc0710_vid_timeout(struct timer_list *t)
 				unsigned long buf_sz = vb2_plane_size(&buf->vb.vb2_buf, 0);
 				u32 fill_w = eff_w, fill_h = eff_h, fill_fs = eff_fs;
 
-				if (dev->pixfmt->rgb) {
+				if (dev->board == SC0710_BOARD_ELGATO_CAMLINK_PRO) {
+					/* NV12 status frame: luma taken from
+					 * the 1920x1080 YUYV status image
+					 * (even bytes), chroma neutral. */
+					u32 npix = min_t(u32, fill_w * fill_h,
+						(u32)(buf_sz * 2 / 3));
+					const u8 *img = dev->cable_connected ?
+						nosignal_frame_buffer :
+						nodevice_frame_buffer;
+					u32 i2;
+
+					if (img && use_status_images) {
+						for (i2 = 0; i2 < npix; i2++)
+							dst[i2] = img[i2 * 2];
+					} else {
+						memset(dst, 0x10, npix);
+					}
+					memset(dst + npix, 0x80, npix / 2);
+					vb2_set_plane_payload(&buf->vb.vb2_buf,
+						0, npix * 3 / 2);
+				} else if (dev->pixfmt->rgb) {
 					/* The pattern renderer and the dims
 					 * fallbacks below are YUYV-only;
 					 * RGB black is all zeros. */

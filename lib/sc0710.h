@@ -126,6 +126,20 @@ extern unsigned int keep_audio_alive;
 #define SC0710_BOARD_ELGATEO_4KP         2
 #define SC0710_BOARD_ELGATO_CAMLINK_PRO  3
 
+/* Cam Link Pro DMA payload geometry, mapped on real hardware. The FPGA
+ * scales every input down to one fixed output and streams it as NV12 in
+ * row triplets: [Y line 2t][Y line 2t+1][UV line t], each a 1936-byte
+ * chunk (1928 bytes of pixels - 1920 active plus 8 of filter overscan -
+ * then 8 zero bytes). The vendor driver's "cx = 1920, cy = 1080" start
+ * line describes this, whatever the input timing says. */
+#define SC0710_CLP_WIDTH        1920
+#define SC0710_CLP_HEIGHT       1080
+#define SC0710_CLP_CHUNK        1936
+#define SC0710_CLP_ROW          (3 * SC0710_CLP_CHUNK)
+#define SC0710_CLP_DMA_FRAMESIZE ((SC0710_CLP_HEIGHT / 2) * SC0710_CLP_ROW)
+/* What userspace gets: packed NV12. */
+#define SC0710_CLP_SIZEIMAGE    (SC0710_CLP_WIDTH * SC0710_CLP_HEIGHT * 3 / 2)
+
 enum sc0710_timing_mode {
 	TIMING_MODE_MERGE = 0,           /* Use static match + dynamic fallback */
 	TIMING_MODE_PROCEDURAL_ONLY = 1, /* Dynamic/procedural fallback only */
@@ -359,6 +373,11 @@ struct sc0710_dma_channel
 	u32                          tear_streak_count;
 	int                          tear_last_line;
 	u32                          tear_resync_retries_left;
+	/* Cam Link Pro: consecutive gathers whose zero-pad structure was
+	 * misaligned (stream slipped), and consecutive aligned gathers
+	 * (earns back resync retries). */
+	u32                          clp_misalign_count;
+	u32                          clp_aligned_streak;
 
 	/* Zero-copy delivery counters (frames DMA'd straight into a client
 	 * buffer vs. delivered through the copy path while zero_copy=1). */
@@ -602,6 +621,24 @@ static inline u32 sc0710_framesize(const struct sc0710_dev *dev,
 	const struct sc0710_format *fmt)
 {
 	return fmt ? fmt->width * dev->pixfmt->bpp * fmt->height : 0;
+}
+
+/* Bytes the DMA engine delivers per frame. On the Cam Link Pro this is a
+ * board constant (see SC0710_CLP_*): the FPGA's output geometry is fixed
+ * and is not the detected input timing, which only steers the pipeline
+ * input registers. Everywhere else it is the packed frame size. */
+extern unsigned int clp_dma_override;
+
+static inline u32 sc0710_dma_framesize(const struct sc0710_dev *dev,
+	const struct sc0710_format *fmt)
+{
+	if (dev->board == SC0710_BOARD_ELGATO_CAMLINK_PRO) {
+		if (!fmt)
+			return 0;
+		return clp_dma_override ? clp_dma_override :
+			SC0710_CLP_DMA_FRAMESIZE;
+	}
+	return sc0710_framesize(dev, fmt);
 }
 
 struct sc0710_fh

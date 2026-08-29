@@ -939,6 +939,15 @@ static int sc0710_initdev(struct pci_dev *pci_dev,
 	 * interrupt-driven service wakes the DMA thread per completed chain
 	 * and demotes polling to a watchdog tick. MSI only - a shared INTx
 	 * line with a wake-only handler would mask co-devices. */
+	if (irq_service && dev->board == SC0710_BOARD_ELGATO_CAMLINK_PRO) {
+		/* This board's FPGA loses bytes whenever the engine pauses, and
+		 * with it the raster alignment. The classic free-running poll
+		 * service disturbs the ring the least, so it wins here until
+		 * the small-descriptor conveyor redesign lands. */
+		printk(KERN_INFO "%s: Cam Link Pro: using polling DMA service\n",
+			dev->name);
+		irq_service = 0;
+	}
 	if (irq_service) {
 		if (pci_alloc_irq_vectors(pci_dev, 1, 1, PCI_IRQ_MSI) == 1 &&
 		    pci_request_irq(pci_dev, 0, sc0710_irq, NULL, dev,
