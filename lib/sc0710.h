@@ -279,6 +279,46 @@ struct sc0710_dma_descriptor_chain
 	u32 wbm_phase;
 };
 
+/* Cam Link Pro conveyor transport (clp_conveyor=1, the vendor
+ * architecture): a circular ring of many small always-armed descriptors
+ * the engine can never starve, never rewritten while running, with the
+ * frame boundaries recovered in software by the framer. ndesc == 0 means
+ * the channel is on the legacy whole-frame chain transport. */
+#define SC0710_CLP_CONVEYOR_MAX_BLOCKS 32
+struct sc0710_clp_conveyor
+{
+	u32         ndesc;          /* descriptors in the ring; 0 = off */
+	u32         seg;            /* payload bytes per descriptor */
+	u32         segs_per_block; /* uniform carve of the blocks below */
+	u32         nblocks;
+	struct {
+		u8         *cpu;
+		dma_addr_t  dma;
+		u32         size;
+	} block[SC0710_CLP_CONVEYOR_MAX_BLOCKS];
+
+	u64         consumed;       /* descriptors consumed since engine start */
+
+	/* Framer: reassembles the byte stream into frames. The FPGA emits
+	 * one TLAST (short descriptor completion) per frame period, whose
+	 * payload is 540 active rows followed by ~35 rows of chunk-formatted
+	 * vertical blanking: copy the active rows, discard the blanking,
+	 * restart at the EOP. Every frame therefore begins hardware-aligned. */
+	u8         *frame;          /* assembly buffer, SC0710_CLP_DMA_FRAMESIZE */
+	u32         fill;           /* bytes assembled so far */
+	bool        await_eop;      /* active rows done; discarding blanking */
+	u32         bad_streak;     /* consecutive invalid frames (escalation) */
+
+	/* Counters (surfaced in /proc/sc0710) */
+	u64         frames_ok;
+	u64         frames_healed;  /* slip measured, phase re-locked in software */
+	u64         frames_skipped; /* overrun or post-restart holds */
+	u64         overruns;       /* service fell a full ring behind */
+	u64         hw_resyncs;     /* escalations to a hardware restart */
+	u64         eop_realigns;   /* frames ending early at a hardware EOP */
+	u64         eop_seen;       /* short (end-of-frame) completions */
+};
+
 /* Forward declaration for multi-client support */
 struct sc0710_fh;
 
@@ -327,6 +367,9 @@ struct sc0710_dma_channel
 	u32                          numDescriptorChains;
 	u32                          buf_size;
 	struct sc0710_dma_descriptor_chain chains[SC0710_MAX_CHANNEL_DESCRIPTOR_CHAINS];
+
+	/* Cam Link Pro conveyor transport; cv.ndesc != 0 supersedes chains[]. */
+	struct sc0710_clp_conveyor   cv;
 
 	/* DMA Controller PCI BAR offsets */
 	u32                          register_dma_base;

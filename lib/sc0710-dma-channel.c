@@ -324,6 +324,478 @@ static void sc0710_clp_unpack_nv12(const u8 *src, u8 *dst)
 	}
 }
 
+/* ---- Cam Link Pro conveyor transport --------------------------------------
+ *
+ * The vendor driver never asks the engine to carry whole frames: it runs a
+ * small circular ring of tiny always-armed descriptors with per-descriptor
+ * writeback, never rewritten while running, and rebuilds frames in software.
+ * The engine can then never starve waiting on a descriptor, which is the
+ * condition under which the FPGA drops bytes (the source of every visible
+ * glitch on the whole-frame transport). When bytes are lost anyway, the
+ * framer measures the loss from the chunk pad grid and re-phases in
+ * software - the hardware is never restarted for a slip.
+ */
+unsigned int clp_conveyor = 1;
+module_param(clp_conveyor, uint, 0644);
+MODULE_PARM_DESC(clp_conveyor,
+	"Cam Link Pro: 1 = small-descriptor conveyor transport (default), 0 = legacy whole-frame chains. Applied at the next stream start.");
+
+unsigned int clp_conveyor_desc = 512;
+module_param(clp_conveyor_desc, uint, 0644);
+MODULE_PARM_DESC(clp_conveyor_desc,
+	"Cam Link Pro conveyor: descriptors in the ring (default 512)");
+
+unsigned int clp_conveyor_seg = 0x1e00;
+module_param(clp_conveyor_seg, uint, 0644);
+MODULE_PARM_DESC(clp_conveyor_seg,
+	"Cam Link Pro conveyor: payload bytes per descriptor (default 0x1e00, the vendor value)");
+
+unsigned int clp_wbm_debug;
+module_param(clp_wbm_debug, uint, 0644);
+MODULE_PARM_DESC(clp_wbm_debug,
+	"Cam Link Pro conveyor: log the next N raw writeback pairs");
+
+unsigned int clp_eop_log;
+module_param(clp_eop_log, uint, 0644);
+MODULE_PARM_DESC(clp_eop_log,
+	"Cam Link Pro conveyor: log the next N EOP (burst end) positions");
+
+/* Rows probed by the alignment checks, spread over the frame. */
+static const u16 sc0710_clp_probe_rows[] = { 1, 13, 67, 131, 263, 389, 487, 539 };
+
+/* Alignment gate for a gathered SC0710_CLP_DMA_FRAMESIZE frame.
+ * The stream carries no framing, so a frame is trusted only if (a) the 8
+ * zero pad bytes closing every 1936-byte chunk land where the grid says
+ * (catches sub-chunk slips) and (b) the chunk ROLES hold: interleaved UV
+ * data correlates better at 2-byte than 1-byte steps (U with U, V with V),
+ * luma the other way round, so the most chroma-like chunk of a triplet must
+ * be the third (catches whole-chunk role rotations, which pads survive).
+ * On flat grey content the role test scores near zero and abstains.
+ * Returns non-zero when the frame is misaligned. */
+static int sc0710_clp_frame_misaligned(const u8 *buf, bool check_roles)
+{
+	unsigned int k;
+
+	for (k = 0; k < ARRAY_SIZE(sc0710_clp_probe_rows); k++) {
+		const u8 *t = buf +
+			(size_t)sc0710_clp_probe_rows[k] * SC0710_CLP_ROW;
+		unsigned int c;
+
+		for (c = 0; c < 3; c++) {
+			const u8 *pad = t + c * SC0710_CLP_CHUNK +
+				SC0710_CLP_CHUNK - 8;
+			unsigned int x;
+
+			for (x = 0; x < 8; x++)
+				if (pad[x])
+					return 1;
+		}
+	}
+
+	/* The role test misfires on content whose luma has a strong 2-pixel
+	 * periodicity (canvas weave, sensor noise), so it only backs up the
+	 * legacy transport, where whole-chunk rotations have no other tell.
+	 * The conveyor's frames start at a hardware EOP: a rotation without
+	 * pad damage cannot happen there, and the pads above suffice. */
+	if (check_roles) {
+		long roleScore[3] = { 0, 0, 0 };
+		unsigned int c, x;
+
+		for (k = 0; k < ARRAY_SIZE(sc0710_clp_probe_rows); k++) {
+			const u8 *t = buf +
+				(size_t)sc0710_clp_probe_rows[k] * SC0710_CLP_ROW;
+
+			for (c = 0; c < 3; c++) {
+				const u8 *d = t + c * SC0710_CLP_CHUNK + 256;
+
+				for (x = 0; x < 512; x += 2)
+					roleScore[c] +=
+						abs(d[x] - d[x + 2]) -
+						abs(d[x] - d[x + 1]);
+			}
+		}
+		/* roleScore strongly negative = chroma-like. */
+		for (c = 0; c < 2; c++)
+			if (roleScore[c] < roleScore[2] &&
+			    roleScore[c] < -(long)(ARRAY_SIZE(sc0710_clp_probe_rows) * 256))
+				return 1;
+	}
+
+	return 0;
+}
+
+/* Hand one assembled, validated frame to every streaming client as packed
+ * NV12 (same delivery contract as the legacy path). */
+static void sc0710_clp_broadcast_frame(struct sc0710_dma_channel *ch, const u8 *frame)
+{
+	struct sc0710_client *client;
+	unsigned long flags;
+	int delivered = 0;
+
+	spin_lock_irqsave(&ch->client_list_lock, flags);
+	list_for_each_entry(client, &ch->client_list, list) {
+		struct sc0710_buffer *vb_buf;
+		unsigned long buf_flags;
+		u8 *dst;
+
+		if (!client->streaming)
+			continue;
+
+		spin_lock_irqsave(&client->buffer_lock, buf_flags);
+		if (list_empty(&client->buffer_list)) {
+			spin_unlock_irqrestore(&client->buffer_lock, buf_flags);
+			continue;
+		}
+		vb_buf = list_first_entry(&client->buffer_list, struct sc0710_buffer, list);
+		dst = vb2_plane_vaddr(&vb_buf->vb.vb2_buf, 0);
+		if (!dst ||
+		    vb2_plane_size(&vb_buf->vb.vb2_buf, 0) < SC0710_CLP_SIZEIMAGE) {
+			spin_unlock_irqrestore(&client->buffer_lock, buf_flags);
+			continue;
+		}
+
+		sc0710_clp_unpack_nv12(frame, dst);
+		vb2_set_plane_payload(&vb_buf->vb.vb2_buf, 0, SC0710_CLP_SIZEIMAGE);
+		vb_buf->vb.vb2_buf.timestamp = ktime_get_ns();
+		vb_buf->vb.sequence = ch->frame_sequence;
+		vb_buf->vb.field = V4L2_FIELD_NONE;
+
+		list_del(&vb_buf->list);
+		vb2_buffer_done(&vb_buf->vb.vb2_buf, VB2_BUF_STATE_DONE);
+		delivered = 1;
+
+		spin_unlock_irqrestore(&client->buffer_lock, buf_flags);
+	}
+	ch->frame_sequence++;
+	spin_unlock_irqrestore(&ch->client_list_lock, flags);
+
+	if (delivered || !timer_pending(&ch->timeout))
+		mod_timer(&ch->timeout, jiffies + VBUF_TIMEOUT);
+}
+
+/* One frame's worth of active rows is assembled: validate and deliver,
+ * then discard everything up to the frame period's EOP (blanking). */
+static void sc0710_clp_frame_complete(struct sc0710_dma_channel *ch)
+{
+	struct sc0710_dev *dev = ch->dev;
+	struct sc0710_clp_conveyor *cv = &ch->cv;
+
+	cv->fill = 0;
+	cv->await_eop = true;
+
+	if (ch->skip_next_frames > 0) {
+		ch->skip_next_frames--;
+		cv->frames_skipped++;
+		return;
+	}
+
+	if (!sc0710_clp_frame_misaligned(cv->frame, false)) {
+		cv->bad_streak = 0;
+		cv->frames_ok++;
+		/* A long healthy run earns the hardware-resync retry budget
+		 * back, so uptime is never capped by the counter. */
+		if (++ch->clp_aligned_streak >= 50) {
+			ch->clp_aligned_streak = 0;
+			ch->tear_resync_retries_left = dma_resync_max_tear_retries;
+		}
+		sc0710_clp_broadcast_frame(ch, cv->frame);
+		return;
+	}
+
+	ch->clp_aligned_streak = 0;
+	cv->frames_skipped++;
+	printk_ratelimited(KERN_INFO "%s: [ch%d] misaligned frame dropped (bytes lost mid-frame); next frame realigns at EOP\n",
+		dev->name, ch->nr);
+
+	/* Diagnostic (clp_eop_log budget): where does the damage start, and
+	 * what does it look like? A consistent row with structured content
+	 * is in-stream metadata; a random row is a real transfer loss. */
+	if (clp_eop_log > 0) {
+		u32 row, c, x, bad_at = 0;
+		const u8 *p = NULL;
+
+		for (row = 0; row < SC0710_CLP_HEIGHT / 2 && !p; row++) {
+			for (c = 0; c < 3 && !p; c++) {
+				const u8 *pad = cv->frame +
+					(size_t)row * SC0710_CLP_ROW +
+					c * SC0710_CLP_CHUNK +
+					SC0710_CLP_CHUNK - 8;
+				for (x = 0; x < 8; x++)
+					if (pad[x]) {
+						bad_at = row * 3 + c;
+						p = cv->frame +
+							(size_t)row * SC0710_CLP_ROW +
+							c * SC0710_CLP_CHUNK;
+						break;
+					}
+			}
+		}
+		if (p) {
+			clp_eop_log--;
+			printk(KERN_INFO "%s: [ch%d] first bad pad in chunk %u (row %u): %*ph\n",
+				dev->name, ch->nr, bad_at, bad_at / 3,
+				32, p);
+		} else {
+			clp_eop_log--;
+			printk(KERN_INFO "%s: [ch%d] pads clean; role rotation only\n",
+				dev->name, ch->nr);
+		}
+	}
+
+	/* Software re-lock not converging: fall back to the old cure, a
+	 * fresh pipeline GO (provably frame-aligned), as a last resort. */
+	if (++cv->bad_streak >= 5) {
+		cv->bad_streak = 0;
+		if (!dev->tear_resync_pending && ch->tear_resync_retries_left > 0) {
+			ch->tear_resync_retries_left--;
+			dev->tear_resync_pending = 1;
+			cv->hw_resyncs++;
+			printk(KERN_WARNING "%s: [ch%d] software re-lock not converging; scheduling hardware resync\n",
+				dev->name, ch->nr);
+		}
+	}
+}
+
+/* Feed one consumed conveyor segment into the frame being assembled.
+ * Bytes arriving after the active rows and before the EOP are the frame
+ * period's blanking: dropped, not stored. */
+static void sc0710_clp_framer_append(struct sc0710_dma_channel *ch,
+	const u8 *src, u32 len)
+{
+	struct sc0710_clp_conveyor *cv = &ch->cv;
+
+	while (len) {
+		u32 n = min(len, SC0710_CLP_DMA_FRAMESIZE - cv->fill);
+
+		if (cv->await_eop)
+			return;
+
+		memcpy(cv->frame + cv->fill, src, n);
+		cv->fill += n;
+		src += n;
+		len -= n;
+		if (cv->fill == SC0710_CLP_DMA_FRAMESIZE)
+			sc0710_clp_frame_complete(ch);
+	}
+}
+
+/* Service pass for the conveyor: consume every segment the engine has
+ * completed since last time, in ring order, into the framer. Called from
+ * sc0710_dma_channel_service with ch->lock held and state RUNNING. */
+static int sc0710_clp_conveyor_service(struct sc0710_dma_channel *ch)
+{
+	struct sc0710_dev *dev = ch->dev;
+	struct sc0710_clp_conveyor *cv = &ch->cv;
+	u32 *wbm_base = (u32 *)((u8 *)ch->pt_cpu + ch->pt_size / 2);
+	u32 lag;
+	int consumed = 0;
+
+	/* Everything here is driven by the per-descriptor writebacks in host
+	 * memory: no MMIO in the hot path. A read to the card would have to
+	 * be answered by the same logic that is streaming the video - the
+	 * vendor driver never touches the card while capture runs, and
+	 * neither do we. */
+
+	/* Overrun check: if the slot almost a whole ring ahead of our read
+	 * position has completed, the engine lapped us and overwrote unread
+	 * segments. The byte position is then unrecoverable in software
+	 * (this needs the service thread starved for ~40 ms); restart the
+	 * pipeline for a provably aligned stream. */
+	{
+		u32 ahead = (u32)((cv->consumed + cv->ndesc - 32) % cv->ndesc);
+		u32 *wa = wbm_base + ahead * 8;
+
+		rmb();
+		if (wa[0] && wa[1]) {
+			cv->overruns++;
+			if (!dev->tear_resync_pending &&
+			    ch->tear_resync_retries_left > 0) {
+				ch->tear_resync_retries_left--;
+				dev->tear_resync_pending = 1;
+				cv->hw_resyncs++;
+			}
+			printk_ratelimited(KERN_WARNING "%s: [ch%d] conveyor overrun (service starved for a full ring); scheduling pipeline restart\n",
+				dev->name, ch->nr);
+			return 0;
+		}
+	}
+
+	lag = cv->ndesc - 64; /* consume at most most-of-a-ring per pass */
+	while (lag--) {
+		u32 idx = (u32)(cv->consumed % cv->ndesc);
+		u32 *w = wbm_base + idx * 8; /* 32-byte writeback stride */
+		u32 len;
+
+		rmb();
+		if (!(w[0] && w[1]))
+			break; /* payload not yet visible; next pass gets it */
+		rmb();
+		/* Writeback layout (mapped on hardware): w[0] = 0x52B4 status
+		 * magic, w[1] = bytes actually written. A short completion is
+		 * the FPGA's end-of-frame mark: the engine closes the
+		 * descriptor at EOP and starts the next frame on the next
+		 * one, so frame boundaries are exact and hardware-provided. */
+		len = min_t(u32, w[1], cv->seg);
+		if (clp_wbm_debug > 0) {
+			clp_wbm_debug--;
+			printk(KERN_INFO "%s: [ch%d] wbm[%u] = %08x %08x\n",
+				dev->name, ch->nr, idx, w[0], w[1]);
+		}
+
+		sc0710_clp_framer_append(ch,
+			cv->block[idx / cv->segs_per_block].cpu +
+			(idx % cv->segs_per_block) * cv->seg, len);
+
+		/* A short completion is the FPGA's TLAST closing the frame
+		 * period: 540 active rows plus the blanking rows we are
+		 * discarding. Whatever happened inside the period - even
+		 * dropped bytes - the next frame starts here, exactly, by
+		 * hardware. This is what makes the transport self-healing:
+		 * a loss can corrupt at most the one frame it happened in. */
+		if (len < cv->seg) {
+			cv->eop_seen++;
+			if (clp_eop_log > 0) {
+				clp_eop_log--;
+				printk(KERN_INFO "%s: [ch%d] EOP: fill %u await %d, len %u\n",
+					dev->name, ch->nr, cv->fill,
+					cv->await_eop, len);
+			}
+			if (!cv->await_eop && cv->fill) {
+				/* The period ended before a full frame of
+				 * active rows arrived: bytes were lost. Drop
+				 * the partial frame; nothing to heal. */
+				cv->eop_realigns++;
+				cv->frames_skipped++;
+				printk_ratelimited(KERN_INFO "%s: [ch%d] frame period ended %u bytes short; dropped one frame\n",
+					dev->name, ch->nr,
+					SC0710_CLP_DMA_FRAMESIZE - cv->fill);
+			}
+			cv->await_eop = false;
+			cv->fill = 0;
+		}
+		w[0] = 0;
+		w[1] = 0;
+		cv->consumed++;
+		consumed++;
+	}
+	wmb();
+
+	if (consumed) {
+		ch->dma_last_completion_jiffies = jiffies;
+		ch->dma_completed_descriptor_count_last = (u32)cv->consumed;
+		sc0710_things_per_second_update(&ch->bitsPerSecond,
+			(s64)consumed * cv->seg * 8);
+		sc0710_things_per_second_update(&ch->descPerSecond, consumed);
+	}
+	return consumed;
+}
+
+static void sc0710_clp_conveyor_free(struct sc0710_dma_channel *ch)
+{
+	struct sc0710_dev *dev = ch->dev;
+	struct sc0710_clp_conveyor *cv = &ch->cv;
+	u32 i;
+
+	for (i = 0; i < cv->nblocks; i++)
+		if (cv->block[i].cpu)
+			dma_free_coherent(&dev->pci->dev, cv->block[i].size,
+				cv->block[i].cpu, cv->block[i].dma);
+	if (cv->frame)
+		vfree(cv->frame);
+	memset(cv, 0, sizeof(*cv));
+}
+
+/* Allocate the ring payload blocks and the assembly buffer. The descriptor
+ * table itself lives in ch->pt_cpu and is written by _link below. */
+static int sc0710_clp_conveyor_build(struct sc0710_dma_channel *ch)
+{
+	struct sc0710_dev *dev = ch->dev;
+	struct sc0710_clp_conveyor *cv = &ch->cv;
+	u32 seg = clp_conveyor_seg ? clp_conveyor_seg : 0x1e00;
+	u32 ndesc = clp_conveyor_desc ? clp_conveyor_desc : 512;
+	u32 spb, i;
+
+	sc0710_clp_conveyor_free(ch);
+
+	seg = clamp_t(u32, seg & ~0xfu, 0x200, 0x10000);
+	ndesc = clamp_t(u32, ndesc, 16, 2048);
+
+	/* Uniform blocks of at most ~1 MiB so the coherent allocator never
+	 * has to find one huge contiguous region. */
+	spb = max_t(u32, 1, SZ_1M / seg);
+	if (spb > ndesc)
+		spb = ndesc;
+	if (DIV_ROUND_UP(ndesc, spb) > SC0710_CLP_CONVEYOR_MAX_BLOCKS)
+		ndesc = spb * SC0710_CLP_CONVEYOR_MAX_BLOCKS;
+	cv->nblocks = DIV_ROUND_UP(ndesc, spb);
+	cv->segs_per_block = spb;
+
+	for (i = 0; i < cv->nblocks; i++) {
+		cv->block[i].size = spb * seg;
+		cv->block[i].cpu = dma_alloc_coherent(&dev->pci->dev,
+			cv->block[i].size, &cv->block[i].dma, GFP_KERNEL);
+		if (!cv->block[i].cpu) {
+			cv->nblocks = i;
+			sc0710_clp_conveyor_free(ch);
+			return -ENOMEM;
+		}
+		memset(cv->block[i].cpu, 0, cv->block[i].size);
+	}
+
+	cv->frame = vzalloc(SC0710_CLP_DMA_FRAMESIZE);
+	if (!cv->frame) {
+		sc0710_clp_conveyor_free(ch);
+		return -ENOMEM;
+	}
+
+	cv->seg = seg;
+	cv->ndesc = ndesc;
+
+	printk(KERN_INFO "%s: [ch%d] conveyor: %u descriptors x %u bytes (%u KiB ring, %u blocks)\n",
+		dev->name, ch->nr, ndesc, seg, (ndesc * seg) >> 10, cv->nblocks);
+	return 0;
+}
+
+/* Write the circular descriptor ring into the page table: descriptors in
+ * the first half of pt, one 32-byte writeback slot per descriptor in the
+ * second half. Nothing here is ever rewritten while the engine runs. */
+static void sc0710_clp_conveyor_link(struct sc0710_dma_channel *ch)
+{
+	struct sc0710_clp_conveyor *cv = &ch->cv;
+	struct sc0710_dma_descriptor *d = (struct sc0710_dma_descriptor *)ch->pt_cpu;
+	dma_addr_t wbm = ch->pt_dma + ch->pt_size / 2;
+	u32 i;
+
+	const u32 per_page = PAGE_SIZE / sizeof(*d);
+
+	for (i = 0; i < cv->ndesc; i++, d++) {
+		dma_addr_t buf = cv->block[i / cv->segs_per_block].dma +
+			(dma_addr_t)(i % cv->segs_per_block) * cv->seg;
+		u32 nidx = (i + 1) % cv->ndesc;
+		dma_addr_t next = ch->pt_dma + nidx * sizeof(*d);
+		dma_addr_t wb = wbm + (dma_addr_t)i * 32;
+		/* Nxt_adj: how many descriptors contiguously follow the next
+		 * one (same 4K page, in ring order), so the fetcher pulls
+		 * descriptors in batches of up to 64 instead of one HostRAM
+		 * round-trip per segment - a fetch stall is exactly when the
+		 * FPGA drops bytes. */
+		u32 adj = min_t(u32, 63, per_page - 1 - (nidx % per_page));
+
+		if (nidx + adj >= cv->ndesc)
+			adj = cv->ndesc - 1 - nidx;
+
+		d->control     = 0xAD4B0000 | (adj << 8);
+		d->lengthBytes = cv->seg;
+		d->src_l       = (u32)wb;
+		d->src_h       = (u32)((u64)wb >> 32);
+		d->dst_l       = (u32)buf;
+		d->dst_h       = (u32)((u64)buf >> 32);
+		d->next_l      = (u32)next;
+		d->next_h      = (u32)((u64)next >> 32);
+	}
+	wmb();
+}
+
 static void sc0710_dma_dequeue_video(struct sc0710_dma_channel *ch,
 	struct sc0710_dma_descriptor_chain *chain,
 	u32 cached_framesize,
@@ -535,9 +1007,7 @@ static void sc0710_dma_dequeue_video(struct sc0710_dma_channel *ch,
 	/* Cam Link Pro: gather the triplet stream once; each client gets it
 	 * unpacked straight into its own buffer below. */
 	if (clp) {
-		static const u16 probe[] = { 1, 13, 67, 131, 263, 389, 487, 539 };
-		int misaligned = 0;
-		unsigned int k;
+		int misaligned;
 
 		if (!dev->frame_staging_buf ||
 		    dev->frame_staging_size < source_framesize)
@@ -549,57 +1019,10 @@ static void sc0710_dma_dequeue_video(struct sc0710_dma_channel *ch,
 
 		/* The stream carries no framing, and the FPGA drops bytes on
 		 * the floor whenever the DMA engine hiccups, which slides the
-		 * whole raster out of the ring grid. Every chunk ends in 8
-		 * zero pad bytes, so a handful of probes detects any slip;
-		 * two bad gathers in a row schedule the existing DMA resync,
-		 * whose fresh pipeline GO restarts the stream frame-aligned. */
-		for (k = 0; k < ARRAY_SIZE(probe) && !misaligned; k++) {
-			const u8 *t = dev->frame_staging_buf +
-				(size_t)probe[k] * SC0710_CLP_ROW;
-			unsigned int c;
-
-			for (c = 0; c < 3 && !misaligned; c++) {
-				const u8 *pad = t + c * SC0710_CLP_CHUNK +
-					SC0710_CLP_CHUNK - 8;
-				unsigned int x;
-
-				for (x = 0; x < 8; x++)
-					if (pad[x]) {
-						misaligned = 1;
-						break;
-					}
-			}
-		}
-
-		/* Pads survive whole-chunk slips (they land back on pads), so
-		 * also verify the chunk ROLES: interleaved UV data correlates
-		 * better at 2-byte than 1-byte steps (U with U, V with V),
-		 * luma the other way round. The most chroma-like position must
-		 * be the third chunk; on flat grey content every position
-		 * scores near zero and the check abstains. */
-		if (!misaligned) {
-			long roleScore[3] = { 0, 0, 0 };
-			unsigned int c, x;
-
-			for (k = 0; k < ARRAY_SIZE(probe); k++) {
-				const u8 *t = dev->frame_staging_buf +
-					(size_t)probe[k] * SC0710_CLP_ROW;
-
-				for (c = 0; c < 3; c++) {
-					const u8 *d = t + c * SC0710_CLP_CHUNK + 256;
-
-					for (x = 0; x < 512; x += 2)
-						roleScore[c] +=
-							abs(d[x] - d[x + 2]) -
-							abs(d[x] - d[x + 1]);
-				}
-			}
-			/* roleScore strongly negative = chroma-like. */
-			for (c = 0; c < 2; c++)
-				if (roleScore[c] < roleScore[2] &&
-				    roleScore[c] < -(long)(ARRAY_SIZE(probe) * 256))
-					misaligned = 1;
-		}
+		 * whole raster out of the ring grid; two bad gathers in a row
+		 * schedule the existing DMA resync, whose fresh pipeline GO
+		 * restarts the stream frame-aligned. */
+		misaligned = sc0710_clp_frame_misaligned(dev->frame_staging_buf, true);
 
 		if (misaligned) {
 			ch->clp_aligned_streak = 0;
@@ -1104,6 +1527,13 @@ int sc0710_dma_channel_service(struct sc0710_dma_channel *ch)
 		return 0;
 	}
 
+	/* Conveyor transport: its own completion tracking and framer. */
+	if (ch->cv.ndesc && ch->mediatype == CHTYPE_VIDEO) {
+		consumed = sc0710_clp_conveyor_service(ch);
+		mutex_unlock(&ch->lock);
+		return consumed;
+	}
+
 	cached_fmt = READ_ONCE(dev->fmt);
 	cached_framesize = sc0710_dma_framesize(dev, cached_fmt);
 	cached_width = cached_fmt ? cached_fmt->width : 0;
@@ -1486,9 +1916,40 @@ int sc0710_dma_channel_resize(struct sc0710_dev *dev, u32 nr, enum sc0710_channe
 	}
 
 	sc0710_dma_chains_free(ch);
+	sc0710_clp_conveyor_free(ch);
 
 	printk(KERN_INFO "%s channel %d resized for framesize %d\n",
 		dev->name, nr, sc0710_dma_framesize(dev, dev->fmt));
+
+	/* Cam Link Pro video: the conveyor transport replaces the whole-frame
+	 * chains entirely. Its descriptor ring lives in a page table sized
+	 * for the ring (descriptors in the first half, writeback slots in
+	 * the second). */
+	if (ch->mediatype == CHTYPE_VIDEO &&
+	    dev->board == SC0710_BOARD_ELGATO_CAMLINK_PRO && clp_conveyor) {
+		ret = sc0710_clp_conveyor_build(ch);
+		if (ret < 0) {
+			printk(KERN_ERR "%s: channel %d conveyor allocation failed (%d); channel unusable until the next resize\n",
+				dev->name, nr, ret);
+			return ret;
+		}
+		ch->numDescriptorChains = 0;
+		ch->buf_size = ch->cv.ndesc * ch->cv.seg;
+
+		ch->pt_size = 2 * ALIGN(ch->cv.ndesc *
+			sizeof(struct sc0710_dma_descriptor), PAGE_SIZE);
+		ch->pt_cpu = dma_alloc_coherent(&dev->pci->dev, ch->pt_size,
+			&ch->pt_dma, GFP_KERNEL);
+		if (!ch->pt_cpu) {
+			sc0710_clp_conveyor_free(ch);
+			printk(KERN_ERR "%s: channel %d conveyor page table allocation failed\n",
+				dev->name, nr);
+			return -ENOMEM;
+		}
+		memset(ch->pt_cpu, 0, ch->pt_size);
+		sc0710_clp_conveyor_link(ch);
+		return 0;
+	}
 
 	if (ch->mediatype == CHTYPE_VIDEO) {
 		ch->numDescriptorChains = DMA_TRANSFER_CHAINS;
@@ -1556,6 +2017,7 @@ void sc0710_dma_channel_free(struct sc0710_dev *dev, u32 nr)
 	/* The V4L2/ALSA nodes are taken down by the remove path before any
 	 * hardware teardown; this frees DMA resources only. */
 	sc0710_dma_chains_free(ch);
+	sc0710_clp_conveyor_free(ch);
 
 	if (sc0710_debug_mode)
 		printk(KERN_INFO "%s channel %d deallocated\n", dev->name, nr);
@@ -1602,6 +2064,23 @@ int sc0710_dma_channel_start_prep(struct sc0710_dma_channel *ch)
 	for (i = 0; i < ch->numDescriptorChains; i++)
 		total_descriptors += ch->chains[i].numAllocations;
 	ch->sg_total_descriptors = total_descriptors;
+
+	/* Conveyor: fresh session, fresh framer. The engine's completed count
+	 * was just zeroed above; consumed tracking and the frame phase both
+	 * restart from zero (a fresh pipeline GO starts frame-aligned). */
+	if (ch->cv.ndesc) {
+		ch->sg_total_descriptors = ch->cv.ndesc;
+		memset((u8 *)ch->pt_cpu + ch->pt_size / 2, 0, ch->pt_size / 2);
+		ch->cv.consumed = 0;
+		ch->cv.fill = 0;
+		ch->cv.await_eop = false;
+		ch->cv.bad_streak = 0;
+		/* First fetch's adjacency hint (descriptor 0 sits at the head
+		 * of a fresh 4K page of contiguous descriptors). */
+		sc_write(ch->dev, 1, ch->reg_sg_adj,
+			min3((u32)63, (u32)(PAGE_SIZE / sizeof(struct sc0710_dma_descriptor)) - 1,
+				ch->cv.ndesc - 1));
+	}
 
 	/* The writeback ping-pong restarts on clean first halves: residue
 	 * from a previous session must not read as completion or staleness. */
