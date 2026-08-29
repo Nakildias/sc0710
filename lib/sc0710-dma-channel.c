@@ -424,8 +424,7 @@ static int sc0710_clp_frame_misaligned(const u8 *buf, bool check_roles)
 	return 0;
 }
 
-/* Hand one assembled, validated frame to every streaming client as packed
- * NV12 (same delivery contract as the legacy path). */
+/* Hand one prepared packed-NV12 1080p frame to every streaming client. */
 static void sc0710_clp_broadcast_frame(struct sc0710_dma_channel *ch, const u8 *frame)
 {
 	struct sc0710_client *client;
@@ -454,7 +453,7 @@ static void sc0710_clp_broadcast_frame(struct sc0710_dma_channel *ch, const u8 *
 			continue;
 		}
 
-		sc0710_clp_unpack_nv12(frame, dst);
+		memcpy(dst, frame, SC0710_CLP_SIZEIMAGE);
 		vb2_set_plane_payload(&vb_buf->vb.vb2_buf, 0, SC0710_CLP_SIZEIMAGE);
 		vb_buf->vb.vb2_buf.timestamp = ktime_get_ns();
 		vb_buf->vb.sequence = ch->frame_sequence;
@@ -473,109 +472,204 @@ static void sc0710_clp_broadcast_frame(struct sc0710_dma_channel *ch, const u8 *
 		mod_timer(&ch->timeout, jiffies + VBUF_TIMEOUT);
 }
 
-/* One frame's worth of active rows is assembled: validate and deliver,
- * then discard everything up to the frame period's EOP (blanking). */
-static void sc0710_clp_frame_complete(struct sc0710_dma_channel *ch)
+/* Raw microscope (clp_raw=1): hand the continuous stream to userspace in
+ * SC0710_CLP_DMA_FRAMESIZE slabs, no parsing - offline stream analysis. */
+static void sc0710_clp_raw_deliver(struct sc0710_dma_channel *ch)
+{
+	struct sc0710_clp_conveyor *cv = &ch->cv;
+	struct sc0710_client *client;
+	unsigned long flags;
+
+	spin_lock_irqsave(&ch->client_list_lock, flags);
+	list_for_each_entry(client, &ch->client_list, list) {
+		struct sc0710_buffer *vb_buf;
+		unsigned long bf;
+		u8 *dst;
+		unsigned long bs;
+
+		if (!client->streaming)
+			continue;
+		spin_lock_irqsave(&client->buffer_lock, bf);
+		if (list_empty(&client->buffer_list)) {
+			spin_unlock_irqrestore(&client->buffer_lock, bf);
+			continue;
+		}
+		vb_buf = list_first_entry(&client->buffer_list, struct sc0710_buffer, list);
+		dst = vb2_plane_vaddr(&vb_buf->vb.vb2_buf, 0);
+		bs = vb2_plane_size(&vb_buf->vb.vb2_buf, 0);
+		if (dst) {
+			u32 n = min_t(u32, SC0710_CLP_DMA_FRAMESIZE, (u32)bs);
+
+			memcpy(dst, cv->frame, n);
+			vb2_set_plane_payload(&vb_buf->vb.vb2_buf, 0, n);
+			vb_buf->vb.vb2_buf.timestamp = ktime_get_ns();
+			vb_buf->vb.sequence = ch->frame_sequence;
+			vb_buf->vb.field = V4L2_FIELD_NONE;
+			list_del(&vb_buf->list);
+			vb2_buffer_done(&vb_buf->vb.vb2_buf, VB2_BUF_STATE_DONE);
+		}
+		spin_unlock_irqrestore(&client->buffer_lock, bf);
+	}
+	ch->frame_sequence++;
+	spin_unlock_irqrestore(&ch->client_list_lock, flags);
+	mod_timer(&ch->timeout, jiffies + VBUF_TIMEOUT);
+}
+
+/* A picture is complete (the next one's line 1 arrived): fold the
+ * anamorphic 1920x2160 assembly down to true full-frame 1080p and
+ * deliver. Lines that never arrived keep the previous picture's content
+ * (counted, invisible at the scale losses actually happen). */
+static void sc0710_clp_deliver_picture(struct sc0710_dma_channel *ch)
 {
 	struct sc0710_dev *dev = ch->dev;
 	struct sc0710_clp_conveyor *cv = &ch->cv;
+	const u8 *ysrc = cv->frame;
+	const u8 *uvsrc = cv->frame + SC0710_CLP_WIDTH * SC0710_CLP_SRC_HEIGHT;
+	u8 *yd = cv->out;
+	u8 *uvd = cv->out + SC0710_CLP_WIDTH * SC0710_CLP_HEIGHT;
+	u32 i, x;
 
-	cv->fill = 0;
-	cv->await_eop = true;
+	if (cv->lines_placed < SC0710_CLP_SRC_HEIGHT) {
+		cv->pictures_short++;
+		cv->stale_lines += SC0710_CLP_SRC_HEIGHT - cv->lines_placed;
+	}
+	cv->lines_placed = 0;
 
 	if (ch->skip_next_frames > 0) {
 		ch->skip_next_frames--;
-		cv->frames_skipped++;
 		return;
 	}
 
-	if (!sc0710_clp_frame_misaligned(cv->frame, false)) {
-		cv->bad_streak = 0;
-		cv->frames_ok++;
-		/* A long healthy run earns the hardware-resync retry budget
-		 * back, so uptime is never capped by the counter. */
-		if (++ch->clp_aligned_streak >= 50) {
-			ch->clp_aligned_streak = 0;
-			ch->tear_resync_retries_left = dma_resync_max_tear_retries;
-		}
-		sc0710_clp_broadcast_frame(ch, cv->frame);
+	/* 2:1 vertical fold, averaging line pairs; UV pairs average U with
+	 * U and V with V (same interleave offsets). */
+	for (i = 0; i < SC0710_CLP_HEIGHT; i++) {
+		const u8 *a = ysrc + (size_t)(2 * i) * SC0710_CLP_WIDTH;
+		const u8 *b = a + SC0710_CLP_WIDTH;
+
+		for (x = 0; x < SC0710_CLP_WIDTH; x++)
+			yd[x] = (a[x] + b[x] + 1) >> 1;
+		yd += SC0710_CLP_WIDTH;
+	}
+	for (i = 0; i < SC0710_CLP_HEIGHT / 2; i++) {
+		const u8 *a = uvsrc + (size_t)(2 * i) * SC0710_CLP_WIDTH;
+		const u8 *b = a + SC0710_CLP_WIDTH;
+
+		for (x = 0; x < SC0710_CLP_WIDTH; x++)
+			uvd[x] = (a[x] + b[x] + 1) >> 1;
+		uvd += SC0710_CLP_WIDTH;
+	}
+
+	cv->pictures++;
+	(void)dev;
+	sc0710_clp_broadcast_frame(ch, cv->out);
+}
+
+/* One complete 1936-byte chunk: validate its header and place its 1920
+ * payload bytes by line number. */
+static void sc0710_clp_process_chunk(struct sc0710_dma_channel *ch)
+{
+	struct sc0710_clp_conveyor *cv = &ch->cv;
+	const u8 *c = cv->chunk;
+	u32 field = c[4] | (c[5] << 8);
+	u32 line = field >> 3;
+
+	if (c[0] != 0xff || c[1] != 0xff || c[2] != 0xff || c[3] != 0x00 ||
+	    c[6] != 0x00 || (c[7] != 0x4f && c[7] != 0x6f) ||
+	    (field & 7) || line == 0) {
+		/* Chunk grid lost (bytes dropped inside a chunk): rescan. */
+		cv->synced = false;
+		cv->resyncs++;
 		return;
 	}
 
-	ch->clp_aligned_streak = 0;
-	cv->frames_skipped++;
-	printk_ratelimited(KERN_INFO "%s: [ch%d] misaligned frame dropped (bytes lost mid-frame); next frame realigns at EOP\n",
-		dev->name, ch->nr);
+	if (c[SC0710_CLP_CHUNK - 8] | c[SC0710_CLP_CHUNK - 7] |
+	    c[SC0710_CLP_CHUNK - 6] | c[SC0710_CLP_CHUNK - 5] |
+	    c[SC0710_CLP_CHUNK - 4] | c[SC0710_CLP_CHUNK - 3] |
+	    c[SC0710_CLP_CHUNK - 2] | c[SC0710_CLP_CHUNK - 1])
+		cv->pad_errors++;
 
-	/* Diagnostic (clp_eop_log budget): where does the damage start, and
-	 * what does it look like? A consistent row with structured content
-	 * is in-stream metadata; a random row is a real transfer loss. */
-	if (clp_eop_log > 0) {
-		u32 row, c, x, bad_at = 0;
-		const u8 *p = NULL;
+	if (c[7] == 0x4f) {
+		if (line > SC0710_CLP_SRC_HEIGHT)
+			return;
+		/* A new picture begins at luma line 1; the threshold keeps a
+		 * duplicated/reordered header from splitting a picture. */
+		if (line == 1 && cv->lines_placed > SC0710_CLP_SRC_HEIGHT / 4)
+			sc0710_clp_deliver_picture(ch);
+		memcpy(cv->frame + (size_t)(line - 1) * SC0710_CLP_WIDTH,
+			c + SC0710_CLP_HDR, SC0710_CLP_WIDTH);
+		cv->lines_placed++;
+	} else {
+		/* Chroma chunks are numbered with the ODD luma line they pair
+		 * with (1, 3, 5, ... 2159): UV row = (line + 1) / 2. */
+		u32 uvline = (line + 1) >> 1;
 
-		for (row = 0; row < SC0710_CLP_HEIGHT / 2 && !p; row++) {
-			for (c = 0; c < 3 && !p; c++) {
-				const u8 *pad = cv->frame +
-					(size_t)row * SC0710_CLP_ROW +
-					c * SC0710_CLP_CHUNK +
-					SC0710_CLP_CHUNK - 8;
-				for (x = 0; x < 8; x++)
-					if (pad[x]) {
-						bad_at = row * 3 + c;
-						p = cv->frame +
-							(size_t)row * SC0710_CLP_ROW +
-							c * SC0710_CLP_CHUNK;
-						break;
-					}
-			}
-		}
-		if (p) {
-			clp_eop_log--;
-			printk(KERN_INFO "%s: [ch%d] first bad pad in chunk %u (row %u): %*ph\n",
-				dev->name, ch->nr, bad_at, bad_at / 3,
-				32, p);
-		} else {
-			clp_eop_log--;
-			printk(KERN_INFO "%s: [ch%d] pads clean; role rotation only\n",
-				dev->name, ch->nr);
-		}
-	}
-
-	/* Software re-lock not converging: fall back to the old cure, a
-	 * fresh pipeline GO (provably frame-aligned), as a last resort. */
-	if (++cv->bad_streak >= 5) {
-		cv->bad_streak = 0;
-		if (!dev->tear_resync_pending && ch->tear_resync_retries_left > 0) {
-			ch->tear_resync_retries_left--;
-			dev->tear_resync_pending = 1;
-			cv->hw_resyncs++;
-			printk(KERN_WARNING "%s: [ch%d] software re-lock not converging; scheduling hardware resync\n",
-				dev->name, ch->nr);
-		}
+		if (line > SC0710_CLP_SRC_HEIGHT ||
+		    uvline > SC0710_CLP_SRC_UV_HEIGHT)
+			return;
+		memcpy(cv->frame +
+			(size_t)SC0710_CLP_WIDTH * SC0710_CLP_SRC_HEIGHT +
+			(size_t)(uvline - 1) * SC0710_CLP_WIDTH,
+			c + SC0710_CLP_HDR, SC0710_CLP_WIDTH);
 	}
 }
 
-/* Feed one consumed conveyor segment into the frame being assembled.
- * Bytes arriving after the active rows and before the EOP are the frame
- * period's blanking: dropped, not stored. */
+/* Feed consumed conveyor bytes to the framer: chunk reassembly across
+ * segment boundaries, header-scan resync when the grid is lost. */
 static void sc0710_clp_framer_append(struct sc0710_dma_channel *ch,
 	const u8 *src, u32 len)
 {
 	struct sc0710_clp_conveyor *cv = &ch->cv;
 
+	if (clp_raw) {
+		while (len) {
+			u32 n = min(len, SC0710_CLP_DMA_FRAMESIZE - cv->fill);
+
+			memcpy(cv->frame + cv->fill, src, n);
+			cv->fill += n;
+			src += n;
+			len -= n;
+			if (cv->fill == SC0710_CLP_DMA_FRAMESIZE) {
+				cv->fill = 0;
+				sc0710_clp_raw_deliver(ch);
+			}
+		}
+		return;
+	}
+
 	while (len) {
-		u32 n = min(len, SC0710_CLP_DMA_FRAMESIZE - cv->fill);
+		u32 n;
 
-		if (cv->await_eop)
-			return;
+		if (!cv->synced) {
+			/* Look for a chunk header: ff ff ff 00 xx xx 00 4f/6f.
+			 * Only whole in-segment matches are taken - losing up
+			 * to one chunk while resyncing is fine. */
+			u32 i;
 
-		memcpy(cv->frame + cv->fill, src, n);
-		cv->fill += n;
+			cv->chunk_fill = 0;
+			for (i = 0; i + 8 <= len; i++) {
+				if (src[i] == 0xff && src[i + 1] == 0xff &&
+				    src[i + 2] == 0xff && src[i + 3] == 0x00 &&
+				    src[i + 6] == 0x00 &&
+				    (src[i + 7] == 0x4f || src[i + 7] == 0x6f)) {
+					cv->synced = true;
+					break;
+				}
+			}
+			if (!cv->synced)
+				return;
+			src += i;
+			len -= i;
+		}
+
+		n = min(len, SC0710_CLP_CHUNK - cv->chunk_fill);
+		memcpy(cv->chunk + cv->chunk_fill, src, n);
+		cv->chunk_fill += n;
 		src += n;
 		len -= n;
-		if (cv->fill == SC0710_CLP_DMA_FRAMESIZE)
-			sc0710_clp_frame_complete(ch);
+		if (cv->chunk_fill == SC0710_CLP_CHUNK) {
+			cv->chunk_fill = 0;
+			sc0710_clp_process_chunk(ch);
+		}
 	}
 }
 
@@ -598,23 +692,27 @@ static int sc0710_clp_conveyor_service(struct sc0710_dma_channel *ch)
 
 	/* Overrun check: if the slot almost a whole ring ahead of our read
 	 * position has completed, the engine lapped us and overwrote unread
-	 * segments. The byte position is then unrecoverable in software
-	 * (this needs the service thread starved for ~40 ms); restart the
-	 * pipeline for a provably aligned stream. */
+	 * segments (needs the service thread starved for ~25 ms). Drop the
+	 * whole ring and let the header scan re-lock the stream - no
+	 * hardware restart. */
 	{
 		u32 ahead = (u32)((cv->consumed + cv->ndesc - 32) % cv->ndesc);
 		u32 *wa = wbm_base + ahead * 8;
 
 		rmb();
 		if (wa[0] && wa[1]) {
-			cv->overruns++;
-			if (!dev->tear_resync_pending &&
-			    ch->tear_resync_retries_left > 0) {
-				ch->tear_resync_retries_left--;
-				dev->tear_resync_pending = 1;
-				cv->hw_resyncs++;
+			u32 i;
+
+			for (i = 0; i < cv->ndesc; i++) {
+				wbm_base[i * 8] = 0;
+				wbm_base[i * 8 + 1] = 0;
 			}
-			printk_ratelimited(KERN_WARNING "%s: [ch%d] conveyor overrun (service starved for a full ring); scheduling pipeline restart\n",
+			wmb();
+			cv->consumed += cv->ndesc;
+			cv->synced = false;
+			cv->lines_placed = 0;
+			cv->overruns++;
+			printk_ratelimited(KERN_WARNING "%s: [ch%d] conveyor overrun (service starved for a full ring); re-locking via headers\n",
 				dev->name, ch->nr);
 			return 0;
 		}
@@ -631,48 +729,19 @@ static int sc0710_clp_conveyor_service(struct sc0710_dma_channel *ch)
 			break; /* payload not yet visible; next pass gets it */
 		rmb();
 		/* Writeback layout (mapped on hardware): w[0] = 0x52B4 status
-		 * magic, w[1] = bytes actually written. A short completion is
-		 * the FPGA's end-of-frame mark: the engine closes the
-		 * descriptor at EOP and starts the next frame on the next
-		 * one, so frame boundaries are exact and hardware-provided. */
+		 * magic, w[1] = bytes actually written (short on the FPGA's
+		 * TLAST flushes - honor it, the stream continues at the next
+		 * descriptor). */
 		len = min_t(u32, w[1], cv->seg);
 		if (clp_wbm_debug > 0) {
 			clp_wbm_debug--;
 			printk(KERN_INFO "%s: [ch%d] wbm[%u] = %08x %08x\n",
 				dev->name, ch->nr, idx, w[0], w[1]);
 		}
-
 		sc0710_clp_framer_append(ch,
 			cv->block[idx / cv->segs_per_block].cpu +
 			(idx % cv->segs_per_block) * cv->seg, len);
-
-		/* A short completion is the FPGA's TLAST closing the frame
-		 * period: 540 active rows plus the blanking rows we are
-		 * discarding. Whatever happened inside the period - even
-		 * dropped bytes - the next frame starts here, exactly, by
-		 * hardware. This is what makes the transport self-healing:
-		 * a loss can corrupt at most the one frame it happened in. */
-		if (len < cv->seg) {
-			cv->eop_seen++;
-			if (clp_eop_log > 0) {
-				clp_eop_log--;
-				printk(KERN_INFO "%s: [ch%d] EOP: fill %u await %d, len %u\n",
-					dev->name, ch->nr, cv->fill,
-					cv->await_eop, len);
-			}
-			if (!cv->await_eop && cv->fill) {
-				/* The period ended before a full frame of
-				 * active rows arrived: bytes were lost. Drop
-				 * the partial frame; nothing to heal. */
-				cv->eop_realigns++;
-				cv->frames_skipped++;
-				printk_ratelimited(KERN_INFO "%s: [ch%d] frame period ended %u bytes short; dropped one frame\n",
-					dev->name, ch->nr,
-					SC0710_CLP_DMA_FRAMESIZE - cv->fill);
-			}
-			cv->await_eop = false;
-			cv->fill = 0;
-		}
+		cv->stream_bytes += len;
 		w[0] = 0;
 		w[1] = 0;
 		cv->consumed++;
@@ -702,6 +771,8 @@ static void sc0710_clp_conveyor_free(struct sc0710_dma_channel *ch)
 				cv->block[i].cpu, cv->block[i].dma);
 	if (cv->frame)
 		vfree(cv->frame);
+	if (cv->out)
+		vfree(cv->out);
 	memset(cv, 0, sizeof(*cv));
 }
 
@@ -742,8 +813,10 @@ static int sc0710_clp_conveyor_build(struct sc0710_dma_channel *ch)
 		memset(cv->block[i].cpu, 0, cv->block[i].size);
 	}
 
-	cv->frame = vzalloc(SC0710_CLP_DMA_FRAMESIZE);
-	if (!cv->frame) {
+	cv->frame = vzalloc(max_t(size_t, SC0710_CLP_ASM_SIZE,
+		SC0710_CLP_DMA_FRAMESIZE));
+	cv->out = vzalloc(SC0710_CLP_SIZEIMAGE);
+	if (!cv->frame || !cv->out) {
 		sc0710_clp_conveyor_free(ch);
 		return -ENOMEM;
 	}
@@ -2072,9 +2145,11 @@ int sc0710_dma_channel_start_prep(struct sc0710_dma_channel *ch)
 		ch->sg_total_descriptors = ch->cv.ndesc;
 		memset((u8 *)ch->pt_cpu + ch->pt_size / 2, 0, ch->pt_size / 2);
 		ch->cv.consumed = 0;
+		ch->cv.stream_bytes = 0;
 		ch->cv.fill = 0;
-		ch->cv.await_eop = false;
-		ch->cv.bad_streak = 0;
+		ch->cv.chunk_fill = 0;
+		ch->cv.synced = true; /* a fresh GO starts on the chunk grid */
+		ch->cv.lines_placed = 0;
 		/* First fetch's adjacency hint (descriptor 0 sits at the head
 		 * of a fresh 4K page of contiguous descriptors). */
 		sc_write(ch->dev, 1, ch->reg_sg_adj,

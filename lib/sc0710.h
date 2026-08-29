@@ -298,26 +298,41 @@ struct sc0710_clp_conveyor
 	} block[SC0710_CLP_CONVEYOR_MAX_BLOCKS];
 
 	u64         consumed;       /* descriptors consumed since engine start */
+	u64         stream_bytes;   /* payload bytes consumed since engine start */
 
-	/* Framer: reassembles the byte stream into frames. The FPGA emits
-	 * one TLAST (short descriptor completion) per frame period, whose
-	 * payload is 540 active rows followed by ~35 rows of chunk-formatted
-	 * vertical blanking: copy the active rows, discard the blanking,
-	 * restart at the EOP. Every frame therefore begins hardware-aligned. */
-	u8         *frame;          /* assembly buffer, SC0710_CLP_DMA_FRAMESIZE */
-	u32         fill;           /* bytes assembled so far */
-	bool        await_eop;      /* active rows done; discarding blanking */
-	u32         bad_streak;     /* consecutive invalid frames (escalation) */
+	/* Header framer. Every 1936-byte chunk of the stream is
+	 * [8-byte header][1920 pixel bytes][8 zero pad], the header being
+	 * ff ff ff 00, a little-endian line counter << 3, 00, and a type tag
+	 * (0x4f = luma, 0x6f = chroma). Line counters run 1..2160 (luma) /
+	 * 1..1080 (chroma) and restart at every picture, so the stream is
+	 * self-describing: chunks are placed by line number into an
+	 * anamorphic 1920x2160 picture (half-width 4K), delivery is a 2:1
+	 * vertical fold to true full-frame 1080p, and losing bytes costs
+	 * exactly the lines they carried. Sync recovery is a header scan. */
+	u8         *frame;          /* Y plane 1920x2160 then UV 1920x1080 */
+	u8         *out;            /* folded NV12 1080p, SC0710_CLP_SIZEIMAGE */
+	u8          chunk[SC0710_CLP_CHUNK]; /* chunk spanning segments */
+	u32         chunk_fill;
+	bool        synced;         /* chunk grid locked to the stream */
+	u32         lines_placed;   /* luma lines landed in this picture */
+	u32         fill;           /* clp_raw slab mode only */
 
 	/* Counters (surfaced in /proc/sc0710) */
-	u64         frames_ok;
-	u64         frames_healed;  /* slip measured, phase re-locked in software */
-	u64         frames_skipped; /* overrun or post-restart holds */
+	u64         pictures;       /* pictures delivered */
+	u64         pictures_short; /* delivered with lines missing (stale) */
+	u64         stale_lines;    /* total luma lines that never arrived */
+	u64         resyncs;        /* header scans after a lost chunk grid */
+	u64         pad_errors;     /* chunks with a valid header, dirty pad */
 	u64         overruns;       /* service fell a full ring behind */
 	u64         hw_resyncs;     /* escalations to a hardware restart */
-	u64         eop_realigns;   /* frames ending early at a hardware EOP */
-	u64         eop_seen;       /* short (end-of-frame) completions */
 };
+
+/* Cam Link Pro source picture geometry behind the chunk headers. */
+#define SC0710_CLP_SRC_HEIGHT    2160  /* luma lines per picture */
+#define SC0710_CLP_SRC_UV_HEIGHT 1080  /* chroma lines per picture */
+#define SC0710_CLP_HDR           8     /* header bytes per chunk */
+#define SC0710_CLP_ASM_SIZE      (SC0710_CLP_WIDTH * \
+	(SC0710_CLP_SRC_HEIGHT + SC0710_CLP_SRC_UV_HEIGHT))
 
 /* Forward declaration for multi-client support */
 struct sc0710_fh;

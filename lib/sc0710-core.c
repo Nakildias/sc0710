@@ -521,12 +521,12 @@ static int sc0710_proc_state_show(struct seq_file *m, void *v)
 			if (ch->cv.ndesc) {
 				seq_printf(m, "    conveyor: %u desc x %u bytes, consumed %llu\n",
 					ch->cv.ndesc, ch->cv.seg, ch->cv.consumed);
-				seq_printf(m, "      frames: %llu ok, %llu healed, %llu skipped, %llu overruns, %llu hw resyncs\n",
-					ch->cv.frames_ok, ch->cv.frames_healed,
-					ch->cv.frames_skipped, ch->cv.overruns,
-					ch->cv.hw_resyncs);
-				seq_printf(m, "         eop: %llu boundaries, %llu realigns\n",
-					ch->cv.eop_seen, ch->cv.eop_realigns);
+				seq_printf(m, "    pictures: %llu delivered (%llu short, %llu stale lines)\n",
+					ch->cv.pictures, ch->cv.pictures_short,
+					ch->cv.stale_lines);
+				seq_printf(m, "      framer: %llu resyncs, %llu pad errors, %llu overruns, %llu hw resyncs\n",
+					ch->cv.resyncs, ch->cv.pad_errors,
+					ch->cv.overruns, ch->cv.hw_resyncs);
 			}
 
 			if (zero_copy && ch->mediatype == CHTYPE_VIDEO) {
