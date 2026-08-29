@@ -92,15 +92,32 @@ void sc0710_dma_channels_stop(struct sc0710_dev *dev)
  * This is the single authoritative place for the register sequence.
  * Called from both normal stream start and DMA resync paths.
  */
+/* Cam Link Pro bring-up knobs. Its FPGA carries an SC400-family design like
+ * the 4K Pro's, so the 4K Pro's scaler programming is the leading candidate
+ * for the pipeline registers we have no Windows trace for. These let the
+ * sequence be swept from userspace between stream starts instead of needing
+ * a rebuild per experiment; they do nothing on the other boards. */
+unsigned int sc400_scaler;
+module_param(sc400_scaler, uint, 0644);
+MODULE_PARM_DESC(sc400_scaler,
+	"Cam Link Pro bring-up: 0=off, 1=take the 4K Pro scaler path (D8/EC)");
+
+unsigned int sc400_scaler_d8 = 0x438;
+module_param(sc400_scaler_d8, uint, 0644);
+MODULE_PARM_DESC(sc400_scaler_d8,
+	"Cam Link Pro bring-up: value for BAR0 0xD8 (scaler output height) when sc400_scaler=1");
+
 void sc0710_program_pipeline_regs(struct sc0710_dev *dev)
 {
 	u32 c8 = dev->fmt ? dev->fmt->height : 0x438;
 	u32 d0 = dev->pixfmt->pipeline_d0;
+	int scaler = dev->board == SC0710_BOARD_ELGATEO_4KP ||
+		     (dev->board == SC0710_BOARD_ELGATO_CAMLINK_PRO && sc400_scaler);
 
 	sc_write(dev, 0, BAR0_00C8, c8);
 
-	if (dev->board == SC0710_BOARD_ELGATEO_4KP)
-		sc_write(dev, 0, BAR0_00D8, 0x438);
+	if (scaler)
+		sc_write(dev, 0, BAR0_00D8, sc400_scaler_d8);
 
 	sc_write(dev, 0, BAR0_00D0, d0);
 	sc_write(dev, 0, 0xCC, 0x00000000);
@@ -109,7 +126,7 @@ void sc0710_program_pipeline_regs(struct sc0710_dev *dev)
 	sc_write(dev, 0, BAR0_00D0, 0x4300);
 	sc_write(dev, 0, BAR0_00D0, d0);
 
-	if (dev->board == SC0710_BOARD_ELGATEO_4KP)
+	if (scaler)
 		sc_write(dev, 0, 0xEC, 0x00000001);
 }
 

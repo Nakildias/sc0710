@@ -978,6 +978,61 @@ confirmed_timing_change:
 	return 0;
 }
 
+/* Cam Link Pro per-input video path select, transcribed from the vendor
+ * driver's video-DMA start path (CamLinkPro.X64.SYS, the four calls at
+ * 0x14026405d..0x1402641dd). It writes one 2-byte I2C register per HDMI
+ * input -- subaddress 0x3b + input -- choosing between two constants by
+ * whether that input's slot in the device extension is non-zero:
+ *
+ *   sub 0x3b + i = (input i is the one being captured) ? 0x10 : 0x01
+ *
+ * Our driver never wrote these, which is the leading explanation for a
+ * locked signal whose DMA payload isn't a valid raster. Same shape as the
+ * color_deep writes the driver already does on 0x32, so nowhere near the
+ * flash/EEPROM paths. Everything is a module parameter because the device
+ * address and constants are read off a disassembly, not a live trace.
+ *
+ * Triggered one-shot from the HDMI poll thread, which already holds the
+ * locks that serialise MCU access, so it cannot race the status poll.
+ */
+unsigned int sc400_input_regs;
+module_param(sc400_input_regs, uint, 0644);
+MODULE_PARM_DESC(sc400_input_regs,
+	"Cam Link Pro bring-up: set to 1 to write the per-input path registers once");
+
+unsigned int sc400_input_dev = 0x32;
+module_param(sc400_input_dev, uint, 0644);
+MODULE_PARM_DESC(sc400_input_dev,
+	"Cam Link Pro bring-up: 7-bit I2C address for the per-input path registers");
+
+unsigned int sc400_input_on = 0x10;
+module_param(sc400_input_on, uint, 0644);
+MODULE_PARM_DESC(sc400_input_on,
+	"Cam Link Pro bring-up: value written for the captured input");
+
+unsigned int sc400_input_off = 0x01;
+module_param(sc400_input_off, uint, 0644);
+MODULE_PARM_DESC(sc400_input_off,
+	"Cam Link Pro bring-up: value written for the idle inputs");
+
+void sc0710_i2c_set_input_path(struct sc0710_dev *dev)
+{
+	u8 devaddr = (u8)((sc400_input_dev & 0x7f) << 1);
+	int active = sc0710_hdmi_input & 3;
+	int i, ret;
+
+	for (i = 0; i < 4; i++) {
+		u8 wbuf[2] = { (u8)(0x3b + i),
+			       (u8)(i == active ? sc400_input_on
+						: sc400_input_off) };
+
+		ret = sc0710_i2c_write(dev, devaddr, wbuf, sizeof(wbuf));
+		printk(KERN_INFO "%s: input path: dev 0x%02x sub 0x%02x = 0x%02x (%d)\n",
+			dev->name, sc400_input_dev, wbuf[0], wbuf[1], ret);
+		msleep(2);
+	}
+}
+
 /* One-shot diagnostic for the Cam Link Pro: hexdump the MCU's status
  * subaddress space so the per-input (4x HDMI) status layout can be found.
  * Read-only: same transaction shape as the normal status poll, just at
