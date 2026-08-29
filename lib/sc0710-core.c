@@ -572,6 +572,19 @@ static int sc0710_proc_show(struct seq_file *m, void *v)
 					seq_printf(m, " 0x%04x = %08x\n", i, val);
 				}
 			}
+
+			/* BAR1 (XDMA): register-capture diffing. Some XDMA
+			 * status fields are clear-on-read, so this is a
+			 * diagnostic for stopped engines, not a monitor. */
+			end = min_t(u64, 0x10000,
+				    pci_resource_len(dev->pci, 1));
+			seq_printf(m, "Full BAR1 Register Dump:\n");
+			for (i = 0; i < end; i += 4) {
+				val = sc_read(dev, 1, i);
+				if (val) {
+					seq_printf(m, " B1 0x%04x = %08x\n", i, val);
+				}
+			}
 		}
 
 	}
