@@ -230,12 +230,24 @@ sc0710_steamos_clean_pkgcache() {
 
 # Install compiler + git if the image (or an update) left us without them.
 # Caller must have unlocked the rootfs.
+# gcc from base-devel is present on a fresh SteamOS image, but the userspace
+# C headers that normally ship inside glibc (stdio.h, glob.h, ...) and
+# linux-api-headers (asm/*.h, e.g. sys/ioctl.h's asm/ioctls.h) are stripped
+# from Valve's base squashfs to save space — so gcc runs but #include fails.
+# This is separate from the kernel headers sc0710_steamos_ensure_headers
+# installs (those are versioned per-kernel; these are the generic userspace
+# ones every C program compiles against).
+sc0710_steamos_have_c_headers() {
+    [[ -f /usr/include/stdio.h && -f /usr/include/asm/ioctls.h ]]
+}
+
 sc0710_steamos_ensure_build_tools() {
     local missing=()
 
     command -v gcc >/dev/null 2>&1 || missing+=("gcc")
     command -v make >/dev/null 2>&1 || missing+=("make")
     command -v git >/dev/null 2>&1 || missing+=("git")
+    sc0710_steamos_have_c_headers || missing+=("glibc" "linux-api-headers")
     [[ ${#missing[@]} -eq 0 ]] && return 0
 
     sc0710_steamos_log "Installing build tools: ${missing[*]}"
@@ -245,11 +257,19 @@ sc0710_steamos_ensure_build_tools() {
         # the individual packages before giving up.
         sc0710_steamos_pacman -Sy --needed --noconfirm "${missing[@]}" >/dev/null 2>&1 || true
     fi
+    # SteamOS strips /usr/include from the base image after glibc and
+    # linux-api-headers are already marked installed in the pacman DB, so
+    # --needed (used above) sees them as satisfied and skips them. Drop
+    # --needed here to force pacman to actually re-extract the packages.
+    if ! sc0710_steamos_have_c_headers; then
+        sc0710_steamos_pacman -S --noconfirm glibc linux-api-headers >/dev/null 2>&1 || true
+    fi
     sc0710_steamos_clean_pkgcache
 
     missing=()
     command -v gcc >/dev/null 2>&1 || missing+=("gcc")
     command -v make >/dev/null 2>&1 || missing+=("make")
+    sc0710_steamos_have_c_headers || missing+=("glibc/linux-api-headers")
     if [[ ${#missing[@]} -gt 0 ]]; then
         sc0710_steamos_log "ERROR: build tools still missing: ${missing[*]}"
         return 1

@@ -2,7 +2,10 @@
 # sc0710-gui — driver management GUI for Elgato SC0710 cards.
 #
 # Launched by `sc0710-cli --gui` / `-g`. Pure Qt UI (no console panel).
-# Sysfs toggles write directly; load/unload use modprobe/rmmod via sudo.
+# Sysfs toggles write directly; load/unload elevate via pkexec (the
+# desktop's own polkit dialog — no controlling terminal needed, which is
+# what lets this run from a plain .desktop launcher), falling back to
+# sudo -n/-v where pkexec is unavailable.
 #
 # SPDX-License-Identifier: GPL-2.0-or-later
 
@@ -10,9 +13,32 @@ import os
 import re
 import sys
 import glob
+import pwd
 import shutil
 import subprocess
 import time
+
+_HAVE_PKEXEC = shutil.which("pkexec") is not None
+
+
+def elevate(argv, user=None):
+    """Prefix argv for privileged execution: pkexec if available, else sudo -n."""
+    if _HAVE_PKEXEC:
+        cmd = ["pkexec"]
+        if user:
+            cmd += ["--user", user]
+        return cmd + list(argv)
+    cmd = ["sudo", "-n"]
+    if user:
+        cmd += ["-u", user]
+    return cmd + list(argv)
+
+
+def _uid_to_user(uid):
+    try:
+        return pwd.getpwuid(int(uid)).pw_name
+    except (KeyError, ValueError):
+        return None
 
 APP_NAME = "sc0710"
 
@@ -107,13 +133,15 @@ def param_int(name, default=0):
 
 
 def sudo_run(argv, timeout=120):
-    """Run argv under sudo -n; prime ticket once if needed."""
-    cmd = ["sudo", "-n", *argv]
+    """Run argv elevated: pkexec (prompts via the desktop's polkit agent) when
+    available, else sudo -n with an interactive `sudo -v` fallback."""
+    cmd = elevate(argv)
     try:
         p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     except (OSError, subprocess.TimeoutExpired) as e:
         return False, str(e)
-    if p.returncode != 0 and "password" in ((p.stderr or "") + (p.stdout or "")).lower():
+    if (not _HAVE_PKEXEC and p.returncode != 0 and
+            "password" in ((p.stderr or "") + (p.stdout or "")).lower()):
         if subprocess.run(["sudo", "-v"]).returncode != 0:
             return False, "sudo authentication failed"
         try:
@@ -131,15 +159,11 @@ def write_param(name, value):
             f.write(f"{value}\n")
         return True, None
     except PermissionError:
-        p = subprocess.run(
-            ["sudo", "-n", "bash", "-c", f"echo {int(value)} > '{path}'"],
-            capture_output=True, text=True, timeout=15)
-        if p.returncode != 0:
+        write_argv = ["bash", "-c", f"echo {int(value)} > '{path}'"]
+        p = subprocess.run(elevate(write_argv), capture_output=True, text=True, timeout=15)
+        if p.returncode != 0 and not _HAVE_PKEXEC:
             if subprocess.run(["sudo", "-v"]).returncode == 0:
-                p = subprocess.run(
-                    ["sudo", "-n", "bash", "-c",
-                     f"echo {int(value)} > '{path}'"],
-                    capture_output=True, text=True, timeout=15)
+                p = subprocess.run(elevate(write_argv), capture_output=True, text=True, timeout=15)
         if p.returncode == 0:
             return True, None
         return False, (p.stderr or p.stdout or "write failed").strip()
@@ -169,7 +193,7 @@ def persist_basic_params():
         return True
     except PermissionError:
         p = subprocess.run(
-            ["sudo", "-n", "tee", PERSIST_FILE],
+            elevate(["tee", PERSIST_FILE]),
             input=body, capture_output=True, text=True, timeout=15)
         return p.returncode == 0
     except OSError:
@@ -277,24 +301,30 @@ def stop_pipewire_holders():
             pass
     uniq = sorted(set(uids))
     for uid in uniq:
+        target = _uid_to_user(uid) if _HAVE_PKEXEC else f"#{uid}"
+        if target is None:
+            continue
         subprocess.run(
-            ["sudo", "-n", "-u", f"#{uid}", "bash", "-c",
-             f"export XDG_RUNTIME_DIR=/run/user/{uid}; "
-             f"export DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/{uid}/bus; "
-             "systemctl --user stop pipewire.socket pipewire-pulse.socket "
-             "pipewire.service pipewire-pulse.service wireplumber.service "
-             "2>/dev/null || true"],
+            elevate(["bash", "-c",
+                     f"export XDG_RUNTIME_DIR=/run/user/{uid}; "
+                     f"export DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/{uid}/bus; "
+                     "systemctl --user stop pipewire.socket pipewire-pulse.socket "
+                     "pipewire.service pipewire-pulse.service wireplumber.service "
+                     "2>/dev/null || true"], user=target),
             capture_output=True, timeout=30)
     return uniq
 
 
 def start_pipewire(uids):
     for uid in uids:
+        target = _uid_to_user(uid) if _HAVE_PKEXEC else f"#{uid}"
+        if target is None:
+            continue
         subprocess.run(
-            ["sudo", "-n", "-u", f"#{uid}", "bash", "-c",
-             f"export XDG_RUNTIME_DIR=/run/user/{uid}; "
-             f"export DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/{uid}/bus; "
-             "systemctl --user start pipewire.socket pipewire-pulse.socket"],
+            elevate(["bash", "-c",
+                     f"export XDG_RUNTIME_DIR=/run/user/{uid}; "
+                     f"export DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/{uid}/bus; "
+                     "systemctl --user start pipewire.socket pipewire-pulse.socket"], user=target),
             capture_output=True, timeout=30)
 
 
@@ -307,7 +337,7 @@ def module_unload():
     uids = stop_pipewire_holders()
     nodes = sc0710_video_nodes()
     if nodes:
-        subprocess.run(["sudo", "-n", "fuser", "-k", *nodes],
+        subprocess.run(elevate(["fuser", "-k", *nodes]),
                        capture_output=True, timeout=15)
     time.sleep(1)
     ok, err = sudo_run(["rmmod", "sc0710"], timeout=30)

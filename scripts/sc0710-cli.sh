@@ -36,6 +36,17 @@ if [[ "$1" == "-ec" || "$1" == "--edid-config" ||
         _gui_name="sc0710-edid-config"
         _gui_label="EDID"
     fi
+    # A .desktop launch has no controlling terminal, so a plain "echo; exit 1"
+    # here is invisible — it looks exactly like nothing happened at all.
+    # Surface every early failure as a desktop notification too, whenever one
+    # is available (present on every DE this driver targets: GNOME, KDE/Plasma
+    # including SteamOS Desktop Mode, XFCE).
+    _gui_notify_fail() {
+        command -v notify-send >/dev/null 2>&1 && \
+            notify-send -u critical "SC0710 ${_gui_label}" "$1" 2>/dev/null
+        return 0
+    }
+
     _GUI=""
     for _p in \
         "$_cli_dir/${_gui_name}" \
@@ -48,6 +59,7 @@ if [[ "$1" == "-ec" || "$1" == "--edid-config" ||
     done
     if [[ -z "$_GUI" ]]; then
         echo -e "${RED}[ERROR]${NC} ${_gui_name} not found. Reinstall the driver package."
+        _gui_notify_fail "${_gui_name} not found. Reinstall the driver package."
         exit 1
     fi
     if ! lsmod | grep -q "^${DRV_NAME} "; then
@@ -55,15 +67,24 @@ if [[ "$1" == "-ec" || "$1" == "--edid-config" ||
     fi
     if ! python3 -c 'import PySide6' 2>/dev/null && ! python3 -c 'import PyQt6' 2>/dev/null; then
         echo -e "${YELLOW}[INFO]${NC} The ${_gui_label} GUI needs a Qt binding (PySide6). Install it with:"
-        echo -e "    Arch:   ${BOLD}sudo pacman -S pyside6${NC}"
-        echo -e "    Fedora: ${BOLD}sudo dnf install python3-pyside6${NC}"
-        echo -e "    Debian: ${BOLD}sudo apt install python3-pyside6${NC}"
+        echo -e "    Arch/SteamOS: ${BOLD}sudo pacman -S pyside6${NC}"
+        echo -e "    Fedora:       ${BOLD}sudo dnf install python3-pyside6${NC} (or rpm-ostree install, then reboot)"
+        echo -e "    Debian:       ${BOLD}sudo apt install python3-pyside6.qtcore python3-pyside6.qtgui python3-pyside6.qtwidgets${NC}"
+        _gui_notify_fail "Needs a Qt binding (PySide6). Run: sudo pacman -S pyside6 (see terminal / sc0710-cli --gui for other distros)."
         exit 1
     fi
-    # Prime sudo once (same auth as other sc0710-cli commands). GUI writes use sudo.
-    if [[ $EUID -ne 0 ]]; then
+    # Privileged writes (-g/--gui, -hc/--hdr-config) elevate per-action via
+    # pkexec, so the desktop's own polkit agent prompts as needed — no
+    # priming here, and no controlling terminal required (this is what lets
+    # a plain double-click from the app grid work). -ec/--edid-config never
+    # needs elevation (device nodes are group "video"). Only without pkexec
+    # do we fall back to sc0710-cli's old sudo-ticket priming, which needs a
+    # terminal to prompt in.
+    if [[ $EUID -ne 0 ]] && ! command -v pkexec >/dev/null 2>&1 && \
+       [[ "$1" == "-g" || "$1" == "--gui" || "$1" == "-hc" || "$1" == "--hdr-config" ]]; then
         if ! sudo -v; then
             echo -e "${RED}[ERROR]${NC} sudo authentication required for ${_gui_label}."
+            _gui_notify_fail "sudo authentication required, and no terminal is attached to prompt in."
             exit 1
         fi
     fi
@@ -344,6 +365,16 @@ sc0710_run_as_invoke_user() {
     fi
 }
 
+sc0710_cli_remove_desktop_launchers() {
+    local user home
+    for user in $(awk -F: '$3 >= 1000 && $3 < 65000 {print $1}' /etc/passwd); do
+        id "$user" >/dev/null 2>&1 || continue
+        home=$(getent passwd "$user" | cut -d: -f6)
+        [[ -n "$home" ]] || continue
+        rm -f "${home}/.local/share/applications/sc0710-gui.desktop" 2>/dev/null || true
+    done
+}
+
 sc0710_cli_remove_user_state() {
     sc0710_remove_firmware_files
     systemctl stop sc0710-firmware.service 2>/dev/null || true
@@ -356,6 +387,7 @@ sc0710_cli_remove_user_state() {
         /etc/modprobe.d/${DRV_NAME}-params.conf /etc/modprobe.d/${DRV_NAME}-atomic.conf
     systemctl daemon-reload 2>/dev/null || true
     rm -rf /var/log/sc0710
+    sc0710_cli_remove_desktop_launchers
 }
 
 sc0710_cli_remove_aur_install() {
@@ -448,7 +480,7 @@ sc0710_cli_atomic_load() {
         rm -rf "$extra_dir"
         depmod -a "$(uname -r)" 2>/dev/null || depmod -a 2>/dev/null || true
     fi
-    for dep in videodev videobuf2-common videobuf2-v4l2 videobuf2-vmalloc snd-pcm; do
+    for dep in videodev videobuf2-common videobuf2-v4l2 videobuf2-vmalloc videobuf2-dma-sg snd-pcm; do
         modprobe "$dep" 2>/dev/null || true
     done
     err=$(insmod "$SRC_DIR/build/${DRV_NAME}.ko" 2>&1) || {
@@ -1618,7 +1650,7 @@ case "$1" in
                 echo -e "  Check: ${BOLD}journalctl -u sc0710-build.service -b${NC}"
             fi
         else
-            for dep in videodev videobuf2-common videobuf2-v4l2 videobuf2-vmalloc snd-pcm; do
+            for dep in videodev videobuf2-common videobuf2-v4l2 videobuf2-vmalloc videobuf2-dma-sg snd-pcm; do
                 modprobe "$dep" 2>/dev/null || true
             done
             if modprobe "$DRV_NAME"; then
@@ -2045,7 +2077,7 @@ case "$1" in
             if make KVERSION="$(uname -r)" -j"$(nproc)" 2>&1; then
                 echo "$(uname -r)" > "$SRC_DIR/.built-for-kernel"
                 chcon -t modules_object_t "$SRC_DIR/build/${DRV_NAME}.ko" 2>/dev/null || true
-                for dep in videodev videobuf2-common videobuf2-v4l2 videobuf2-vmalloc snd-pcm; do modprobe "$dep" 2>/dev/null || true; done
+                for dep in videodev videobuf2-common videobuf2-v4l2 videobuf2-vmalloc videobuf2-dma-sg snd-pcm; do modprobe "$dep" 2>/dev/null || true; done
                 if sc0710_cli_atomic_load; then
                     if sc0710_is_4k_pro_card && sc0710_firmware_lib_path >/dev/null; then
                         if sc0710_cli_ensure_ecp5 5; then

@@ -396,6 +396,98 @@ check_video_group() {
     done
 }
 
+# Desktop launcher for `sc0710-cli --gui`. Installed per-user under
+# ~/.local/share/applications: always writable (part of /home) on every
+# flow this script supports — non-atomic, Fedora Atomic, and SteamOS all
+# leave /usr/share read-only or layered, but never /home. sc0710-cli's own
+# GUI dispatch elevates privileged writes via pkexec (falling back to sudo
+# where pkexec is unavailable), so this launcher needs no Terminal=true and
+# no polkit policy file of its own — pkexec's built-in admin-auth fallback
+# action covers it.
+install_desktop_launcher() {
+    local bin="$1" users home desktop_dir
+
+    [[ -x "$bin" ]] || bin="/usr/local/bin/sc0710-cli"
+    [[ -x "$bin" ]] || return 0
+
+    users=$(awk -F: '$3 >= 1000 && $3 < 65000 {print $1}' /etc/passwd)
+    for user in $users; do
+        id "$user" >/dev/null 2>&1 || continue
+        home=$(getent passwd "$user" | cut -d: -f6)
+        [[ -n "$home" && -d "$home" ]] || continue
+        desktop_dir="${home}/.local/share/applications"
+        mkdir -p "$desktop_dir" || continue
+
+        cat > "${desktop_dir}/sc0710-gui.desktop" <<EOF
+[Desktop Entry]
+Type=Application
+Name=SC0710 Manager
+GenericName=Capture Card Driver Manager
+Comment=Load/unload and configure the Elgato SC0710 capture card driver
+Exec=${bin} --gui
+Icon=camera-video
+Terminal=false
+Categories=AudioVideo;Settings;
+StartupNotify=true
+EOF
+        chown "${user}:${user}" "${desktop_dir}/sc0710-gui.desktop" 2>/dev/null || true
+        log "Installed desktop launcher for ${user}: ${desktop_dir}/sc0710-gui.desktop"
+    done
+}
+
+# sc0710-cli --gui/--edid-config/--hdr-config need a Qt binding to run at
+# all, and nothing else on any of these distros installs one by default.
+# Without it, the GUI dispatch in sc0710-cli.sh prints instructions and
+# exits 1 — invisible when launched from the desktop icon (no terminal to
+# print to), which just looks like "nothing happens". Install it here so
+# the GUI actually works out of the box; PKG_MANAGER/is_atomic/is_steamos
+# are only meaningful once the main distro-detection branch below has run,
+# so this must be called from the shared code after that branch closes.
+ensure_gui_dependencies() {
+    python3 -c 'import PySide6' 2>/dev/null && return 0
+    python3 -c 'import PyQt6' 2>/dev/null && return 0
+
+    msg "Installing Qt binding for the GUI tools..."
+    if is_steamos; then
+        sc0710_steamos_init_keyring
+        sc0710_steamos_pacman -Sy --needed --noconfirm pyside6 >/dev/null 2>&1 || true
+        sc0710_steamos_clean_pkgcache
+    elif is_atomic; then
+        # rpm-ostree layers don't become importable until the next boot even
+        # when it succeeds, so check the package DB, not `python3 -c import`.
+        if ! rpm -q python3-pyside6 >/dev/null 2>&1; then
+            rpm-ostree install --apply-live --idempotent --allow-inactive python3-pyside6 >/dev/null 2>&1 || \
+            rpm-ostree install --idempotent --allow-inactive python3-pyside6 >/dev/null 2>&1 || true
+        fi
+        if rpm -q python3-pyside6 >/dev/null 2>&1; then
+            if python3 -c 'import PySide6' 2>/dev/null; then
+                msg2 "Qt binding installed."
+            else
+                msg2 "Qt binding layered — reboot for the GUI tools to work."
+            fi
+            return 0
+        fi
+    else
+        case "${PKG_MANAGER:-}" in
+            pacman) pacman -S --needed --noconfirm pyside6 >/dev/null 2>&1 || true ;;
+            dnf)    dnf install -y python3-pyside6 >/dev/null 2>&1 || true ;;
+            apt)    apt-get install -y python3-pyside6.qtcore python3-pyside6.qtgui \
+                        python3-pyside6.qtwidgets >/dev/null 2>&1 || \
+                    apt-get install -y python3-pyside6 >/dev/null 2>&1 || true ;;
+        esac
+    fi
+
+    if python3 -c 'import PySide6' 2>/dev/null || python3 -c 'import PyQt6' 2>/dev/null; then
+        msg2 "Qt binding installed."
+    else
+        warning "Could not install a Qt binding automatically."
+        warning "GUI tools (--gui/--edid-config/--hdr-config) will need one installed manually:"
+        warning "  Arch/SteamOS: sudo pacman -S pyside6"
+        warning "  Fedora Atomic: rpm-ostree install python3-pyside6 (may need a reboot)"
+        warning "  Debian/Ubuntu: sudo apt install python3-pyside6.qtcore python3-pyside6.qtgui python3-pyside6.qtwidgets"
+    fi
+}
+
 # Extract base kernel version (X.Y.Z) for comparison - avoids false warnings on
 # distros like CachyOS where 6.19.6-2-cachyos and 6.19.6-arch1-1 are same base.
 kernel_base_version() {
@@ -503,7 +595,8 @@ check_video_group
 msg "Checking build dependencies..."
 
 HEADERS_PKG="$(sc0710_steamos_headers_pkg "$KERNEL_VER")"
-if sc0710_steamos_have_headers "$KERNEL_VER" && command -v gcc >/dev/null 2>&1 && command -v make >/dev/null 2>&1; then
+if sc0710_steamos_have_headers "$KERNEL_VER" && command -v gcc >/dev/null 2>&1 && \
+   command -v make >/dev/null 2>&1 && sc0710_steamos_have_c_headers; then
     msg2 "All build dependencies are present."
 else
     msg2 "Needed: build tools and ${HEADERS_PKG} (headers for kernel ${KERNEL_VER})."
@@ -870,7 +963,7 @@ cat > "/etc/modprobe.d/${DRV_NAME}.conf" <<EOF
 # Parameter persistence for sc0710 (loaded via insmod by sc0710-build.service)
 # Blacklist stops stale copies under /lib/modules/extra/ from loading at boot (ostree read-only).
 blacklist $DRV_NAME
-softdep $DRV_NAME pre: videodev videobuf2-v4l2 videobuf2-vmalloc videobuf2-common snd-pcm
+softdep $DRV_NAME pre: videodev videobuf2-v4l2 videobuf2-vmalloc videobuf2-dma-sg videobuf2-common snd-pcm
 EOF
 log "Module parameters configured"
 
@@ -1145,10 +1238,10 @@ else
 fi
 
 confirm "Load driver automatically on boot?" "Y" && echo "$DRV_NAME" > "/etc/modules-load.d/${DRV_NAME}.conf" || rm -f "/etc/modules-load.d/${DRV_NAME}.conf"
-echo 'softdep sc0710 pre: videodev videobuf2-v4l2 videobuf2-vmalloc videobuf2-common snd-pcm' > /etc/modprobe.d/${DRV_NAME}.conf
+echo 'softdep sc0710 pre: videodev videobuf2-v4l2 videobuf2-vmalloc videobuf2-dma-sg videobuf2-common snd-pcm' > /etc/modprobe.d/${DRV_NAME}.conf
 
 msg2 "Loading module..."
-for dep in videodev videobuf2-common videobuf2-v4l2 videobuf2-vmalloc snd-pcm; do modprobe "$dep" 2>/dev/null || true; done
+for dep in videodev videobuf2-common videobuf2-v4l2 videobuf2-vmalloc videobuf2-dma-sg snd-pcm; do modprobe "$dep" 2>/dev/null || true; done
 if lspci -n -v -d 12ab:0710 2>/dev/null | grep -qi "1cfa:0012" && [[ -f "/usr/local/libexec/sc0710-firmware-lib.sh" ]]; then
     # shellcheck source=/dev/null
     SC0710_FW_LOG_FILE="$LOG_FILE" source "/usr/local/libexec/sc0710-firmware-lib.sh"
@@ -1175,6 +1268,8 @@ if [[ -f "$SOURCE/scripts/sc0710-cli.sh" ]]; then
 else
     warning "scripts/sc0710-cli.sh not found in source. CLI not installed."
 fi
+
+ensure_gui_dependencies
 
 # EDID configuration GUI (launched by `sc0710-cli --edid-config`)
 if [[ -f "$SOURCE/scripts/sc0710-edid-config" ]]; then
@@ -1203,6 +1298,7 @@ fi
 if [[ -f "$SOURCE/scripts/sc0710-gui" ]]; then
     cp "$SOURCE/scripts/sc0710-gui" /usr/local/bin/sc0710-gui
     chmod +x /usr/local/bin/sc0710-gui
+    install_desktop_launcher /usr/local/bin/sc0710-cli
 else
     warning "scripts/sc0710-gui not found. Manager GUI not installed."
 fi

@@ -100,7 +100,7 @@ if [[ "$IS_STEAMOS" == "true" ]]; then
 # Parameter persistence for sc0710 (loaded via insmod by sc0710-build.service)
 # Blacklist stops stale copies under /lib/modules/extra/ from loading at boot.
 blacklist $DRV_NAME
-softdep $DRV_NAME pre: videodev videobuf2-v4l2 videobuf2-vmalloc videobuf2-common snd-pcm
+softdep $DRV_NAME pre: videodev videobuf2-v4l2 videobuf2-vmalloc videobuf2-dma-sg videobuf2-common snd-pcm
 EOF
         fi
     fi
@@ -197,7 +197,7 @@ if [[ -d "$extra_dir" ]]; then
     depmod -a "$KERNEL_VER" 2>/dev/null || depmod -a 2>/dev/null || true
 fi
 
-for dep in videodev videobuf2-common videobuf2-v4l2 videobuf2-vmalloc snd-pcm; do
+for dep in videodev videobuf2-common videobuf2-v4l2 videobuf2-vmalloc videobuf2-dma-sg snd-pcm; do
     modprobe "$dep" 2>/dev/null || log "WARNING: Failed to load dependency: $dep"
 done
 
