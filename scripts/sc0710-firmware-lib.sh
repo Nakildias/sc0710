@@ -276,7 +276,7 @@ sc0710_load_driver() {
 
     sc0710_clear_stale_kernel_registration
 
-    for dep in videodev videobuf2-common videobuf2-v4l2 videobuf2-vmalloc snd-pcm; do
+    for dep in videodev videobuf2-common videobuf2-v4l2 videobuf2-vmalloc videobuf2-dma-sg snd-pcm; do
         modprobe "$dep" 2>/dev/null || true
     done
 

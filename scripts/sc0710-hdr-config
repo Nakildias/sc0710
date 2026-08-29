@@ -3,11 +3,13 @@
 #
 # Launched by `sc0710-cli --hdr-config` / `-hc`. Same Qt style as
 # sc0710-edid-config (stock widgets, card selector, group boxes). Privilege
-# escalation for sysfs writes uses sudo (same ticket as sc0710-cli).
+# escalation for sysfs writes re-execs this script under pkexec (the
+# desktop's own polkit dialog — no controlling terminal needed), falling
+# back to sudo -n/-v where pkexec is unavailable.
 #
 #   sc0710-hdr-config                  launch the GUI
 #   sc0710-hdr-config --status         print live HDR state
-#   sc0710-hdr-config --set k=v …      write module params (used via sudo)
+#   sc0710-hdr-config --set k=v …      write module params (used via pkexec/sudo)
 #   sc0710-hdr-config --persist k=v …  write params + /etc/modprobe.d snippet
 #
 # SPDX-License-Identifier: GPL-2.0-or-later
@@ -18,6 +20,8 @@ import glob
 import random
 import shutil
 import subprocess
+
+_HAVE_PKEXEC = shutil.which("pkexec") is not None
 
 APP_NAME = "sc0710 HDR Configuration"
 
@@ -197,7 +201,7 @@ def write_persist_file(mapping):
 
 
 def privileged_set(mapping, persist=False):
-    """Apply mapping; escalate via sudo if needed (reuses sc0710-cli ticket)."""
+    """Apply mapping; escalate via pkexec (or sudo, if pkexec is unavailable)."""
     try:
         write_params_direct(mapping)
         if persist:
@@ -209,14 +213,23 @@ def privileged_set(mapping, persist=False):
     except OSError as e:
         return False, str(e)
 
-    if not shutil.which("sudo"):
-        return False, ("Permission denied and sudo is unavailable. "
-                       "Run as root or via sc0710-cli --hdr-config.")
+    if not (_HAVE_PKEXEC or shutil.which("sudo")):
+        return False, ("Permission denied and no elevation tool (pkexec/sudo) "
+                       "is available. Run as root or via sc0710-cli --hdr-config.")
 
     self_path = os.path.realpath(__file__)
     args = [sys.executable, self_path,
             "--persist" if persist else "--set",
             *[f"{k}={v}" for k, v in mapping.items()]]
+
+    if _HAVE_PKEXEC:
+        # pkexec prompts via the desktop's polkit agent; a single call is enough.
+        p = subprocess.run(["pkexec", *args], capture_output=True, text=True)
+        if p.returncode == 0:
+            return True, ("Applied."
+                          + (" Persisted for next boot." if persist else ""))
+        err = (p.stderr or p.stdout or "").strip() or f"pkexec exited {p.returncode}"
+        return False, err
 
     # Prefer non-interactive sudo (ticket already primed by sc0710-cli).
     p = subprocess.run(["sudo", "-n", *args], capture_output=True, text=True)
