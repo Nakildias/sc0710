@@ -19,7 +19,7 @@ High-performance, multi-client Linux driver for the Elgato 4K60 Pro MK.2, 4K Pro
 |------|-------------|-------|
 | **Elgato 4K60 Pro MK.2** | `1cfa:000e` | Plug-and-play after driver load. No FPGA firmware step. |
 | **Elgato 4K Pro** | `1cfa:0012` | Requires **ECP5 FPGA firmware** programming on every **cold boot**. Handled automatically by the installer and the AUR package; manual `insmod` builds need extra steps (see below). |
-| **Elgato Cam Link Pro** | `1cfa:0011` | Experimental. Native 3840x2160 NV12 capture and cold-boot firmware loading work. Four independent HDMI nodes are still under development. |
+| **Elgato Cam Link Pro** | `1cfa:0011` | Experimental. One HDMI-1 video/audio path, native 3840x2160 NV12 capture, and cold-boot firmware loading have been tested. Four simultaneous inputs are not implemented. |
 
 All three cards share the same `12ab:0710` PCI device ID but use different board profiles in the driver.
 
@@ -195,7 +195,7 @@ Same command as above. It checks the module, DKMS, CLI, systemd units, config fi
 * **DKMS integration** — automatic rebuilds on kernel updates (standard distros)
 * **Atomic / immutable support** — boot-time rebuild via `sc0710-build.service` (Bazzite, Silverblue, etc.)
 * **ECP5 auto-programming**: card-specific firmware extraction at install time; the driver programs the FPGA at load and refuses to bind if it cannot
-* **Cam Link Pro native 4K**: genuine 3840x2160 NV12 capture without host-side 1080p upscaling
+* **Cam Link Pro native 4K**: genuine 3840x2160 NV12 capture on the tested HDMI-1 path without host-side 1080p upscaling
 * **Status images** — storage-efficient No Signal / No Device screens
 * **Connection sensing** — distinguishes unplugged cables from signal loss (not 100% reliable)
 * **Video formats** — 4K60, 1440p144, 1080p240. **EDID Source control (Internal/Display/Merged) on both cards** via the `EDID Source` V4L2 control (`v4l2-ctl --set-ctrl=edid_source=N`). **Custom EDID read/write on both cards** via `VIDIOC_G_EDID`/`VIDIOC_S_EDID` — the 4K Pro through its EEPROM (`edid=` boot param, profiles from `scripts/extract-firmware.sh`), the MK.2 through its MCU (runtime only). The graphical **EDID Config app** (`sc0710-cli --edid-config`) manages this for both cards and can fetch Elgato's official EDID profiles
@@ -205,9 +205,9 @@ Same command as above. It checks the module, DKMS, CLI, systemd units, config fi
 * **Driver manager GUI** — `sc0710-cli --gui` (load/unload/restart, toggles, EDID/HDR config launchers, dump + HDR tests)
 * **Debug dumps** — `sc0710-cli --dump` collects distro, kernel, `lspci`, driver version, and service state for issue reports
 
-### Pixel formats (YUYV 4:2:2 and native BGR24 4:4:4)
+### Pixel formats
 
-Two capture formats are offered; pick per app over V4L2, no reload:
+The 4K60 Pro MK.2 and 4K Pro offer two capture formats. Pick one per app over V4L2, with no reload:
 
 * **`YUYV` (default)** — packed 4:2:2, 2 bytes/pixel. Lowest bandwidth, always available.
 * **`BGR24`** — native **4:4:4**, 3 bytes/pixel: the card's full-chroma mode (Elgato markets
@@ -220,6 +220,9 @@ v4l2-ctl -d /dev/video0 --list-formats                     # YUYV + BGR3
 v4l2-ctl -d /dev/video0 --set-fmt-video=pixelformat=BGR3   # select 4:4:4
 # OBS / ffmpeg pick it via the normal format menu / -pixel_format bgr24
 ```
+
+The Cam Link Pro path currently exposes one fixed format: `NV12` at 3840x2160. YUYV,
+BGR24, four simultaneous HDMI nodes, and multiview are not implemented for that card.
 
 On **MK.2**, HDR mode can also auto-select the format while idle:
 
