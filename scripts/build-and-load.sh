@@ -23,6 +23,89 @@ log "=== SC0710 boot-time build started ==="
 log "Kernel: $KERNEL_VER"
 log "Timestamp: $(date)"
 
+# --- SteamOS self-healing ---------------------------------------------------
+# A SteamOS A/B update swaps in a fresh rootfs: the kernel headers, anything
+# under /usr/local, and the /var/lib/sc0710 symlink can all be gone. The
+# persistent tree in /home/sc0710 survives, so put the system back together
+# from it before building. See scripts/sc0710-steamos-lib.sh.
+IS_STEAMOS=false
+STEAMOS_LIB=""
+for _cand in /home/sc0710/sc0710-steamos-lib.sh \
+             /home/sc0710/scripts/sc0710-steamos-lib.sh \
+             "${SRC_DIR}/sc0710-steamos-lib.sh"; do
+    if [[ -f "$_cand" ]]; then
+        STEAMOS_LIB="$_cand"
+        break
+    fi
+done
+
+if [[ -n "$STEAMOS_LIB" ]]; then
+    # shellcheck source=/dev/null
+    SC0710_STEAMOS_LOG_FILE="$LOG_FILE" source "$STEAMOS_LIB"
+    if sc0710_is_steamos; then
+        IS_STEAMOS=true
+    fi
+fi
+
+steamos_needs_unlock() {
+    sc0710_steamos_have_headers "$KERNEL_VER" || return 0
+    sc0710_steamos_tools_missing && return 0
+    [[ -f "/etc/modprobe.d/${DRV_NAME}.conf" ]] || return 0
+    [[ -f "/etc/modprobe.d/${DRV_NAME}-atomic.conf" ]] || return 0
+    if lspci -n -v -d 12ab:0710 2>/dev/null | grep -qi "1cfa:0012"; then
+        [[ -e "/etc/firmware/sc0710/SC0710.FWI.HEX" ]] || return 0
+    fi
+    return 1
+}
+
+if [[ "$IS_STEAMOS" == "true" ]]; then
+    log "SteamOS detected — persistent source tree: ${SC0710_STEAMOS_HOME}"
+    sc0710_steamos_ensure_layout || log "WARNING: could not repair ${SRC_DIR} -> ${SC0710_STEAMOS_HOME}"
+
+    if steamos_needs_unlock; then
+        log "Unlocking the read-only rootfs to restore the driver environment..."
+        trap 'sc0710_steamos_relock' EXIT
+        if ! sc0710_steamos_unlock; then
+            log "ERROR: could not unlock the rootfs; cannot restore headers or tools."
+            exit 1
+        fi
+
+        if ! sc0710_steamos_have_headers "$KERNEL_VER"; then
+            log "Waiting for the network (kernel headers must be downloaded)..."
+            if sc0710_steamos_wait_online 90; then
+                sc0710_steamos_ensure_build_tools || true
+                if ! sc0710_steamos_ensure_headers "$KERNEL_VER"; then
+                    log "ERROR: kernel headers unavailable — the driver cannot be rebuilt this boot."
+                    log "Fix it once online with: sudo sc0710-cli --rebuild"
+                    exit 1
+                fi
+            else
+                log "ERROR: no network connection; cannot install kernel headers for $KERNEL_VER."
+                log "Connect to the network and run: sudo sc0710-cli --rebuild"
+                exit 1
+            fi
+        fi
+
+        # /usr/local is emptied by an OS update — put the CLI and GUIs back.
+        if sc0710_steamos_tools_missing; then
+            log "Reinstalling sc0710-cli and GUIs into /usr/local/bin..."
+            sc0710_steamos_install_tools "${SC0710_STEAMOS_HOME}" || \
+                log "WARNING: could not reinstall the sc0710 userspace tools."
+        fi
+
+        # modprobe.d config lives on the rootfs and is lost with it.
+        if [[ ! -f "/etc/modprobe.d/${DRV_NAME}.conf" ]]; then
+            mkdir -p /etc/modprobe.d
+            cat > "/etc/modprobe.d/${DRV_NAME}.conf" <<EOF
+# Parameter persistence for sc0710 (loaded via insmod by sc0710-build.service)
+# Blacklist stops stale copies under /lib/modules/extra/ from loading at boot.
+blacklist $DRV_NAME
+softdep $DRV_NAME pre: videodev videobuf2-v4l2 videobuf2-vmalloc videobuf2-common snd-pcm
+EOF
+        fi
+    fi
+fi
+
 if [[ ! -d "$SRC_DIR" || ! -f "$SRC_DIR/Makefile" ]]; then
     log "ERROR: Source directory $SRC_DIR is missing or incomplete."
     exit 1
@@ -30,7 +113,11 @@ fi
 
 if [[ ! -d "/lib/modules/${KERNEL_VER}/build" ]]; then
     log "ERROR: Kernel headers for $KERNEL_VER are missing."
-    log "Run: sudo rpm-ostree install kernel-devel"
+    if [[ "$IS_STEAMOS" == "true" ]]; then
+        log "Install them with: sudo steamos-readonly disable && sudo pacman -Sy $(sc0710_steamos_headers_pkg "$KERNEL_VER")"
+    else
+        log "Run: sudo rpm-ostree install kernel-devel"
+    fi
     exit 1
 fi
 

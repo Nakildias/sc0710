@@ -76,15 +76,70 @@ if [[ $EUID -ne 0 ]]; then
 fi
 DUMP_USER="${SC0710_INVOKE_USER:-${SUDO_USER:-root}}"
 
+# --- SteamOS support ---
+# SteamOS is immutable like Bazzite but locks / behind `steamos-readonly`, so
+# every write to /etc, /usr/local or /lib/modules needs an unlock first. The
+# helper library also knows where the persistent source tree lives.
+IS_STEAMOS=false
+for _steamos_lib in /home/sc0710/sc0710-steamos-lib.sh \
+                    /var/lib/sc0710/sc0710-steamos-lib.sh \
+                    /usr/lib/sc0710/sc0710-steamos-lib.sh \
+                    "$(dirname "$(readlink -f "${BASH_SOURCE[0]:-$0}")")/sc0710-steamos-lib.sh"; do
+    if [[ -f "$_steamos_lib" ]]; then
+        # shellcheck source=/dev/null
+        source "$_steamos_lib"
+        sc0710_is_steamos && IS_STEAMOS=true
+        break
+    fi
+done
+
+is_steamos() {
+    [[ "$IS_STEAMOS" == "true" ]]
+}
+
+# Banner suffix: "SteamOS Edition" / "Atomic Edition" / "".
+sc0710_edition_label() {
+    if is_steamos; then
+        printf ' (SteamOS Edition)'
+    elif [[ -f /run/ostree-booted ]] || command -v rpm-ostree &>/dev/null; then
+        printf ' (Atomic Edition)'
+    fi
+}
+
+# Unlock the rootfs for the current command and re-lock it on exit. Idempotent
+# and a no-op off SteamOS, so write sites can just call it.
+STEAMOS_RW_ACTIVE=false
+steamos_rw() {
+    is_steamos || return 0
+    [[ "$STEAMOS_RW_ACTIVE" == "true" ]] && return 0
+    if ! sc0710_steamos_unlock; then
+        echo -e "${RED}[ERROR]${NC} Could not unlock the SteamOS rootfs."
+        echo -e "  Run ${BOLD}sudo steamos-readonly disable${NC} and try again."
+        return 1
+    fi
+    STEAMOS_RW_ACTIVE=true
+    trap 'sc0710_steamos_relock' EXIT
+    return 0
+}
+
 # --- Detect atomic distro ---
+# SteamOS counts as atomic here: same immutable layout (source tree rebuilt at
+# boot, module insmod'ed from it) even though the package manager differs.
 is_atomic() {
-    [[ -f /run/ostree-booted ]] || command -v rpm-ostree &>/dev/null
+    [[ -f /run/ostree-booted ]] && return 0
+    command -v rpm-ostree &>/dev/null && return 0
+    is_steamos
 }
 
 # --- Resolve version and paths ---
 if is_atomic; then
     IS_ATOMIC=true
     SRC_DIR="/var/lib/sc0710"
+    # SteamOS: /var is an A/B partition, so the compat symlink can be missing
+    # after an OS update even though the source tree in /home survived.
+    if is_steamos && [[ ! -e "$SRC_DIR" && -d "$SC0710_STEAMOS_HOME" ]]; then
+        sc0710_steamos_ensure_layout 2>/dev/null || SRC_DIR="$SC0710_STEAMOS_HOME"
+    fi
     if [[ -f "$SRC_DIR/version" ]]; then
         CURRENT_VERSION="$(cat "$SRC_DIR/version" | tr -d '[:space:]')"
     else
@@ -142,6 +197,7 @@ save_config() {
         return 0
     fi
 
+    steamos_rw || { echo -e "${YELLOW}[WARN]${NC} Settings not persisted (rootfs is read-only)."; return 0; }
     echo "options sc0710$opts" > /etc/modprobe.d/sc0710-params.conf
     echo -e "${BLUE}[PERSIST]${NC} Settings saved to /etc/modprobe.d/sc0710-params.conf"
     echo -e "  ${BOLD}options sc0710$opts${NC}"
@@ -331,7 +387,7 @@ sc0710_detect_install_method() {
     fi
 
     if [[ "$IS_ATOMIC" == "true" && -d /var/lib/sc0710 ]]; then
-        printf 'GitHub (atomic installer)'
+        is_steamos && printf 'GitHub (SteamOS installer)' || printf 'GitHub (atomic installer)'
         return 0
     fi
 
@@ -828,11 +884,16 @@ write_debug_dump() {
             printf 'Linux Distro: unknown\n'
         fi
         printf 'Kernel Version: %s\n' "$(uname -r)"
-        printf 'System Type: %s\n' "$([[ "$IS_ATOMIC" == "true" ]] && echo Atomic || echo Standard)"
+        printf 'System Type: %s\n' "$(is_steamos && echo SteamOS || { [[ "$IS_ATOMIC" == "true" ]] && echo Atomic || echo Standard; })"
         printf 'Architecture: %s\n' "$(uname -m)"
         printf 'Hostname: %s\n' "$(get_hostname)"
         printf 'Uptime: %s\n' "$(uptime -p 2>/dev/null || uptime 2>/dev/null || echo unknown)"
-        if [[ "$IS_ATOMIC" == "true" ]]; then
+        if is_steamos; then
+            printf 'SteamOS Rootfs: %s\n' "$(sc0710_steamos_rootfs_locked && echo 'read-only' || echo writable)"
+            printf 'Persistent Source: %s\n' "$SC0710_STEAMOS_HOME"
+            printf 'Kernel Headers Package: %s\n' "$(sc0710_steamos_headers_pkg)"
+            printf 'Kernel Headers Present: %s\n' "$(sc0710_steamos_have_headers && echo yes || echo no)"
+        elif [[ "$IS_ATOMIC" == "true" ]]; then
             printf 'Ostree Booted: %s\n' "$([[ -f /run/ostree-booted ]] && echo yes || echo no)"
             command -v rpm-ostree &>/dev/null && printf 'rpm-ostree: available\n' || printf 'rpm-ostree: not found\n'
         fi
@@ -865,7 +926,13 @@ write_debug_dump() {
 
     dump_section "Install State"
     if [[ "$IS_ATOMIC" == "true" ]]; then
-        dump_cmd "rpm-ostree status" bash -c "rpm-ostree status 2>/dev/null || echo '(rpm-ostree unavailable)'"
+        if is_steamos; then
+            dump_cmd "SteamOS release" bash -c "cat /etc/os-release 2>/dev/null || echo '(no os-release)'"
+            dump_cmd "Rootfs state" bash -c "btrfs property get -ts / ro 2>/dev/null || echo '(not btrfs)'"
+            dump_cmd "Neptune headers" bash -c "pacman -Q \$(uname -r | sed -n 's/.*neptune-\\([0-9]*\\).*/linux-neptune-\\1-headers/p') 2>/dev/null || echo '(headers package not installed)'"
+        else
+            dump_cmd "rpm-ostree status" bash -c "rpm-ostree status 2>/dev/null || echo '(rpm-ostree unavailable)'"
+        fi
         dump_cmd "Atomic build service" systemctl status sc0710-build.service --no-pager
         dump_cmd "sc0710-build.service journal (last 50 lines)" bash -c "journalctl -u sc0710-build.service -n 50 --no-pager 2>/dev/null || echo '(no journal entries)'"
         dump_file_if_exists "$SRC_DIR/.built-for-kernel"
@@ -1442,7 +1509,7 @@ EOF
 # --- Help Function ---
 show_help() {
     if [[ "$IS_ATOMIC" == "true" ]]; then
-        echo -e "${BOLD}SC0710${NC} Driver Control Utility v${CURRENT_VERSION} (Atomic Edition)"
+        echo -e "${BOLD}SC0710${NC} Driver Control Utility v${CURRENT_VERSION}$(sc0710_edition_label)"
     else
         echo -e "${BOLD}SC0710${NC} Driver Control Utility v${CURRENT_VERSION}"
     fi
@@ -1475,13 +1542,22 @@ show_help() {
     fi
     echo -e "    ${BOLD}-v, --version${NC}    Show version information"
     echo -e "    ${BOLD}-h, --help${NC}       Show this help message"
+    if is_steamos; then
+        echo ""
+        echo -e "  ${BOLD}SteamOS notes${NC}"
+        echo -e "    The driver source lives in ${BOLD}${SC0710_STEAMOS_HOME}${NC} — /home is the only"
+        echo -e "    partition a SteamOS update leaves alone. ${BOLD}sc0710-build.service${NC} rebuilds"
+        echo -e "    the module and reinstalls the kernel headers on the first boot after one."
+        echo -e "    These commands unlock the read-only rootfs and re-lock it when they finish."
+        echo -e "    If an update removes the boot service: ${BOLD}sudo bash ${SC0710_STEAMOS_HOME}/steamos-restore.sh${NC}"
+    fi
     echo ""
 }
 
 # --- No Arguments Handler ---
 if [[ $# -eq 0 ]]; then
     if [[ "$IS_ATOMIC" == "true" ]]; then
-        echo -e "${BOLD}SC0710${NC} Driver Control Utility (Atomic Edition)"
+        echo -e "${BOLD}SC0710${NC} Driver Control Utility$(sc0710_edition_label)"
     else
         echo -e "${BOLD}SC0710${NC} Driver Control Utility"
     fi
@@ -1490,6 +1566,16 @@ if [[ $# -eq 0 ]]; then
 fi
 
 # --- Command Handler ---
+# SteamOS: these commands write to /etc, /usr/local or /lib/modules, all on the
+# read-only rootfs. Unlock once here; the trap in steamos_rw re-locks on exit.
+case "$1" in
+    -l|--load|-u|--unload|--restart|-d|--debug|-ht|--hdr-toggle|-it|--image-toggle| \
+    -kaa|--keep-audio-alive|-pt|--procedural-timings|-U|--update|--rebuild|-r|-R|--remove| \
+    --rate-decode)
+        steamos_rw || exit 1
+        ;;
+esac
+
 case "$1" in
     -l|--load)
         if lsmod | grep -q "$DRV_NAME"; then
@@ -1658,7 +1744,8 @@ case "$1" in
         echo ""
         if [[ "$IS_ATOMIC" == "true" ]]; then
             echo -e "${BLUE}::${NC} ${BOLD}System Type${NC}"
-            echo -e "   Atomic/Immutable (boot-time build)"
+            is_steamos && echo -e "   SteamOS (boot-time build, source in ${SC0710_STEAMOS_HOME})" \
+                       || echo -e "   Atomic/Immutable (boot-time build)"
             if [[ -f "$SRC_DIR/.built-for-kernel" ]]; then
                 echo -e "   Last built for: ${BOLD}$(cat "$SRC_DIR/.built-for-kernel")${NC}"
             fi
@@ -1942,6 +2029,13 @@ case "$1" in
             rm -f "$TEMP_TAR"
             [[ -f "$SRC_DIR/scripts/build-and-load.sh" ]] && cp "$SRC_DIR/scripts/build-and-load.sh" "$SRC_DIR/build-and-load.sh" && chmod +x "$SRC_DIR/build-and-load.sh"
             [[ -f "$SRC_DIR/scripts/sc0710-firmware-lib.sh" ]] && cp "$SRC_DIR/scripts/sc0710-firmware-lib.sh" "$SRC_DIR/sc0710-firmware-lib.sh" && chmod +x "$SRC_DIR/sc0710-firmware-lib.sh"
+            # The boot service sources this out of the tree root, so it has to
+            # be refreshed alongside the others.
+            [[ -f "$SRC_DIR/scripts/sc0710-steamos-lib.sh" ]] && cp "$SRC_DIR/scripts/sc0710-steamos-lib.sh" "$SRC_DIR/sc0710-steamos-lib.sh" && chmod +x "$SRC_DIR/sc0710-steamos-lib.sh"
+            if is_steamos; then
+                sc0710_steamos_install_tools "$SRC_DIR" || \
+                    echo -e "${YELLOW}[WARNING]${NC} Could not refresh the sc0710 tools in /usr/local/bin."
+            fi
             NEW_VER="$CURRENT_VERSION"
             [[ -f "$SRC_DIR/version" ]] && NEW_VER=$(cat "$SRC_DIR/version" | tr -d '[:space:]')
             lsmod | grep -q "$DRV_NAME" && "$0" --unload
@@ -2016,7 +2110,7 @@ case "$1" in
         ;;
     --rebuild)
         if [[ "$IS_ATOMIC" != "true" ]]; then
-            echo -e "${RED}[ERROR]${NC} --rebuild is only supported on Atomic distros. Use --update instead."
+            echo -e "${RED}[ERROR]${NC} --rebuild is only supported on Atomic/SteamOS installs. Use --update instead."
             exit 1
         fi
         echo -e "${BLUE}::${NC} Forcing module rebuild..."
@@ -2040,8 +2134,16 @@ case "$1" in
             rm -f /etc/systemd/system/sc0710-build.service
             systemctl daemon-reload
             sc0710_cli_clear_stale_registration
-            rm -rf "$SRC_DIR"
-            echo -e "  ${YELLOW}NOTE:${NC} Layered build packages were left unchanged (no rpm-ostree changes, no reboot needed)."
+            if is_steamos; then
+                # $SRC_DIR is a symlink into /home; removing it alone would
+                # leave the whole driver tree (and the source) behind.
+                rm -rf "${SC0710_STEAMOS_HOME:?}"
+                rm -f /var/lib/sc0710
+                echo -e "  ${YELLOW}NOTE:${NC} Packages installed with pacman (kernel headers, base-devel) were left in place."
+            else
+                rm -rf "$SRC_DIR"
+                echo -e "  ${YELLOW}NOTE:${NC} Layered build packages were left unchanged (no rpm-ostree changes, no reboot needed)."
+            fi
         else
             sc0710_dkms_run_cleanup
         fi
@@ -2111,7 +2213,7 @@ case "$1" in
         sc0710_pcie_verdict
         ;;
     -v|--version)
-        [[ "$IS_ATOMIC" == "true" ]] && echo -e "${BOLD}SC0710${NC} Driver Control Utility (Atomic Edition)" || echo -e "${BOLD}SC0710${NC} Driver Control Utility"
+        echo -e "${BOLD}SC0710${NC} Driver Control Utility$(sc0710_edition_label)"
         echo -e "Version: ${BOLD}${CURRENT_VERSION}${NC}"
         check_version
         ;;
