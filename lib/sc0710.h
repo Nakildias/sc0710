@@ -82,6 +82,11 @@ extern unsigned int dma_resync_tear_streak_required;
 extern unsigned int dma_resync_max_tear_retries;
 extern unsigned int refresh_rate_resync_passes;
 extern unsigned int refresh_rate_resync_delay_ms;
+extern unsigned int dma_short_desc_detect;
+
+/* Laps a writeback word must match the configured descriptor length before
+ * it is trusted as the transferred-length word. */
+#define SC0710_WB_CAL_LAPS 240
 
 /* EDID profile to present to the HDMI source (edid= module param); empty = factory default. */
 extern char *sc0710_edid_profile;
@@ -372,6 +377,31 @@ struct sc0710_dma_channel
 	u64                          zc_wbm_flips;
 	u64                          zc_stale_events;
 	u64                          zc_stale_descs;
+
+	/* Short-descriptor detection (dma_short_desc_detect).
+	 *
+	 * The engine may complete a descriptor short of its configured
+	 * lengthBytes; the driver copies the full size regardless, which
+	 * permanently shifts the frame anchor with nothing logged.
+	 *
+	 * The writeback word carrying the transferred length is not
+	 * documented for this part, so it is learned rather than assumed:
+	 * during calibration each writeback word is compared against the
+	 * descriptor's configured lengthBytes, and a word that matches on
+	 * every descriptor for wb_cal_target laps is locked in as the
+	 * length word. Afterwards any descriptor whose length word differs
+	 * from its configured size is a short. */
+	int                          wb_len_word;   /* -1 unknown, else 0/1 */
+	u32                          wb_cal_laps;   /* laps observed so far */
+	u32                          wb_cal_cand;   /* bitmask of still-viable words */
+	bool                         wb_cal_failed; /* neither word is a length */
+	u64                          short_desc_count;
+	u64                          short_desc_laps;
+	u32                          short_last_expect;
+	u32                          short_last_actual;
+	u32                          short_last_chain;
+	u32                          short_last_desc;
+	unsigned long                short_last_jiffies;
 
 	/* Channel 1 */
 	struct sc0710_audio_dev     *audio_dev;
@@ -701,6 +731,7 @@ int  sc0710_dma_channel_alloc(struct sc0710_dev *dev, u32 nr, enum sc0710_channe
 	enum sc0710_channel_type_e mediatype);
 
 void sc0710_dma_channel_free(struct sc0710_dev *dev, u32 nr);
+void sc0710_short_desc_reset(struct sc0710_dma_channel *ch);
 void sc0710_dma_channel_descriptors_dump(struct sc0710_dma_channel *ch);
 int  sc0710_dma_channel_service(struct sc0710_dma_channel *ch);
 int  sc0710_dma_channel_start_prep(struct sc0710_dma_channel *ch);

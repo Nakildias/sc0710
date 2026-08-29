@@ -17,22 +17,6 @@ SC0710_FIRMWARE_FILE="${SC0710_FIRMWARE_FILE:-SC0710.FWI.HEX}"
 SC0710_DRV_NAME="${SC0710_DRV_NAME:-sc0710}"
 SC0710_4K_PRO_SUBSYS="${SC0710_4K_PRO_SUBSYS:-1cfa:0012}"
 
-# Self-contained SteamOS probe: sc0710-steamos-lib.sh is not always sourced
-# alongside this file (the AUR package ships only the firmware lib).
-sc0710_is_steamos_host() {
-    local id id_like variant
-    if [[ -r /etc/os-release ]]; then
-        id=$(. /etc/os-release 2>/dev/null; printf '%s' "${ID:-}")
-        id_like=$(. /etc/os-release 2>/dev/null; printf '%s' "${ID_LIKE:-}")
-        variant=$(. /etc/os-release 2>/dev/null; printf '%s' "${VARIANT_ID:-}")
-        [[ "$id" == "steamos" ]] && return 0
-        [[ "$id_like" == *steamos* ]] && return 0
-        [[ "$variant" == "steamdeck" ]] && return 0
-    fi
-    command -v steamos-readonly >/dev/null 2>&1 && return 0
-    return 1
-}
-
 sc0710_fw_log() {
     if [[ -n "${SC0710_FW_LOG_FILE:-}" ]]; then
         echo "$*" >> "$SC0710_FW_LOG_FILE"
@@ -43,10 +27,6 @@ sc0710_fw_log() {
 sc0710_is_immutable() {
     [[ -f /run/ostree-booted ]] && return 0
     command -v rpm-ostree &>/dev/null && return 0
-    # SteamOS: / is read-only but can be temporarily unlocked, so the write
-    # probe below would misreport it as traditional mid-install. Decide by
-    # distro identity instead — the layout is immutable either way.
-    sc0710_is_steamos_host && return 0
     [[ -L /lib/firmware && "$(readlink -f /lib/firmware)" == /nix/store/* ]] && return 0
     [[ -L /lib/firmware && "$(readlink -f /lib/firmware)" == /gnu/store/* ]] && return 0
     command -v transactional-update &>/dev/null && return 0
@@ -140,16 +120,9 @@ sc0710_ensure_firmware_layout() {
     fi
 
     if [[ "$SC0710_DISTRO_TYPE" == "immutable" ]]; then
-        mkdir -p "$SC0710_FIRMWARE_STORE"
-        # /etc lives on the read-only rootfs on SteamOS. The symlink is a
-        # convenience only — the driver also searches SC0710_FIRMWARE_STORE
-        # (/var/lib/sc0710/firmware) directly — so never fail on it.
-        if mkdir -p "$SC0710_FIRMWARE_LINK" 2>/dev/null && \
-           ln -sfn "$SC0710_FIRMWARE_PATH" "${SC0710_FIRMWARE_LINK}/${SC0710_FIRMWARE_FILE}" 2>/dev/null; then
-            sc0710_fw_log "Firmware symlink: ${SC0710_FIRMWARE_LINK}/${SC0710_FIRMWARE_FILE} -> ${SC0710_FIRMWARE_PATH}"
-        else
-            sc0710_fw_log "NOTE: could not create ${SC0710_FIRMWARE_LINK} (read-only /etc); the driver reads ${SC0710_FIRMWARE_PATH} directly."
-        fi
+        mkdir -p "$SC0710_FIRMWARE_STORE" "$SC0710_FIRMWARE_LINK"
+        ln -sfn "$SC0710_FIRMWARE_PATH" "${SC0710_FIRMWARE_LINK}/${SC0710_FIRMWARE_FILE}"
+        sc0710_fw_log "Firmware symlink: ${SC0710_FIRMWARE_LINK}/${SC0710_FIRMWARE_FILE} -> ${SC0710_FIRMWARE_PATH}"
     fi
 
     chcon -t firmware_t "$SC0710_FIRMWARE_PATH" 2>/dev/null || true
@@ -225,17 +198,11 @@ sc0710_ensure_modprobe_blacklist() {
     [[ "${SC0710_DISTRO_TYPE:-}" == "immutable" ]] || return 0
     [[ -f "$conf" ]] && grep -q "^blacklist ${SC0710_DRV_NAME}\$" "$conf" 2>/dev/null && return 0
 
-    if ! cat 2>/dev/null > "$conf" <<EOF
+    cat > "$conf" <<EOF
 # SC0710 on atomic distros: do not auto-load stale copies under /lib/modules/*/extra/.
 # sc0710-build.service loads ${SC0710_SRC_DIR:-/var/lib/sc0710}/build/${SC0710_DRV_NAME}.ko via insmod.
 blacklist ${SC0710_DRV_NAME}
 EOF
-    then
-        # SteamOS keeps /etc on the read-only rootfs. Not fatal: nothing can
-        # auto-load a stale module from there either.
-        sc0710_fw_log "NOTE: could not write ${conf} (read-only /etc); skipping the blacklist."
-        return 0
-    fi
     sc0710_fw_log "Installed modprobe blacklist at ${conf}"
 }
 

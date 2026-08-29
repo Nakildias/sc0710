@@ -207,6 +207,11 @@ module_param(refresh_rate_resync_delay_ms, int, 0644);
 MODULE_PARM_DESC(refresh_rate_resync_delay_ms,
 	"Delay between refresh-rate resync passes in milliseconds");
 
+unsigned int dma_short_desc_detect = 0;
+module_param(dma_short_desc_detect, int, 0644);
+MODULE_PARM_DESC(dma_short_desc_detect,
+	"Short-descriptor detection: 0=off, 1=detect and count, 2=detect and resync");
+
 static unsigned int card[]  = {[0 ... (SC0710_MAXBOARDS - 1)] = UNSET };
 module_param_array(card,  int, NULL, 0444);
 MODULE_PARM_DESC(card, "card type");
@@ -466,8 +471,22 @@ static int sc0710_proc_state_show(struct seq_file *m, void *v)
 				dev->interlaced ? 'i' : 'p',
 				dev->pixelLineH, dev->pixelLineV);
 			if (dev->fmt) {
-				seq_printf(m, "   framesize: %d\n",
-					sc0710_framesize(dev, dev->fmt));
+				u32 fsz = sc0710_framesize(dev, dev->fmt);
+
+				seq_printf(m, "   framesize: %d\n", fsz);
+				/* Sustained host-write rate this format demands.
+				 * Compared against the PCIe link's usable
+				 * bandwidth, this is what decides whether the
+				 * slot can carry the stream at all. */
+				seq_printf(m, "  req bytes/s: %llu (%llu MB/s, %c%c%c%c @ %u.%02u fps)\n",
+					(u64)fsz * dev->fmt->fpsX100 / 100,
+					(u64)fsz * dev->fmt->fpsX100 / 100 / 1000000,
+					dev->pixfmt->fourcc & 0xff,
+					(dev->pixfmt->fourcc >> 8) & 0xff,
+					(dev->pixfmt->fourcc >> 16) & 0xff,
+					(dev->pixfmt->fourcc >> 24) & 0xff,
+					dev->fmt->fpsX100 / 100,
+					dev->fmt->fpsX100 % 100);
 			}
 		} else {
 			seq_printf(m, "        HDMI: no signal\n");
@@ -524,6 +543,28 @@ static int sc0710_proc_state_show(struct seq_file *m, void *v)
 				seq_printf(m, "    zc flips: %llu, stale events: %llu, stale descriptors: %llu%s\n",
 					ch->zc_wbm_flips, ch->zc_stale_events, ch->zc_stale_descs,
 					ch->zc_stale_trip ? " [TRIPPED - zero-copy disabled]" : "");
+			}
+
+			if (dma_short_desc_detect && ch->mediatype == CHTYPE_VIDEO) {
+				if (ch->wb_cal_failed) {
+					seq_printf(m, " short descr: unavailable (no writeback word tracks descriptor length)\n");
+				} else if (ch->wb_len_word < 0) {
+					seq_printf(m, " short descr: calibrating (%u/%u laps, candidates %s%s)\n",
+						ch->wb_cal_laps, SC0710_WB_CAL_LAPS,
+						ch->wb_cal_cand & 0x1 ? "w0 " : "",
+						ch->wb_cal_cand & 0x2 ? "w1" : "");
+				} else {
+					seq_printf(m, " short descr: %llu in %llu laps (length word w%d)\n",
+						ch->short_desc_count, ch->short_desc_laps,
+						ch->wb_len_word);
+					if (ch->short_desc_count)
+						seq_printf(m, "  last short: chain %u desc %u got %u of %u (short %u, mod3 %u) %u ms ago\n",
+							ch->short_last_chain, ch->short_last_desc,
+							ch->short_last_actual, ch->short_last_expect,
+							ch->short_last_expect - ch->short_last_actual,
+							(ch->short_last_expect - ch->short_last_actual) % 3,
+							jiffies_to_msecs(jiffies - ch->short_last_jiffies));
+				}
 			}
 
 			if (ch->mediatype == CHTYPE_AUDIO) {
