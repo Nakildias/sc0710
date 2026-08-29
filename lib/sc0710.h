@@ -124,6 +124,7 @@ extern unsigned int keep_audio_alive;
 #define SC0710_BOARD_UNKNOWN             0
 #define SC0710_BOARD_ELGATEO_4KP60_MK2   1
 #define SC0710_BOARD_ELGATEO_4KP         2
+#define SC0710_BOARD_ELGATO_CAMLINK_PRO  3
 
 enum sc0710_timing_mode {
 	TIMING_MODE_MERGE = 0,           /* Use static match + dynamic fallback */
