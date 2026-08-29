@@ -777,6 +777,8 @@ int sc0710_i2c_read_hdmi_status(struct sc0710_dev *dev);
 void sc0710_i2c_mcu_scan(struct sc0710_dev *dev);
 extern unsigned int sc0710_mcu_scan;
 void sc0710_i2c_set_input_path(struct sc0710_dev *dev);
+void sc0710_i2c_apply_4k_mode(struct sc0710_dev *dev);
+extern unsigned int clp_4k_switch;
 extern unsigned int sc400_input_regs;
 extern unsigned int sc0710_hdmi_input;
 int sc0710_i2c_read_status2(struct sc0710_dev *dev);

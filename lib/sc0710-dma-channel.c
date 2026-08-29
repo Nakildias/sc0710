@@ -355,10 +355,6 @@ module_param(clp_wbm_debug, uint, 0644);
 MODULE_PARM_DESC(clp_wbm_debug,
 	"Cam Link Pro conveyor: log the next N raw writeback pairs");
 
-unsigned int clp_eop_log;
-module_param(clp_eop_log, uint, 0644);
-MODULE_PARM_DESC(clp_eop_log,
-	"Cam Link Pro conveyor: log the next N EOP (burst end) positions");
 
 /* Rows probed by the alignment checks, spread over the frame. */
 static const u16 sc0710_clp_probe_rows[] = { 1, 13, 67, 131, 263, 389, 487, 539 };

@@ -1033,6 +1033,89 @@ void sc0710_i2c_set_input_path(struct sc0710_dev *dev)
 	}
 }
 
+/* Cam Link Pro true-4K mode switch (Milestone 4 experiment).
+ *
+ * Reverse-engineered from CamLinkPro.X64.SYS (see
+ * captures/windows-analysis/REPORT-4k-mode.md): when the detector sees a
+ * source >= 3840x2160 on HDMI input 1 (zero-based index 0), the vendor
+ * driver does a read-modify-write of MCU (0x32) subaddress 0x03, setting
+ * bit 0; index 2 uses bit 1. Dropping below 4K clears the bit. This is
+ * the only 4K-specific MCU transaction; everything else (0xC8 height,
+ * 0xD0=0x4100) already follows the detected timing we program.
+ *
+ * Reversible and non-destructive: one control byte on the safe status
+ * port, exactly as Windows toggles it on every 4K lock. Trigger with
+ *   echo 1 > /sys/module/sc0710/parameters/clp_4k_switch   (enable)
+ *   echo 2 > /sys/module/sc0710/parameters/clp_4k_switch   (force disable)
+ * and watch dmesg; then capture a raw tap (clp_raw=1) to learn the 4K
+ * chunk geometry. Default 0 = never touch subaddress 0x03. */
+unsigned int clp_4k_switch;
+module_param_named(clp_4k_switch, clp_4k_switch, int, 0644);
+MODULE_PARM_DESC(clp_4k_switch,
+	"Cam Link Pro M4: 1 = set the 4K bit for the active input on MCU 0x03 (if >=3840x2160), 2 = clear it; 0 = leave alone");
+
+void sc0710_i2c_apply_4k_mode(struct sc0710_dev *dev)
+{
+	int active = sc0710_hdmi_input & 3;
+	int bit, want, changed = 0;
+	u8 wbuf[2] = { 0x03, 0 };
+	u8 rbuf[1] = { 0 };
+	int ret;
+
+	/* The vendor maps input index 0 -> bit 0, index 2 -> bit 1. Other
+	 * inputs have no documented 4K bit; refuse rather than guess. */
+	if (active == 0)
+		bit = 0x01;
+	else if (active == 2)
+		bit = 0x02;
+	else {
+		printk(KERN_WARNING "%s: 4K switch only known for HDMI input 1/3 (active=%d); ignoring\n",
+			dev->name, active);
+		return;
+	}
+
+	if (clp_4k_switch == 2) {
+		want = 0; /* force disable */
+	} else {
+		/* Enable only when the detected source really is >= 4K, the
+		 * same geometry gate the Windows driver applies. */
+		if (dev->width < 3840 || dev->height < 2160) {
+			printk(KERN_WARNING "%s: 4K switch: detected %ux%u is below 3840x2160; not enabling\n",
+				dev->name, dev->width, dev->height);
+			return;
+		}
+		want = 1;
+	}
+
+	mutex_lock(&dev->signalMutex);
+	ret = __sc0710_i2c_writeread(dev, I2C_DEV__ARM_MCU, wbuf, 1, rbuf, 1);
+	if (ret < 0) {
+		mutex_unlock(&dev->signalMutex);
+		printk(KERN_WARNING "%s: 4K switch: read of MCU sub 0x03 failed (%d)\n",
+			dev->name, ret);
+		return;
+	}
+
+	wbuf[0] = 0x03;
+	if (want)
+		wbuf[1] = rbuf[0] | (u8)bit;
+	else
+		wbuf[1] = rbuf[0] & (u8)~bit;
+	changed = (wbuf[1] != rbuf[0]);
+
+	if (changed) {
+		ret = sc0710_i2c_write(dev, I2C_DEV__ARM_MCU, wbuf, 2);
+		printk(KERN_INFO "%s: 4K switch: MCU 0x03 0x%02x -> 0x%02x (bit 0x%02x %s, input %d, %ux%u) ret=%d\n",
+			dev->name, rbuf[0], wbuf[1], bit,
+			want ? "set" : "clear", active + 1,
+			dev->width, dev->height, ret);
+	} else {
+		printk(KERN_INFO "%s: 4K switch: MCU 0x03 already 0x%02x (bit 0x%02x %s); no change\n",
+			dev->name, rbuf[0], bit, want ? "set" : "clear");
+	}
+	mutex_unlock(&dev->signalMutex);
+}
+
 /* One-shot diagnostic for the Cam Link Pro: hexdump the MCU's status
  * subaddress space so the per-input (4x HDMI) status layout can be found.
  * Read-only: same transaction shape as the normal status poll, just at
