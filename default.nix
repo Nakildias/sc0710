@@ -47,8 +47,8 @@ in
         boot.kernelModules         = [ "sc0710" ];
         environment.systemPackages = [ cli      ];
 
-        # 4K Pro only: the driver programs the ECP5 FPGA during probe and needs
-        # SC0710.FWI.HEX on disk; provision it once with scripts/extract-firmware.sh
+        # ECP5-based cards: the driver programs the FPGA during probe and needs
+        # card-specific firmware on disk; provision it with scripts/extract-firmware.sh
         # (installs to /lib/firmware/sc0710, which the kernel loader reads directly).
     });
 }

@@ -175,7 +175,7 @@ verify_essential_files() {
 # The driver programs the ECP5 at probe and fails the probe if it can't, so
 # no boot-time firmware services are needed — only the helper lib that
 # sc0710-cli and the atomic build service source.
-install_4k_pro_firmware_lib() {
+install_ecp5_firmware_lib() {
     local fw_lib="$1"
     local src_root="${2:-}"
 
@@ -189,6 +189,25 @@ install_4k_pro_firmware_lib() {
         warning "sc0710-firmware-lib.sh missing; sc0710-cli status/restart helpers may not work."
     fi
     return 0
+}
+
+has_ecp5_card() {
+    lspci -n -v -d 12ab:0710 2>/dev/null | grep -qiE '1cfa:00(11|12)'
+}
+
+detected_firmware_file() {
+    if lspci -n -v -d 12ab:0710 2>/dev/null | grep -qi '1cfa:0011'; then
+        printf '%s' 'CAMLINKPRO.FWI.HEX'
+    else
+        printf '%s' 'SC0710.FWI.HEX'
+    fi
+}
+
+firmware_file_present() {
+    local file="$1"
+    [[ -f "/var/lib/sc0710/firmware/$file" || \
+       -f "/lib/firmware/sc0710/$file" || \
+       -f "/etc/firmware/sc0710/$file" ]]
 }
 
 confirm() {
@@ -573,17 +592,17 @@ if [[ ! -d "$SRC_DIR" ]]; then
     log "Source verification passed"
 fi
 
-# --- 5.5. Firmware Extraction (4K Pro only) ---
-if lspci -n -v -d 12ab:0710 2>/dev/null | grep -qi "1cfa:0012"; then
-    FIRMWARE_FILE="SC0710.FWI.HEX"
-    if [[ ! -f "/var/lib/sc0710/firmware/$FIRMWARE_FILE" && ! -f "/lib/firmware/sc0710/$FIRMWARE_FILE" && ! -f "/etc/firmware/sc0710/$FIRMWARE_FILE" ]]; then
-        msg "4K Pro detected — extracting ECP5 firmware..."
+# --- 5.5. Firmware extraction for ECP5-based cards ---
+if has_ecp5_card; then
+    FIRMWARE_FILE="$(detected_firmware_file)"
+    if ! firmware_file_present "$FIRMWARE_FILE"; then
+        msg "ECP5-based card detected; extracting runtime firmware..."
         EXT_SCRIPT="$SOURCE/scripts/extract-firmware.sh"
         if [[ -f "$EXT_SCRIPT" ]]; then
             chmod +x "$EXT_SCRIPT"
             if bash "$EXT_SCRIPT"; then
                 msg2 "Firmware extraction completed."
-                log "4K Pro firmware extracted"
+                log "ECP5 runtime firmware extracted"
             else
                 warning "Firmware extraction failed."
             fi
@@ -591,19 +610,19 @@ if lspci -n -v -d 12ab:0710 2>/dev/null | grep -qi "1cfa:0012"; then
             warning "scripts/extract-firmware.sh not found. Firmware must be installed manually."
         fi
     else
-        msg2 "4K Pro firmware already present"
+        msg2 "ECP5 runtime firmware already present"
     fi
 else
-    log "No 4K Pro card detected, skipping firmware extraction"
+    log "No ECP5-based card detected, skipping firmware extraction"
 fi
 
-# --- 5.6. Firmware helper lib (4K Pro only) ---
-if lspci -n -v -d 12ab:0710 2>/dev/null | grep -qi "1cfa:0012"; then
-    msg "4K Pro detected — installing firmware helper lib..."
-    install_4k_pro_firmware_lib "/var/lib/sc0710/sc0710-firmware-lib.sh" "$SOURCE"
-    msg2 "4K Pro firmware helper lib installed (atomic)."
+# --- 5.6. Firmware helper lib for ECP5-based cards ---
+if has_ecp5_card; then
+    msg "Installing ECP5 firmware helper library..."
+    install_ecp5_firmware_lib "/var/lib/sc0710/sc0710-firmware-lib.sh" "$SOURCE"
+    msg2 "ECP5 firmware helper library installed (atomic)."
 else
-    log "No 4K Pro card detected, skipping firmware helper installation"
+    log "No ECP5-based card detected, skipping firmware helper installation"
 fi
 
 # --- 6. Create the boot-time build script ---
@@ -732,7 +751,7 @@ if [[ ${#FAILED_DEPS[@]} -gt 0 ]]; then
     log "ERROR: Failed to load kernel modules: ${FAILED_DEPS[*]}"
 fi
 
-# Load the driver (4K Pro uses ECP5-aware loader with retries)
+# Load the driver (ECP5-based cards use the firmware-aware loader with retries)
 if [[ -f "$SRC_DIR/sc0710-firmware-lib.sh" ]]; then
     # shellcheck source=/dev/null
     SC0710_FW_LOG_FILE="$LOG_FILE" source "$SRC_DIR/sc0710-firmware-lib.sh"
@@ -741,7 +760,7 @@ if [[ -f "$SRC_DIR/sc0710-firmware-lib.sh" ]]; then
     log "Cleared stale kernel module registrations (if any)"
 fi
 
-if lspci -n -v -d 12ab:0710 2>/dev/null | grep -qi "1cfa:0012" && [[ -f "$SRC_DIR/sc0710-firmware-lib.sh" ]]; then
+if has_ecp5_card && [[ -f "$SRC_DIR/sc0710-firmware-lib.sh" ]]; then
     # shellcheck source=/dev/null
     SC0710_FW_LOG_FILE="$LOG_FILE" source "$SRC_DIR/sc0710-firmware-lib.sh"
     sc0710_init_firmware_paths
@@ -882,14 +901,15 @@ else
 fi
 verify_essential_files "$SRC_DEST" || die "Source verification failed."
 
-if lspci -n -v -d 12ab:0710 2>/dev/null | grep -qi "1cfa:0012"; then
-    if [[ ! -f "/var/lib/sc0710/firmware/SC0710.FWI.HEX" && ! -f "/lib/firmware/sc0710/SC0710.FWI.HEX" && ! -f "/etc/firmware/sc0710/SC0710.FWI.HEX" ]]; then
-        msg "4K Pro detected — extracting ECP5 firmware..."
+if has_ecp5_card; then
+    FIRMWARE_FILE="$(detected_firmware_file)"
+    if ! firmware_file_present "$FIRMWARE_FILE"; then
+        msg "ECP5-based card detected; extracting runtime firmware..."
         [[ -f "$SOURCE/scripts/extract-firmware.sh" ]] && bash "$SOURCE/scripts/extract-firmware.sh" && msg2 "Firmware extracted." || warning "Firmware extraction failed."
     fi
-    msg "4K Pro detected — installing firmware helper lib..."
+    msg "Installing ECP5 firmware helper library..."
     mkdir -p "/usr/local/libexec"
-    install_4k_pro_firmware_lib "/usr/local/libexec/sc0710-firmware-lib.sh" "$SOURCE"
+    install_ecp5_firmware_lib "/usr/local/libexec/sc0710-firmware-lib.sh" "$SOURCE"
 fi
 
 USE_DKMS=false
@@ -930,7 +950,7 @@ echo 'softdep sc0710 pre: videodev videobuf2-v4l2 videobuf2-vmalloc videobuf2-co
 
 msg2 "Loading module..."
 for dep in videodev videobuf2-common videobuf2-v4l2 videobuf2-vmalloc snd-pcm; do modprobe "$dep" 2>/dev/null || true; done
-if lspci -n -v -d 12ab:0710 2>/dev/null | grep -qi "1cfa:0012" && [[ -f "/usr/local/libexec/sc0710-firmware-lib.sh" ]]; then
+if has_ecp5_card && [[ -f "/usr/local/libexec/sc0710-firmware-lib.sh" ]]; then
     # shellcheck source=/dev/null
     SC0710_FW_LOG_FILE="$LOG_FILE" source "/usr/local/libexec/sc0710-firmware-lib.sh"
     sc0710_init_firmware_paths

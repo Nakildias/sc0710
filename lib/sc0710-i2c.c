@@ -983,19 +983,18 @@ confirmed_timing_change:
 	return 0;
 }
 
-/* Cam Link Pro per-input video path select, transcribed from the vendor
- * driver's video-DMA start path (CamLinkPro.X64.SYS, the four calls at
+/* Cam Link Pro per-input setup, transcribed from the vendor driver's
+ * video-DMA start path (CamLinkPro.X64.SYS, the four calls at
  * 0x14026405d..0x1402641dd). It writes one 2-byte I2C register per HDMI
- * input -- subaddress 0x3b + input -- choosing between two constants by
+ * input, subaddress 0x3b + input, choosing between two constants by
  * whether that input's slot in the device extension is non-zero:
  *
  *   sub 0x3b + i = (input i is the one being captured) ? 0x10 : 0x01
  *
- * Our driver never wrote these, which is the leading explanation for a
- * locked signal whose DMA payload isn't a valid raster. Same shape as the
- * color_deep writes the driver already does on 0x32, so nowhere near the
- * flash/EEPROM paths. Everything is a module parameter because the device
- * address and constants are read off a disassembly, not a live trace.
+ * The exact meaning is still unverified. Writing these values did not switch
+ * the single-input payload on its own, so keep the experiment opt-in until a
+ * second live source can show whether they enable a multiplexed input stream.
+ * This uses the MCU's volatile runtime register port and never touches flash.
  *
  * Triggered one-shot from the HDMI poll thread, which already holds the
  * locks that serialise MCU access, so it cannot race the status poll.
@@ -1003,7 +1002,7 @@ confirmed_timing_change:
 unsigned int sc400_input_regs;
 module_param(sc400_input_regs, uint, 0644);
 MODULE_PARM_DESC(sc400_input_regs,
-	"Cam Link Pro bring-up: set to 1 to write the per-input path registers once");
+	"Cam Link Pro bring-up: set to 1 to write the vendor per-input setup registers once");
 
 unsigned int sc400_input_dev = 0x32;
 module_param(sc400_input_dev, uint, 0644);

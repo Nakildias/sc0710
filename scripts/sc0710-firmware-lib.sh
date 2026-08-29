@@ -13,9 +13,12 @@
 [[ -n "${SC0710_FIRMWARE_LIB_LOADED:-}" ]] && return 0
 SC0710_FIRMWARE_LIB_LOADED=1
 
-SC0710_FIRMWARE_FILE="${SC0710_FIRMWARE_FILE:-SC0710.FWI.HEX}"
 SC0710_DRV_NAME="${SC0710_DRV_NAME:-sc0710}"
 SC0710_4K_PRO_SUBSYS="${SC0710_4K_PRO_SUBSYS:-1cfa:0012}"
+SC0710_CAM_LINK_PRO_SUBSYS="${SC0710_CAM_LINK_PRO_SUBSYS:-1cfa:0011}"
+SC0710_4K_PRO_FIRMWARE_FILE="${SC0710_4K_PRO_FIRMWARE_FILE:-SC0710.FWI.HEX}"
+SC0710_CAM_LINK_PRO_FIRMWARE_FILE="${SC0710_CAM_LINK_PRO_FIRMWARE_FILE:-CAMLINKPRO.FWI.HEX}"
+SC0710_FIRMWARE_FILE="${SC0710_FIRMWARE_FILE:-}"
 
 sc0710_fw_log() {
     if [[ -n "${SC0710_FW_LOG_FILE:-}" ]]; then
@@ -41,6 +44,7 @@ sc0710_is_immutable() {
 }
 
 sc0710_init_firmware_paths() {
+    sc0710_select_firmware_file
     if sc0710_is_immutable; then
         SC0710_DISTRO_TYPE="immutable"
         SC0710_FIRMWARE_STORE="/var/lib/sc0710/firmware"
@@ -57,6 +61,31 @@ sc0710_init_firmware_paths() {
 
 sc0710_is_4k_pro() {
     lspci -n -v -d 12ab:0710 2>/dev/null | grep -qi "$SC0710_4K_PRO_SUBSYS"
+}
+
+sc0710_is_cam_link_pro() {
+    lspci -n -v -d 12ab:0710 2>/dev/null | grep -qi "$SC0710_CAM_LINK_PRO_SUBSYS"
+}
+
+sc0710_requires_ecp5_firmware() {
+    local subsys
+
+    subsys=$(sc0710_pci_subsys 2>/dev/null) || return 1
+    case "$subsys" in
+        "$SC0710_4K_PRO_SUBSYS"|"$SC0710_CAM_LINK_PRO_SUBSYS") return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+sc0710_select_firmware_file() {
+    local subsys
+
+    [[ -z "$SC0710_FIRMWARE_FILE" ]] || return 0
+    subsys=$(sc0710_pci_subsys 2>/dev/null || true)
+    case "$subsys" in
+        "$SC0710_CAM_LINK_PRO_SUBSYS") SC0710_FIRMWARE_FILE="$SC0710_CAM_LINK_PRO_FIRMWARE_FILE" ;;
+        *) SC0710_FIRMWARE_FILE="$SC0710_4K_PRO_FIRMWARE_FILE" ;;
+    esac
 }
 
 sc0710_pci_subsys() {
@@ -83,6 +112,7 @@ sc0710_pci_subsys() {
 sc0710_board_name_from_subsys() {
     case "$1" in
         1cfa:000e) printf '%s' 'Elgato 4K60 Pro MK.2' ;;
+        1cfa:0011) printf '%s' 'Elgato Cam Link Pro' ;;
         1cfa:0012) printf '%s' 'Elgato 4K Pro' ;;
         1cfa:0006) printf '%s' 'Elgato HD60 Pro (1cfa:0006)' ;;
         *) printf '%s' 'UNKNOWN/GENERIC' ;;
@@ -132,7 +162,7 @@ sc0710_ensure_firmware_layout() {
     return 0
 }
 
-# Probe success == the card is bound to the driver: on the 4K Pro the driver
+# Probe success == the card is bound to the driver: on ECP5-based cards the driver
 # fails its probe when the ECP5 can't be programmed, so bind state IS the
 # FPGA state — no kernel-log parsing needed.
 sc0710_card_bound() {
@@ -291,7 +321,7 @@ sc0710_ensure_ecp5_programmed() {
     local max_attempts="${1:-2}"
     local attempt
 
-    if ! sc0710_is_4k_pro; then
+    if ! sc0710_requires_ecp5_firmware; then
         return 0
     fi
 

@@ -1,4 +1,4 @@
-# Elgato 4K60 Pro MK.2 (1cfa:000e) and Elgato 4K Pro (1cfa:0012) Linux Driver
+# Linux driver for Elgato SC0710 capture cards
 
 [![Kernel Compatibility](https://img.shields.io/badge/Kernel-6.12%20--%207.0%2B-blueviolet)](https://github.com/Nakildias/sc0710)
 [![AUR version](https://img.shields.io/aur/version/sc0710-dkms-git?logo=arch-linux)](https://aur.archlinux.org/packages/sc0710-dkms-git)
@@ -9,7 +9,7 @@
 [![GitHub stars](https://img.shields.io/github/stars/Nakildias/sc0710?style=flat)](https://github.com/Nakildias/sc0710/stargazers)
 [![GitHub issues](https://img.shields.io/github/issues/Nakildias/sc0710)](https://github.com/Nakildias/sc0710/issues)
 
-High-performance, multi-client Linux driver for the Elgato 4K60 Pro MK.2 and Elgato 4K Pro PCI-e capture cards. Engineered for stability on modern kernels (6.12 through 7.0+).
+High-performance, multi-client Linux driver for the Elgato 4K60 Pro MK.2, 4K Pro, and Cam Link Pro PCIe capture cards. Engineered for stability on modern kernels (6.12 through 7.0+).
 
 *For older kernels, use the original [stoth68000/sc0710](https://github.com/stoth68000/sc0710) repository (MK.2 only).*
 
@@ -19,18 +19,19 @@ High-performance, multi-client Linux driver for the Elgato 4K60 Pro MK.2 and Elg
 |------|-------------|-------|
 | **Elgato 4K60 Pro MK.2** | `1cfa:000e` | Plug-and-play after driver load. No FPGA firmware step. |
 | **Elgato 4K Pro** | `1cfa:0012` | Requires **ECP5 FPGA firmware** programming on every **cold boot**. Handled automatically by the installer and the AUR package; manual `insmod` builds need extra steps (see below). |
+| **Elgato Cam Link Pro** | `1cfa:0011` | Experimental. Native 3840x2160 NV12 capture and cold-boot firmware loading work. Four independent HDMI nodes are still under development. |
 
-Both cards share the same `12ab:0710` Magewell chipset but use different board profiles in the driver.
+All three cards share the same `12ab:0710` PCI device ID but use different board profiles in the driver.
 
 ## Kernel compatibility
 
 | Distribution | Status | Notes |
 |--------------|--------|-------|
-| **Arch Linux** | Stable | DKMS via AUR (`sc0710-dkms-git`) or manual build. Includes `sc0710-cli` and 4K Pro firmware helpers (see below). |
+| **Arch Linux** | Stable | DKMS via AUR (`sc0710-dkms-git`) or manual build. Includes `sc0710-cli` and ECP5 firmware helpers (see below). |
 | **Fedora / RHEL** | Stable | DKMS via the automatic installer. |
 | **Debian / Ubuntu** | Stable | **Warning:** distro OBS packages may crash; prefer Flatpak OBS. |
-| **Fedora Atomic** (Bazzite, Bluefin, Aurora, Silverblue) | Stable | Boot-time build service at `/var/lib/sc0710`. No DKMS. 4K Pro ECP5 stack included. |
-| **NixOS** | Supported | Flake module builds the driver and installs `sc0710-cli`; 4K Pro firmware is a one-time `extract-firmware.sh` run (see below). |
+| **Fedora Atomic** (Bazzite, Bluefin, Aurora, Silverblue) | Stable | Boot-time build service at `/var/lib/sc0710`. No DKMS. ECP5 firmware support included. |
+| **NixOS** | Supported | Flake module builds the driver and installs `sc0710-cli`; ECP5 cards need a one-time `extract-firmware.sh` run (see below). |
 
 Tested on kernel **6.12 through 7.0+**. Newer kernels may work but are not guaranteed until tested.
 
@@ -51,11 +52,11 @@ sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/Nakildias/sc0710/ma
 - `sc0710-build.service` — rebuilds and loads the module on each boot
 - `sc0710-cli` with atomic-specific commands (`--rebuild`, etc.)
 
-**4K Pro on any distro** additionally gets extraction of `SC0710.FWI.HEX` from the Elgato Windows driver at install time (`extract-firmware.sh`, with pinned checksums). Downloading from Elgato always asks for consent first, so a non-interactive install extracts only if the Elgato package is already on disk — otherwise re-run the script in a terminal afterwards.
+**4K Pro and Cam Link Pro** additionally need their card-specific volatile ECP5 firmware. `extract-firmware.sh` obtains it from the matching official Elgato Windows driver and verifies pinned checksums for both the installer and extracted firmware. Downloads always require consent.
 
-### 4K Pro ECP5 firmware (cold boot)
+### ECP5 firmware (4K Pro and Cam Link Pro)
 
-The 4K Pro has a Lattice ECP5 FPGA whose configuration is **volatile** — it is lost on full power-off / cold boot. Windows programs it on every boot; this driver programs it during its probe, and **fails the probe if it can't** (missing firmware file, upload failure) — the card then stays unbound and no `/dev/video*` appears, with the reason in `dmesg`.
+These cards have a Lattice ECP5 FPGA whose configuration is **volatile** and is lost after full power-off. The driver uploads the matching firmware during probe and refuses to bind if the file is missing or the upload fails. It never writes these runtime files to the card's persistent flash.
 
 **If the card didn't bind:**
 
@@ -75,13 +76,13 @@ The AUR package installs:
 
 - **DKMS kernel module** — rebuilds automatically on kernel updates
 - **`sc0710-cli`** at `/usr/bin/sc0710-cli` — same management tool as the automatic installer
-- **4K Pro firmware helpers** under `/usr/lib/sc0710/` (`extract-firmware.sh`, `sc0710-firmware-lib.sh`)
+- **ECP5 firmware helpers** under `/usr/lib/sc0710/` (`extract-firmware.sh`, `sc0710-firmware-lib.sh`)
 
 **MK.2 users** can load with `sudo modprobe sc0710` (or enable `/etc/modules-load.d/sc0710.conf` for boot load) and manage the driver with `sc0710-cli`.
 
-**4K Pro users** — if a 4K Pro card (`1cfa:0012`) is present at install/upgrade time, the package hook:
+**4K Pro and Cam Link Pro users**: when either card is present at install or upgrade time, the package hook:
 
-1. Extracts `SC0710.FWI.HEX` if the Elgato installer is already on disk (`p7zip` needed; the hook never downloads — pacman runs it non-interactively, and downloading from Elgato requires a consent prompt). If firmware ends up missing, run `sudo bash /usr/lib/sc0710/extract-firmware.sh` in a terminal afterwards.
+1. Extracts the matching firmware if the official Elgato installer is already on disk. The package hook never downloads because pacman runs it non-interactively. Run `sudo bash /usr/lib/sc0710/extract-firmware.sh` in a terminal to approve a download.
 2. Configures boot module loading via `modules-load.d` and `modprobe.d` softdeps
 3. Loads the driver (which programs the ECP5 during its probe)
 
@@ -103,7 +104,7 @@ sudo sc0710-cli --restart
 
 **Upgrading from an older package version** — old versions created `sc0710-firmware.service`/`sc0710-firmware-verify.service` outside the package (the driver programs the ECP5 itself now, so they no longer exist). The package upgrade removes those leftovers automatically; the [removal check script](#verify-complete-removal) flags any stragglers.
 
-**4K Pro on Arch** — the maintainer primarily tests on MK.2 hardware. Cold-boot ECP5 reports from 4K Pro users are especially welcome ([open an issue](https://github.com/Nakildias/sc0710/issues) with `sc0710-cli --dump`).
+Cam Link Pro support was developed and tested on attached hardware. Reports from other machines and multi-input setups are welcome through `sc0710-cli --dump`.
 
 ### NixOS (flakes)
 
@@ -134,7 +135,7 @@ hardware.sc0710.enable = true;          # kernel module + sc0710-cli
 # hardware.sc0710.kernel = pkgs.linuxPackages_6_19.kernel;  # optional override
 ```
 
-**Note:** The NixOS module builds the driver and installs `sc0710-cli`. **4K Pro users on NixOS** additionally run `scripts/extract-firmware.sh` once (as root, from a repo checkout) to provision the ECP5 firmware and EDID profiles — it installs to `/lib/firmware/sc0710`, which the kernel firmware loader reads directly. (MK.2 users don't need it: capture works without firmware files, and custom EDIDs are written at runtime — no firmware install required.) The driver programs the FPGA at every module load and refuses to bind if it can't, so no boot service is needed.
+**Note:** The NixOS module builds the driver and installs `sc0710-cli`. **4K Pro and Cam Link Pro users on NixOS** additionally run `scripts/extract-firmware.sh` once as root from a repo checkout. It installs the matching ECP5 firmware to `/lib/firmware/sc0710`, which the kernel firmware loader reads directly. MK.2 capture works without a firmware file. The driver programs the FPGA at every module load and refuses to bind if it cannot, so no boot service is needed.
 
 ### Manual compilation
 
@@ -153,8 +154,8 @@ For development or unsupported distros.
    sudo insmod build/sc0710.ko
    ```
 
-3. **4K Pro only** — `insmod` alone is not enough on cold boot. You also need:
-   - `SC0710.FWI.HEX` in `/lib/firmware/sc0710/` (extract with `scripts/extract-firmware.sh`)
+3. **4K Pro and Cam Link Pro only**: `insmod` alone is not enough on cold boot. You also need:
+   - The matching firmware in `/lib/firmware/sc0710/` (extract with `scripts/extract-firmware.sh`)
    - Reload the module after cold boot so the driver can program the ECP5, or use the automatic installer
 
 ## Driver management (`sc0710-cli`)
@@ -163,18 +164,18 @@ Installed by the automatic installer, the AUR package, and the NixOS module. Pro
 
 | Command | Alias | Description |
 |---------|-------|-------------|
-| `--status` | `-s` | Module state, card info, signal format, ECP5 status (4K Pro), DKMS or build service status |
-| `--load` | `-l` | Load the module. On 4K Pro, verifies ECP5 programming after load |
+| `--status` | `-s` | Module state, card info, signal format, ECP5 status, DKMS or build service status |
+| `--load` | `-l` | Load the module and verify ECP5 programming when required |
 | `--unload` | `-u` | Unload the module (stops PipeWire consumers if the module is busy) |
-| `--restart` | | Full reload. On 4K Pro, runs ECP5 programming with retries |
+| `--restart` | | Full reload. On ECP5 cards, runs firmware programming with retries |
 | `--debug` | `-d` | Toggle verbose `dmesg` logging |
 | `--image-toggle` | `-it` | Toggle No Signal images vs colorbars |
 | `--procedural-timings` | `-pt` | Cycle timing mode: merge → procedural-only → static-only |
 | `--keep-audio-alive` | `-kaa` | Toggle always-on audio capture (off by default). See below |
-| `--update` | `-U` | Pull latest source, rebuild, reload. On 4K Pro, re-runs ECP5 programming with retries |
+| `--update` | `-U` | Pull latest source, rebuild, reload, and reprogram ECP5 firmware when required |
 | `--rebuild` | | *(Atomic only)* Force rebuild the module for the running kernel |
 | `--dump` | | Save a debug report to the Desktop (`dump-DD-MM-YYYY.txt`) for GitHub issues |
-| `--remove` | `-r`, `-R` | Uninstall driver, CLI, services, config files, and 4K Pro firmware |
+| `--remove` | `-r`, `-R` | Uninstall driver, CLI, services, config files, and ECP5 firmware |
 | `--version` | `-v` | Show installed driver version |
 | `--help` | `-h` | Show all options |
 
@@ -186,14 +187,15 @@ bash -c "$(curl -fsSL https://raw.githubusercontent.com/Nakildias/sc0710/main/sc
 
 ### Verify complete removal
 
-Same command as above — checks module, DKMS, CLI, systemd units, config files, logs, and 4K Pro firmware. No clone or sudo required. Exits `0` when fully clean.
+Same command as above. It checks the module, DKMS, CLI, systemd units, config files, logs, and ECP5 firmware. No clone or sudo required. Exits `0` when fully clean.
 
 ## Features
 
 * **Multi-client support** — multiple apps (e.g. OBS + Discord) can open the device simultaneously
 * **DKMS integration** — automatic rebuilds on kernel updates (standard distros)
 * **Atomic / immutable support** — boot-time rebuild via `sc0710-build.service` (Bazzite, Silverblue, etc.)
-* **4K Pro ECP5 auto-programming** — firmware extraction at install time; the driver programs the FPGA at load and refuses to bind if it can't
+* **ECP5 auto-programming**: card-specific firmware extraction at install time; the driver programs the FPGA at load and refuses to bind if it cannot
+* **Cam Link Pro native 4K**: genuine 3840x2160 NV12 capture without host-side 1080p upscaling
 * **Status images** — storage-efficient No Signal / No Device screens
 * **Connection sensing** — distinguishes unplugged cables from signal loss (not 100% reliable)
 * **Video formats** — 4K60, 1440p144, 1080p240. **EDID Source control (Internal/Display/Merged) on both cards** via the `EDID Source` V4L2 control (`v4l2-ctl --set-ctrl=edid_source=N`). **Custom EDID read/write on both cards** via `VIDIOC_G_EDID`/`VIDIOC_S_EDID` — the 4K Pro through its EEPROM (`edid=` boot param, profiles from `scripts/extract-firmware.sh`), the MK.2 through its MCU (runtime only). The graphical **EDID Config app** (`sc0710-cli --edid-config`) manages this for both cards and can fetch Elgato's official EDID profiles
@@ -332,7 +334,7 @@ sudo sh -c 'echo 1 > /proc/sys/vm/compact_memory'
 
 | Problem | What to try |
 |---------|-------------|
-| **4K Pro: card didn't bind / no `/dev/video*`** (cold boot) | `sudo dmesg \| grep sc0710` for the probe error; if firmware is missing run `extract-firmware.sh`, then `sudo sc0710-cli --restart` |
+| **4K Pro or Cam Link Pro: no `/dev/video*` after cold boot** | `sudo dmesg \| grep sc0710` for the probe error; if firmware is missing run `extract-firmware.sh`, then `sudo sc0710-cli --restart` |
 | **Module won't unload** (app in use) | `sc0710-cli --unload` stops PipeWire first; close OBS/etc. |
 | **Atomic: module not built after kernel update** | `sudo sc0710-cli --rebuild` or check `journalctl -u sc0710-build.service -b` |
 | **Driver still present after `--remove`** | Run `sudo sc0710-cli --remove` again, then the [removal check script](#verify-complete-removal) |
@@ -344,6 +346,7 @@ For GitHub issues, attach output from `sc0710-cli --dump`.
 
 * **4K60 DMA tearing** — horizontal tears or frame shifts at 4K60 (~995 MB/s) under heavy load; **under active investigation**
 * **10-bit planar formats** — P010/P016 not implemented; HDR passthrough uses native **BGR24** 4:4:4 instead
+* **Cam Link Pro ports 2 through 4**: the current Linux node captures the selected/native stream. Four simultaneous V4L2 and ALSA endpoints are not implemented yet.
 
 ## Help wanted
 
@@ -352,6 +355,7 @@ Maintainer **[Nakildias](https://github.com/Nakildias)** only has an **Elgato 4K
 Contributions and testing help are especially welcome for:
 
 * **Elgato 4K Pro** — ECP5 cold-boot behavior, atomic/Bazzite installs, and general capture stability
+* **Elgato Cam Link Pro**: four-input stream tagging, simultaneous capture, and multi-input audio testing
 * **Unsupported cards** — other `12ab:0710` subsystem IDs (e.g. HD60 Pro) that are not yet fully supported
 * **Open issues** — bugs that need reproduction on hardware the maintainer does not own (4K60 tearing, edge-case distros, etc.)
 

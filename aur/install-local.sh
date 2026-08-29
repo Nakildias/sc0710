@@ -74,9 +74,9 @@ print_next_steps() {
     if [[ -f "$fw_lib" ]]; then
         # shellcheck source=/dev/null
         source "$fw_lib"
-        if sc0710_is_4k_pro; then
+        if sc0710_requires_ecp5_firmware; then
             cat <<'EOF'
-4K Pro — the driver programs the ECP5 FPGA at module load and refuses to
+This card uses volatile ECP5 firmware. The driver programs it at module load and refuses to
 bind the card if it can't (missing firmware file, upload failure).
 
 Next steps:
@@ -213,7 +213,7 @@ if [[ "$DO_VERIFY" -eq 1 ]]; then
       ls -l /usr/bin/sc0710-cli /usr/lib/sc0710/ 2>/dev/null || true
       dkms status sc0710 2>/dev/null || true
       sc0710-cli -s || sudo sc0710-cli -s
-      if source /usr/lib/sc0710/sc0710-firmware-lib.sh 2>/dev/null && sc0710_is_4k_pro; then
+      if source /usr/lib/sc0710/sc0710-firmware-lib.sh 2>/dev/null && sc0710_requires_ecp5_firmware; then
           sc0710_card_bound && msg "Card bound — ECP5 FPGA programmed" || msg "Card not bound — check dmesg (sudo dmesg | grep sc0710)"
       fi
   else

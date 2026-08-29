@@ -65,14 +65,14 @@ if [[ -f "$FIRMWARE_LIB" ]]; then
     sc0710_init_firmware_paths
     sc0710_clear_stale_kernel_registration
 
-    if sc0710_is_4k_pro; then
-        log "Elgato 4K Pro detected — ensuring ECP5 firmware is programmed."
+    if sc0710_requires_ecp5_firmware; then
+        log "ECP5-based Elgato card detected; ensuring runtime firmware is programmed."
         if ! sc0710_ensure_ecp5_programmed 5; then
             log "ERROR: ECP5 programming failed. See dmesg and $LOG_FILE"
             dmesg 2>/dev/null | grep -E "sc0710.*ECP5" | tail -20 >> "$LOG_FILE" || true
             exit 1
         fi
-        log "=== SC0710 boot-time build completed (4K Pro ECP5 OK) ==="
+        log "=== SC0710 boot-time build completed (ECP5 OK) ==="
         exit 0
     fi
 
