@@ -82,6 +82,7 @@ extern unsigned int dma_resync_tear_streak_required;
 extern unsigned int dma_resync_max_tear_retries;
 extern unsigned int refresh_rate_resync_passes;
 extern unsigned int refresh_rate_resync_delay_ms;
+extern unsigned int hdmi_rate_decode;
 extern unsigned int dma_short_desc_detect;
 
 /* Laps a writeback word must match the configured descriptor length before

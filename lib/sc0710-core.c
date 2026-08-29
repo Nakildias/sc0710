@@ -207,6 +207,12 @@ module_param(refresh_rate_resync_delay_ms, int, 0644);
 MODULE_PARM_DESC(refresh_rate_resync_delay_ms,
 	"Delay between refresh-rate resync passes in milliseconds");
 
+unsigned int hdmi_rate_decode = 1;
+module_param(hdmi_rate_decode, int, 0644);
+MODULE_PARM_DESC(hdmi_rate_decode,
+	"HDMI refresh-rate byte meaning: 1=byte is the refresh rate (default, correct), "
+	"0=legacy (3600/byte + 120Hz special case), 2=byte is a period (3600/byte)");
+
 unsigned int dma_short_desc_detect = 0;
 module_param(dma_short_desc_detect, int, 0644);
 MODULE_PARM_DESC(dma_short_desc_detect,

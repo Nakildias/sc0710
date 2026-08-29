@@ -105,24 +105,46 @@ else
 fi
 
 # --- Persistence Function ---
+#
+# Parameters carried across a --restart. A parameter missing from this list
+# silently reverts to its compiled-in default on every reload, which is very
+# hard to spot: the module reloads cleanly and just behaves as if nothing was
+# set. Add new persistable module parameters here.
+SC0710_PERSIST_PARAMS=(
+    sc0710_debug_mode
+    use_status_images
+    procedural_timings
+    keep_audio_alive
+    hdmi_rate_decode
+    dma_short_desc_detect
+)
+
 save_config() {
-    local dbg=0
-    if [[ -f /sys/module/sc0710/parameters/sc0710_debug_mode ]]; then
-        dbg=$(cat /sys/module/sc0710/parameters/sc0710_debug_mode 2>/dev/null || echo 0)
-    elif [[ -f /sys/module/sc0710/parameters/debug ]]; then
-        dbg=$(cat /sys/module/sc0710/parameters/debug 2>/dev/null || echo 0)
+    local pdir=/sys/module/sc0710/parameters
+    local opts="" name value
+
+    for name in "${SC0710_PERSIST_PARAMS[@]}"; do
+        if [[ -r "$pdir/$name" ]]; then
+            value=$(cat "$pdir/$name" 2>/dev/null) || continue
+        elif [[ "$name" == "sc0710_debug_mode" && -r "$pdir/debug" ]]; then
+            # Older builds named the debug parameter differently.
+            value=$(cat "$pdir/debug" 2>/dev/null) || continue
+        else
+            # Not present in this build; persisting it would make the
+            # module fail to load.
+            continue
+        fi
+        opts="$opts $name=$value"
+    done
+
+    if [[ -z "$opts" ]]; then
+        echo -e "${YELLOW}[PERSIST]${NC} Module not loaded — nothing to save."
+        return 0
     fi
-    local img=$(cat /sys/module/sc0710/parameters/use_status_images 2>/dev/null || echo 1)
-    local pt=0
-    if [[ -f /sys/module/sc0710/parameters/procedural_timings ]]; then
-        pt=$(cat /sys/module/sc0710/parameters/procedural_timings 2>/dev/null || echo 0)
-    fi
-    local kaa=0
-    if [[ -f /sys/module/sc0710/parameters/keep_audio_alive ]]; then
-        kaa=$(cat /sys/module/sc0710/parameters/keep_audio_alive 2>/dev/null || echo 0)
-    fi
-    echo "options sc0710 sc0710_debug_mode=$dbg use_status_images=$img procedural_timings=$pt keep_audio_alive=$kaa" > /etc/modprobe.d/sc0710-params.conf
+
+    echo "options sc0710$opts" > /etc/modprobe.d/sc0710-params.conf
     echo -e "${BLUE}[PERSIST]${NC} Settings saved to /etc/modprobe.d/sc0710-params.conf"
+    echo -e "  ${BOLD}options sc0710$opts${NC}"
 }
 
 sc0710_is_4k_pro_card() {
@@ -610,9 +632,32 @@ sc0710_state_field() {
 
 # Produce the verdict block. Written to stdout so it can go both to the
 # top of the dump file and to the terminal.
+# Warn when the loaded module predates this CLI. A stale module is easy to
+# miss: everything loads cleanly, the parameter you passed is logged as
+# "unknown parameter ... ignored" in dmesg and nowhere else, and the output
+# looks normal while silently reflecting the old defaults.
+sc0710_check_module_freshness() {
+    local pdir=/sys/module/sc0710/parameters
+    local name missing=""
+
+    [[ -d "$pdir" ]] || return 0
+    for name in "${SC0710_PERSIST_PARAMS[@]}"; do
+        [[ -e "$pdir/$name" ]] || missing="$missing $name"
+    done
+    [[ -z "$missing" ]] && return 0
+
+    echo "NOTE:          the loaded module is older than this CLI."
+    echo "               Missing parameter(s):$missing"
+    echo "               Rebuild and reload from this source tree, or those"
+    echo "               settings will be silently ignored at load time."
+    echo ""
+}
+
 sc0710_pcie_verdict() {
     local bdfs bdf req util fmt shorts warn=0 crit=0
     local -a notes=()
+
+    sc0710_check_module_freshness
 
     mapfile -t bdfs < <(sc0710_find_bdfs)
     if [[ ${#bdfs[@]} -eq 0 ]]; then
@@ -1424,6 +1469,7 @@ show_help() {
     echo -e "    ${BOLD}-r, -R, --remove${NC} Completely uninstall driver and CLI (AUR: uses yay/paru)"
     echo -e "    ${BOLD}--dump${NC}           Save a debug report to the Desktop"
     echo -e "    ${BOLD}--verdict${NC}        Analyse the PCIe link and diagnose image corruption"
+    echo -e "    ${BOLD}--rate-decode N${NC}  Reload with refresh-rate decoding N (0=legacy, 1=rate, 2=period)"
     if [[ "$IS_ATOMIC" == "true" ]]; then
         echo -e "    ${BOLD}--rebuild${NC}        Force rebuild the module for current kernel"
     fi
@@ -2027,6 +2073,41 @@ case "$1" in
     --verdict)
         # Same analysis the dump leads with, straight to the terminal, so
         # "is my slot the problem?" is answerable without a file.
+        sc0710_pcie_verdict
+        ;;
+    --rate-decode)
+        # Reload with a specific refresh-rate decoding and show the result.
+        # The parameter only takes effect at load time (the rate is derived
+        # behind the timing-change path), so this always reloads.
+        case "$2" in
+            0|1|2) ;;
+            *)
+                echo -e "${RED}error:${NC} --rate-decode needs 0, 1 or 2"
+                echo "  0 = legacy (3600/byte, with the 120Hz special case)"
+                echo "  1 = the byte is the refresh rate"
+                echo "  2 = the byte is a period (3600/byte)"
+                exit 1
+                ;;
+        esac
+        if [[ ! -e /sys/module/sc0710/parameters/hdmi_rate_decode ]] && \
+           lsmod | grep -q "^${DRV_NAME}[[:space:]]"; then
+            echo -e "${YELLOW}[WARNING]${NC} The loaded module has no hdmi_rate_decode parameter."
+            echo -e "  It predates this CLI; rebuild and reinstall from this source tree first."
+            exit 1
+        fi
+        "$0" --unload
+        echo -e "${BLUE}::${NC} Loading with hdmi_rate_decode=$2..."
+        if ! modprobe "$DRV_NAME" "hdmi_rate_decode=$2"; then
+            echo -e "${RED}[ERROR]${NC} Load failed."
+            exit 1
+        fi
+        # An unknown parameter is only ever reported to the kernel log.
+        if dmesg 2>/dev/null | tail -40 | grep -q "unknown parameter"; then
+            echo -e "${YELLOW}[WARNING]${NC} The kernel ignored a parameter:"
+            dmesg | grep "unknown parameter" | tail -3 | sed 's/^/  /'
+        fi
+        sleep 1
+        echo ""
         sc0710_pcie_verdict
         ;;
     -v|--version)
