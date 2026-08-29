@@ -552,12 +552,47 @@ void sc0710_video_free_status_frames(void)
 	mutex_unlock(&status_frames_lock);
 }
 
+/* The shared status artwork is generated as 1920x1080 YUYV. Cam Link Pro
+ * userspace buffers are 3840x2160 NV12, so copy each Y sample into a 2x2
+ * block and supply neutral chroma. */
+static void sc0710_clp_fill_status_nv12(u8 *dst, unsigned long buf_size,
+	const u8 *img)
+{
+	u32 y, x;
+
+	if (buf_size < SC0710_CLP_SIZEIMAGE)
+		return;
+
+	if (!img || !use_status_images) {
+		memset(dst, 0x10, SC0710_CLP_WIDTH * SC0710_CLP_HEIGHT);
+	} else {
+		for (y = 0; y < STATUS_IMAGE_HEIGHT; y++) {
+			const u8 *src = img +
+				(size_t)y * STATUS_IMAGE_WIDTH * 2;
+			u8 *row0 = dst + (size_t)(2 * y) * SC0710_CLP_WIDTH;
+			u8 *row1 = row0 + SC0710_CLP_WIDTH;
+
+			for (x = 0; x < STATUS_IMAGE_WIDTH; x++) {
+				u8 luma = src[2 * x];
+
+				row0[2 * x] = luma;
+				row0[2 * x + 1] = luma;
+				row1[2 * x] = luma;
+				row1[2 * x + 1] = luma;
+			}
+		}
+	}
+
+	memset(dst + SC0710_CLP_WIDTH * SC0710_CLP_HEIGHT, 0x80,
+		SC0710_CLP_WIDTH * SC0710_CLP_HEIGHT / 2);
+}
+
 /* Compute the output dimensions and frame size for a detected format. */
 static void sc0710_get_effective_size(struct sc0710_dev *dev,
 	const struct sc0710_format *fmt, u32 *width, u32 *height, u32 *framesize)
 {
-	/* Cam Link Pro: the card's output is a fixed NV12 1080p stream no
-	 * matter what timing the MCU detects; the detected format only
+	/* Cam Link Pro: the card's chunk stream assembles to fixed anamorphic
+	 * 1920x2160 NV12 and is delivered as 3840x2160; the detected format only
 	 * drives the FPGA input programming. Everything that negotiates
 	 * with userspace (g/try/s_fmt, enum ioctls, queue sizing, the
 	 * client's stream-lifetime lock) funnels through here. */
@@ -1161,7 +1196,7 @@ static int vidioc_try_fmt_vid_cap(struct file *file, void *priv, struct v4l2_for
 	sc0710_fill_colorimetry(dev, pf, &f->fmt.pix);
 
 	if (dev->board == SC0710_BOARD_ELGATO_CAMLINK_PRO) {
-		/* Whatever was asked for, the answer is NV12 1080p. */
+		/* Whatever was asked for, the answer is NV12 3840x2160. */
 		f->fmt.pix.pixelformat = V4L2_PIX_FMT_NV12;
 		f->fmt.pix.field = V4L2_FIELD_NONE;
 		f->fmt.pix.bytesperline = eff_w;
@@ -2127,25 +2162,16 @@ static void sc0710_vid_timeout(struct timer_list *t)
 				u32 fill_w = eff_w, fill_h = eff_h, fill_fs = eff_fs;
 
 				if (dev->board == SC0710_BOARD_ELGATO_CAMLINK_PRO) {
-					/* NV12 status frame: luma taken from
-					 * the 1920x1080 YUYV status image
-					 * (even bytes), chroma neutral. */
-					u32 npix = min_t(u32, fill_w * fill_h,
-						(u32)(buf_sz * 2 / 3));
+					/* Scale the shared 1080p artwork to the
+					 * fixed 4K NV12 delivery geometry. */
 					const u8 *img = dev->cable_connected ?
 						nosignal_frame_buffer :
 						nodevice_frame_buffer;
-					u32 i2;
 
-					if (img && use_status_images) {
-						for (i2 = 0; i2 < npix; i2++)
-							dst[i2] = img[i2 * 2];
-					} else {
-						memset(dst, 0x10, npix);
-					}
-					memset(dst + npix, 0x80, npix / 2);
-					vb2_set_plane_payload(&buf->vb.vb2_buf,
-						0, npix * 3 / 2);
+					sc0710_clp_fill_status_nv12(dst, buf_sz, img);
+					vb2_set_plane_payload(&buf->vb.vb2_buf, 0,
+						buf_sz >= SC0710_CLP_SIZEIMAGE ?
+						SC0710_CLP_SIZEIMAGE : 0);
 				} else if (dev->pixfmt->rgb) {
 					/* The pattern renderer and the dims
 					 * fallbacks below are YUYV-only;

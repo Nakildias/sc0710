@@ -302,25 +302,61 @@ module_param(clp_dma_override, uint, 0644);
 MODULE_PARM_DESC(clp_dma_override,
 	"Cam Link Pro bring-up: video DMA transfer size override in bytes (0=mapped default)");
 
-/* Unpack the Cam Link Pro's row-triplet stream into a packed NV12 frame.
+/* Expand one 1920-pixel luma line to 3840 pixels. Source samples land on
+ * even output pixels; odd pixels are the midpoint to the next sample. */
+static void sc0710_clp_upscale_y_line(const u8 *src, u8 *dst)
+{
+	u32 x;
+
+	for (x = 0; x + 1 < SC0710_CLP_SRC_WIDTH; x++) {
+		dst[2 * x] = src[x];
+		dst[2 * x + 1] = (src[x] + src[x + 1] + 1) >> 1;
+	}
+	dst[SC0710_CLP_WIDTH - 2] = src[SC0710_CLP_SRC_WIDTH - 1];
+	dst[SC0710_CLP_WIDTH - 1] = src[SC0710_CLP_SRC_WIDTH - 1];
+}
+
+/* Expand one NV12 chroma line without mixing the interleaved U and V
+ * components. Each source UV pair becomes two output UV pairs. */
+static void sc0710_clp_upscale_uv_line(const u8 *src, u8 *dst)
+{
+	u32 x;
+
+	for (x = 0; x + 2 < SC0710_CLP_SRC_WIDTH; x += 2) {
+		dst[2 * x] = src[x];
+		dst[2 * x + 1] = src[x + 1];
+		dst[2 * x + 2] = (src[x] + src[x + 2] + 1) >> 1;
+		dst[2 * x + 3] = (src[x + 1] + src[x + 3] + 1) >> 1;
+	}
+	dst[SC0710_CLP_WIDTH - 4] = src[SC0710_CLP_SRC_WIDTH - 2];
+	dst[SC0710_CLP_WIDTH - 3] = src[SC0710_CLP_SRC_WIDTH - 1];
+	dst[SC0710_CLP_WIDTH - 2] = src[SC0710_CLP_SRC_WIDTH - 2];
+	dst[SC0710_CLP_WIDTH - 1] = src[SC0710_CLP_SRC_WIDTH - 1];
+}
+
+/* Unpack the legacy Cam Link Pro row-triplet stream into packed NV12.
  * src is one SC0710_CLP_DMA_FRAMESIZE gather; dst gets the
- * SC0710_CLP_SIZEIMAGE result (Y plane then interleaved UV plane). Only
- * the 1920 active bytes of each 1936-byte chunk are kept. */
+ * current 3840x2160 delivery shape. This old bring-up fallback only has
+ * 1080 luma lines in one gather, so it doubles them vertically; normal
+ * capture uses the header framer below and keeps all native lines. */
 static void sc0710_clp_unpack_nv12(const u8 *src, u8 *dst)
 {
 	u8 *y = dst;
 	u8 *uv = dst + SC0710_CLP_WIDTH * SC0710_CLP_HEIGHT;
 	u32 t;
 
-	for (t = 0; t < SC0710_CLP_HEIGHT / 2; t++) {
+	for (t = 0; t < 540; t++) {
 		const u8 *row = src + (size_t)t * SC0710_CLP_ROW;
 
-		memcpy(y, row, SC0710_CLP_WIDTH);
-		y += SC0710_CLP_WIDTH;
-		memcpy(y, row + SC0710_CLP_CHUNK, SC0710_CLP_WIDTH);
-		y += SC0710_CLP_WIDTH;
-		memcpy(uv, row + 2 * SC0710_CLP_CHUNK, SC0710_CLP_WIDTH);
-		uv += SC0710_CLP_WIDTH;
+		sc0710_clp_upscale_y_line(row, y);
+		memcpy(y + SC0710_CLP_WIDTH, y, SC0710_CLP_WIDTH);
+		y += 2 * SC0710_CLP_WIDTH;
+		sc0710_clp_upscale_y_line(row + SC0710_CLP_CHUNK, y);
+		memcpy(y + SC0710_CLP_WIDTH, y, SC0710_CLP_WIDTH);
+		y += 2 * SC0710_CLP_WIDTH;
+		sc0710_clp_upscale_uv_line(row + 2 * SC0710_CLP_CHUNK, uv);
+		memcpy(uv + SC0710_CLP_WIDTH, uv, SC0710_CLP_WIDTH);
+		uv += 2 * SC0710_CLP_WIDTH;
 	}
 }
 
@@ -420,7 +456,7 @@ static int sc0710_clp_frame_misaligned(const u8 *buf, bool check_roles)
 	return 0;
 }
 
-/* Hand one prepared packed-NV12 1080p frame to every streaming client. */
+/* Hand one prepared packed-NV12 4K frame to every streaming client. */
 static void sc0710_clp_broadcast_frame(struct sc0710_dma_channel *ch, const u8 *frame)
 {
 	struct sc0710_client *client;
@@ -511,19 +547,18 @@ static void sc0710_clp_raw_deliver(struct sc0710_dma_channel *ch)
 	mod_timer(&ch->timeout, jiffies + VBUF_TIMEOUT);
 }
 
-/* A picture is complete (the next one's line 1 arrived): fold the
- * anamorphic 1920x2160 assembly down to true full-frame 1080p and
- * deliver. Lines that never arrived keep the previous picture's content
- * (counted, invisible at the scale losses actually happen). */
+/* A picture is complete when the next one's line 1 arrives. Keep every
+ * native source line and expand only the FPGA-halved horizontal axis.
+ * Lines that never arrived keep the previous picture's content. */
 static void sc0710_clp_deliver_picture(struct sc0710_dma_channel *ch)
 {
-	struct sc0710_dev *dev = ch->dev;
 	struct sc0710_clp_conveyor *cv = &ch->cv;
 	const u8 *ysrc = cv->frame;
-	const u8 *uvsrc = cv->frame + SC0710_CLP_WIDTH * SC0710_CLP_SRC_HEIGHT;
+	const u8 *uvsrc = cv->frame +
+		SC0710_CLP_SRC_WIDTH * SC0710_CLP_SRC_HEIGHT;
 	u8 *yd = cv->out;
 	u8 *uvd = cv->out + SC0710_CLP_WIDTH * SC0710_CLP_HEIGHT;
-	u32 i, x;
+	u32 i;
 
 	if (cv->lines_placed < SC0710_CLP_SRC_HEIGHT) {
 		cv->pictures_short++;
@@ -536,27 +571,18 @@ static void sc0710_clp_deliver_picture(struct sc0710_dma_channel *ch)
 		return;
 	}
 
-	/* 2:1 vertical fold, averaging line pairs; UV pairs average U with
-	 * U and V with V (same interleave offsets). */
-	for (i = 0; i < SC0710_CLP_HEIGHT; i++) {
-		const u8 *a = ysrc + (size_t)(2 * i) * SC0710_CLP_WIDTH;
-		const u8 *b = a + SC0710_CLP_WIDTH;
-
-		for (x = 0; x < SC0710_CLP_WIDTH; x++)
-			yd[x] = (a[x] + b[x] + 1) >> 1;
+	for (i = 0; i < SC0710_CLP_SRC_HEIGHT; i++) {
+		sc0710_clp_upscale_y_line(ysrc, yd);
+		ysrc += SC0710_CLP_SRC_WIDTH;
 		yd += SC0710_CLP_WIDTH;
 	}
-	for (i = 0; i < SC0710_CLP_HEIGHT / 2; i++) {
-		const u8 *a = uvsrc + (size_t)(2 * i) * SC0710_CLP_WIDTH;
-		const u8 *b = a + SC0710_CLP_WIDTH;
-
-		for (x = 0; x < SC0710_CLP_WIDTH; x++)
-			uvd[x] = (a[x] + b[x] + 1) >> 1;
+	for (i = 0; i < SC0710_CLP_SRC_UV_HEIGHT; i++) {
+		sc0710_clp_upscale_uv_line(uvsrc, uvd);
+		uvsrc += SC0710_CLP_SRC_WIDTH;
 		uvd += SC0710_CLP_WIDTH;
 	}
 
 	cv->pictures++;
-	(void)dev;
 	sc0710_clp_broadcast_frame(ch, cv->out);
 }
 
@@ -591,8 +617,8 @@ static void sc0710_clp_process_chunk(struct sc0710_dma_channel *ch)
 		 * duplicated/reordered header from splitting a picture. */
 		if (line == 1 && cv->lines_placed > SC0710_CLP_SRC_HEIGHT / 4)
 			sc0710_clp_deliver_picture(ch);
-		memcpy(cv->frame + (size_t)(line - 1) * SC0710_CLP_WIDTH,
-			c + SC0710_CLP_HDR, SC0710_CLP_WIDTH);
+		memcpy(cv->frame + (size_t)(line - 1) * SC0710_CLP_SRC_WIDTH,
+			c + SC0710_CLP_HDR, SC0710_CLP_SRC_WIDTH);
 		cv->lines_placed++;
 	} else {
 		/* Chroma chunks are numbered with the ODD luma line they pair
@@ -603,9 +629,9 @@ static void sc0710_clp_process_chunk(struct sc0710_dma_channel *ch)
 		    uvline > SC0710_CLP_SRC_UV_HEIGHT)
 			return;
 		memcpy(cv->frame +
-			(size_t)SC0710_CLP_WIDTH * SC0710_CLP_SRC_HEIGHT +
-			(size_t)(uvline - 1) * SC0710_CLP_WIDTH,
-			c + SC0710_CLP_HDR, SC0710_CLP_WIDTH);
+			(size_t)SC0710_CLP_SRC_WIDTH * SC0710_CLP_SRC_HEIGHT +
+			(size_t)(uvline - 1) * SC0710_CLP_SRC_WIDTH,
+			c + SC0710_CLP_HDR, SC0710_CLP_SRC_WIDTH);
 	}
 }
 

@@ -126,18 +126,21 @@ extern unsigned int keep_audio_alive;
 #define SC0710_BOARD_ELGATEO_4KP         2
 #define SC0710_BOARD_ELGATO_CAMLINK_PRO  3
 
-/* Cam Link Pro DMA payload geometry, mapped on real hardware. The FPGA
- * scales every input down to one fixed output and streams it as NV12 in
- * row triplets: [Y line 2t][Y line 2t+1][UV line t], each a 1936-byte
- * chunk (1928 bytes of pixels - 1920 active plus 8 of filter overscan -
- * then 8 zero bytes). The vendor driver's "cx = 1920, cy = 1080" start
- * line describes this, whatever the input timing says. */
-#define SC0710_CLP_WIDTH        1920
-#define SC0710_CLP_HEIGHT       1080
+/* Cam Link Pro source and delivery geometry, mapped on real hardware.
+ * Chunk headers describe an anamorphic 1920x2160 NV12 picture: the FPGA
+ * halves a 4K input horizontally but keeps all 2160 luma lines. Userspace
+ * gets a correctly proportioned 3840x2160 frame, with only the horizontal
+ * axis interpolated. */
+#define SC0710_CLP_SRC_WIDTH     1920
+#define SC0710_CLP_SRC_HEIGHT    2160  /* luma lines per picture */
+#define SC0710_CLP_SRC_UV_HEIGHT 1080  /* chroma lines per picture */
+#define SC0710_CLP_WIDTH         3840
+#define SC0710_CLP_HEIGHT        2160
 #define SC0710_CLP_CHUNK        1936
 #define SC0710_CLP_ROW          (3 * SC0710_CLP_CHUNK)
-#define SC0710_CLP_DMA_FRAMESIZE ((SC0710_CLP_HEIGHT / 2) * SC0710_CLP_ROW)
-/* What userspace gets: packed NV12. */
+/* Legacy DMA/raw-tap slab size. Picture boundaries come from chunk headers. */
+#define SC0710_CLP_DMA_FRAMESIZE (540 * SC0710_CLP_ROW)
+/* What userspace gets: packed 3840x2160 NV12. */
 #define SC0710_CLP_SIZEIMAGE    (SC0710_CLP_WIDTH * SC0710_CLP_HEIGHT * 3 / 2)
 
 enum sc0710_timing_mode {
@@ -306,11 +309,11 @@ struct sc0710_clp_conveyor
 	 * (0x4f = luma, 0x6f = chroma). Line counters run 1..2160 (luma) /
 	 * 1..1080 (chroma) and restart at every picture, so the stream is
 	 * self-describing: chunks are placed by line number into an
-	 * anamorphic 1920x2160 picture (half-width 4K), delivery is a 2:1
-	 * vertical fold to true full-frame 1080p, and losing bytes costs
-	 * exactly the lines they carried. Sync recovery is a header scan. */
+	 * anamorphic 1920x2160 picture (half-width 4K), then horizontally
+	 * interpolated to 3840x2160 for delivery. Losing bytes costs exactly
+	 * the lines they carried. Sync recovery is a header scan. */
 	u8         *frame;          /* Y plane 1920x2160 then UV 1920x1080 */
-	u8         *out;            /* folded NV12 1080p, SC0710_CLP_SIZEIMAGE */
+	u8         *out;            /* delivered NV12 3840x2160 */
 	u8          chunk[SC0710_CLP_CHUNK]; /* chunk spanning segments */
 	u32         chunk_fill;
 	bool        synced;         /* chunk grid locked to the stream */
@@ -327,11 +330,8 @@ struct sc0710_clp_conveyor
 	u64         hw_resyncs;     /* escalations to a hardware restart */
 };
 
-/* Cam Link Pro source picture geometry behind the chunk headers. */
-#define SC0710_CLP_SRC_HEIGHT    2160  /* luma lines per picture */
-#define SC0710_CLP_SRC_UV_HEIGHT 1080  /* chroma lines per picture */
 #define SC0710_CLP_HDR           8     /* header bytes per chunk */
-#define SC0710_CLP_ASM_SIZE      (SC0710_CLP_WIDTH * \
+#define SC0710_CLP_ASM_SIZE      (SC0710_CLP_SRC_WIDTH * \
 	(SC0710_CLP_SRC_HEIGHT + SC0710_CLP_SRC_UV_HEIGHT))
 
 /* Forward declaration for multi-client support */
