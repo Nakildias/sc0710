@@ -867,12 +867,66 @@ confirmed_timing_change:
 			for (i = 0; i < 0x14; i++)
 				printk(KERN_CONT "%02x ", rbuf[i]);
 			printk(KERN_CONT "\n");
+
+			/* Both readings of the rate byte, against the pixel clock
+			 * each implies from the blanking totals. The rate reading
+			 * is the correct one (see the decode below); this stays as
+			 * the check to run first if a source ever reports a rate
+			 * that does not match what it was set to.
+			 *
+			 * Bytes 0x00-0x03 and 0x10-0x13 are still undecoded; if
+			 * one holds the pixel clock then rate = clock / (H*V)
+			 * would be exact for fractional rates (59.94, 144.205)
+			 * instead of rounded to a whole number of Hz. */
+			if (new_pixelLineH && new_pixelLineV) {
+				printk(KERN_INFO "%s: HDMI rate decode: interval byte 0x0c=%u (0x%02x) flags 0x0d=0x%02x | "
+					"as-rate %u Hz -> %u.%02u MHz | as-period 3600/%u=%u Hz -> %u.%02u MHz | totals %ux%u | "
+					"undecoded 00-03 %02x%02x%02x%02x 10-13 %02x%02x%02x%02x\n",
+					dev->name, hint_interval, hint_interval, hint_flags,
+					hint_interval,
+					(new_pixelLineH * new_pixelLineV * hint_interval) / 1000000,
+					((new_pixelLineH * new_pixelLineV * hint_interval) % 1000000) / 10000,
+					hint_interval,
+					hint_interval ? 3600 / hint_interval : 0,
+					hint_interval ? (new_pixelLineH * new_pixelLineV * (3600 / hint_interval)) / 1000000 : 0,
+					hint_interval ? ((new_pixelLineH * new_pixelLineV * (3600 / hint_interval)) % 1000000) / 10000 : 0,
+					new_pixelLineH, new_pixelLineV,
+					rbuf[0x00], rbuf[0x01], rbuf[0x02], rbuf[0x03],
+					rbuf[0x10], rbuf[0x11], rbuf[0x12], rbuf[0x13]);
+			}
 		}
 
+		/* The 0x0c byte holds the refresh rate directly.
+		 *
+		 * It used to be read as a period (3600 / byte), which is only
+		 * ever correct at 60Hz - the one rate where the two readings
+		 * agree, since 3600 / 60 == 60. Everywhere else it was wrong:
+		 * a 144Hz source puts 144 in the byte and was reported as 25Hz
+		 * (3600 / 144), 30Hz was reported as 120, 50Hz as 72. Confirmed
+		 * against an Elgato 4K Pro at 2560x1440p144, whose 2784x1458
+		 * blanking totals give 584.51MHz at 144Hz - the pixel clock the
+		 * source's own EDID advertises - and an implausible 101.48MHz
+		 * under the period reading.
+		 *
+		 * The old code special-cased byte 0x78 (120 decimal) back to
+		 * 120Hz, which was this same bug patched at a single value.
+		 *
+		 * hdmi_rate_decode=0 restores the old behaviour, 2 selects the
+		 * period reading alone; neither should be needed. */
 		if (hint_interval > 0 && hint_interval < 0xFF) {
-			fps_target = 3600 / hint_interval;
-			if (hint_interval == 0x78 && (hint_flags & 0x10))
-				fps_target = 120;
+			switch (hdmi_rate_decode) {
+			case 0:
+				fps_target = 3600 / hint_interval;
+				if (hint_interval == 0x78 && (hint_flags & 0x10))
+					fps_target = 120;
+				break;
+			case 2:
+				fps_target = 3600 / hint_interval;
+				break;
+			default:
+				fps_target = hint_interval;
+				break;
+			}
 		}
 
 		/* Timing selection strategy:

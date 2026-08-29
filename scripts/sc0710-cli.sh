@@ -76,15 +76,70 @@ if [[ $EUID -ne 0 ]]; then
 fi
 DUMP_USER="${SC0710_INVOKE_USER:-${SUDO_USER:-root}}"
 
+# --- SteamOS support ---
+# SteamOS is immutable like Bazzite but locks / behind `steamos-readonly`, so
+# every write to /etc, /usr/local or /lib/modules needs an unlock first. The
+# helper library also knows where the persistent source tree lives.
+IS_STEAMOS=false
+for _steamos_lib in /home/sc0710/sc0710-steamos-lib.sh \
+                    /var/lib/sc0710/sc0710-steamos-lib.sh \
+                    /usr/lib/sc0710/sc0710-steamos-lib.sh \
+                    "$(dirname "$(readlink -f "${BASH_SOURCE[0]:-$0}")")/sc0710-steamos-lib.sh"; do
+    if [[ -f "$_steamos_lib" ]]; then
+        # shellcheck source=/dev/null
+        source "$_steamos_lib"
+        sc0710_is_steamos && IS_STEAMOS=true
+        break
+    fi
+done
+
+is_steamos() {
+    [[ "$IS_STEAMOS" == "true" ]]
+}
+
+# Banner suffix: "SteamOS Edition" / "Atomic Edition" / "".
+sc0710_edition_label() {
+    if is_steamos; then
+        printf ' (SteamOS Edition)'
+    elif [[ -f /run/ostree-booted ]] || command -v rpm-ostree &>/dev/null; then
+        printf ' (Atomic Edition)'
+    fi
+}
+
+# Unlock the rootfs for the current command and re-lock it on exit. Idempotent
+# and a no-op off SteamOS, so write sites can just call it.
+STEAMOS_RW_ACTIVE=false
+steamos_rw() {
+    is_steamos || return 0
+    [[ "$STEAMOS_RW_ACTIVE" == "true" ]] && return 0
+    if ! sc0710_steamos_unlock; then
+        echo -e "${RED}[ERROR]${NC} Could not unlock the SteamOS rootfs."
+        echo -e "  Run ${BOLD}sudo steamos-readonly disable${NC} and try again."
+        return 1
+    fi
+    STEAMOS_RW_ACTIVE=true
+    trap 'sc0710_steamos_relock' EXIT
+    return 0
+}
+
 # --- Detect atomic distro ---
+# SteamOS counts as atomic here: same immutable layout (source tree rebuilt at
+# boot, module insmod'ed from it) even though the package manager differs.
 is_atomic() {
-    [[ -f /run/ostree-booted ]] || command -v rpm-ostree &>/dev/null
+    [[ -f /run/ostree-booted ]] && return 0
+    command -v rpm-ostree &>/dev/null && return 0
+    is_steamos
 }
 
 # --- Resolve version and paths ---
 if is_atomic; then
     IS_ATOMIC=true
     SRC_DIR="/var/lib/sc0710"
+    # SteamOS: /var is an A/B partition, so the compat symlink can be missing
+    # after an OS update even though the source tree in /home survived.
+    if is_steamos && [[ ! -e "$SRC_DIR" && -d "$SC0710_STEAMOS_HOME" ]]; then
+        sc0710_steamos_ensure_layout 2>/dev/null || SRC_DIR="$SC0710_STEAMOS_HOME"
+    fi
     if [[ -f "$SRC_DIR/version" ]]; then
         CURRENT_VERSION="$(cat "$SRC_DIR/version" | tr -d '[:space:]')"
     else
@@ -105,24 +160,47 @@ else
 fi
 
 # --- Persistence Function ---
+#
+# Parameters carried across a --restart. A parameter missing from this list
+# silently reverts to its compiled-in default on every reload, which is very
+# hard to spot: the module reloads cleanly and just behaves as if nothing was
+# set. Add new persistable module parameters here.
+SC0710_PERSIST_PARAMS=(
+    sc0710_debug_mode
+    use_status_images
+    procedural_timings
+    keep_audio_alive
+    hdmi_rate_decode
+    dma_short_desc_detect
+)
+
 save_config() {
-    local dbg=0
-    if [[ -f /sys/module/sc0710/parameters/sc0710_debug_mode ]]; then
-        dbg=$(cat /sys/module/sc0710/parameters/sc0710_debug_mode 2>/dev/null || echo 0)
-    elif [[ -f /sys/module/sc0710/parameters/debug ]]; then
-        dbg=$(cat /sys/module/sc0710/parameters/debug 2>/dev/null || echo 0)
+    local pdir=/sys/module/sc0710/parameters
+    local opts="" name value
+
+    for name in "${SC0710_PERSIST_PARAMS[@]}"; do
+        if [[ -r "$pdir/$name" ]]; then
+            value=$(cat "$pdir/$name" 2>/dev/null) || continue
+        elif [[ "$name" == "sc0710_debug_mode" && -r "$pdir/debug" ]]; then
+            # Older builds named the debug parameter differently.
+            value=$(cat "$pdir/debug" 2>/dev/null) || continue
+        else
+            # Not present in this build; persisting it would make the
+            # module fail to load.
+            continue
+        fi
+        opts="$opts $name=$value"
+    done
+
+    if [[ -z "$opts" ]]; then
+        echo -e "${YELLOW}[PERSIST]${NC} Module not loaded — nothing to save."
+        return 0
     fi
-    local img=$(cat /sys/module/sc0710/parameters/use_status_images 2>/dev/null || echo 1)
-    local pt=0
-    if [[ -f /sys/module/sc0710/parameters/procedural_timings ]]; then
-        pt=$(cat /sys/module/sc0710/parameters/procedural_timings 2>/dev/null || echo 0)
-    fi
-    local kaa=0
-    if [[ -f /sys/module/sc0710/parameters/keep_audio_alive ]]; then
-        kaa=$(cat /sys/module/sc0710/parameters/keep_audio_alive 2>/dev/null || echo 0)
-    fi
-    echo "options sc0710 sc0710_debug_mode=$dbg use_status_images=$img procedural_timings=$pt keep_audio_alive=$kaa" > /etc/modprobe.d/sc0710-params.conf
+
+    steamos_rw || { echo -e "${YELLOW}[WARN]${NC} Settings not persisted (rootfs is read-only)."; return 0; }
+    echo "options sc0710$opts" > /etc/modprobe.d/sc0710-params.conf
     echo -e "${BLUE}[PERSIST]${NC} Settings saved to /etc/modprobe.d/sc0710-params.conf"
+    echo -e "  ${BOLD}options sc0710$opts${NC}"
 }
 
 sc0710_is_ecp5_card() {
@@ -307,7 +385,7 @@ sc0710_detect_install_method() {
     fi
 
     if [[ "$IS_ATOMIC" == "true" && -d /var/lib/sc0710 ]]; then
-        printf 'GitHub (atomic installer)'
+        is_steamos && printf 'GitHub (SteamOS installer)' || printf 'GitHub (atomic installer)'
         return 0
     fi
 
@@ -512,6 +590,234 @@ resolve_dump_desktop() {
     mkdir -p "$DUMP_DESKTOP"
 }
 
+# --- PCIe Link & Bandwidth Analysis ---
+#
+# Most "image tears / shifts / goes green and never recovers" reports come
+# down to the card's DMA being starved on a PCIe link that has no headroom
+# left. The card is Gen2 x4 by design, so a 4K60 stream can sit at >90% of
+# usable link bandwidth; any competing traffic on a shared uplink then
+# truncates a transfer mid-frame. That is invisible in dmesg, so this
+# section works it out from the link's own capabilities instead.
+
+# Bytes/sec per lane, after 8b/10b (Gen1/2) or 128b/130b (Gen3+) encoding.
+pcie_lane_bytes() {
+    case "$1" in
+        "2.5 GT/s"*)  echo 250000000 ;;
+        "5.0 GT/s"*|"5 GT/s"*) echo 500000000 ;;
+        "8.0 GT/s"*|"8 GT/s"*) echo 984615384 ;;
+        "16.0 GT/s"*|"16 GT/s"*) echo 1969230769 ;;
+        "32.0 GT/s"*|"32 GT/s"*) echo 3938461538 ;;
+        *) echo 0 ;;
+    esac
+}
+
+# Find the card's PCI address(es) by vendor/device, not by driver binding,
+# so an unbound or failed card is still analysed.
+sc0710_find_bdfs() {
+    local d vendor device
+    for d in /sys/bus/pci/devices/*; do
+        [[ -r "$d/vendor" && -r "$d/device" ]] || continue
+        vendor=$(cat "$d/vendor" 2>/dev/null)
+        device=$(cat "$d/device" 2>/dev/null)
+        if [[ "$vendor" == "0x12ab" && ( "$device" == "0x0710" || "$device" == "0x0380" ) ]]; then
+            basename "$d"
+        fi
+    done
+}
+
+# Walk from the card up to the root complex. A card whose path passes
+# through a chipset/PCH switch shares that uplink with USB, NVMe and
+# networking; a card on CPU-direct lanes does not.
+sc0710_pcie_path() {
+    local bdf="$1" real path node
+    real=$(readlink -f "/sys/bus/pci/devices/$bdf" 2>/dev/null) || return
+    path=""
+    # The sysfs path is .../pci0000:00/0000:00:1c.4/0000:af:00.0
+    for node in $(echo "$real" | tr '/' '\n' | grep -E '^0000:[0-9a-f]{2}:'); do
+        [[ -n "$path" ]] && path="$path -> "
+        path="$path$node"
+    done
+    echo "$path"
+}
+
+# Sets: PCIE_CUR_SPEED PCIE_CUR_WIDTH PCIE_MAX_SPEED PCIE_MAX_WIDTH
+#       PCIE_MPS PCIE_USABLE PCIE_PATH PCIE_UPSTREAM_COUNT
+sc0710_pcie_probe() {
+    local bdf="$1" sysfs="/sys/bus/pci/devices/$1" lane
+    PCIE_CUR_SPEED=$(cat "$sysfs/current_link_speed" 2>/dev/null || echo "unknown")
+    PCIE_CUR_WIDTH=$(cat "$sysfs/current_link_width" 2>/dev/null || echo 0)
+    PCIE_MAX_SPEED=$(cat "$sysfs/max_link_speed" 2>/dev/null || echo "unknown")
+    PCIE_MAX_WIDTH=$(cat "$sysfs/max_link_width" 2>/dev/null || echo 0)
+    PCIE_PATH=$(sc0710_pcie_path "$bdf")
+    # The path is <root port> -> [bridges...] -> <card>. A card on
+    # CPU-direct lanes sits directly under its root port, so it has exactly
+    # one hop; anything more means a switch or the chipset is in between.
+    PCIE_UPSTREAM_COUNT=$(( $(echo "$PCIE_PATH" | grep -o '\->' | wc -l) - 1 ))
+    [[ "$PCIE_UPSTREAM_COUNT" -lt 0 ]] && PCIE_UPSTREAM_COUNT=0
+
+    # MaxPayload is what the whole path negotiated; it sets TLP efficiency.
+    PCIE_MPS=$(lspci -vvv -s "$bdf" 2>/dev/null | grep -oP 'MaxPayload \K[0-9]+' | head -1)
+    [[ -z "$PCIE_MPS" ]] && PCIE_MPS=0
+
+    lane=$(pcie_lane_bytes "$PCIE_CUR_SPEED")
+    if [[ "$lane" -gt 0 && "$PCIE_CUR_WIDTH" -gt 0 ]]; then
+        # TLP overhead: each payload carries ~24 bytes of header/CRC/sequence.
+        # At MPS 128 that is ~84% of raw; at 512, ~96%. Unknown MPS is
+        # assumed to be the 128-byte default, which is the common case.
+        local mps=${PCIE_MPS:-128}
+        [[ "$mps" -lt 128 ]] && mps=128
+        PCIE_USABLE=$(( lane * PCIE_CUR_WIDTH * mps / (mps + 24) ))
+    else
+        PCIE_USABLE=0
+    fi
+}
+
+# The required rate is computed by the driver (framesize x fps) and printed
+# in /proc/sc0710-state, so this does not have to re-derive it.
+sc0710_required_bps() {
+    grep -oP '^\s*req bytes/s:\s*\K[0-9]+' /proc/sc0710-state 2>/dev/null | head -1
+}
+
+# The capture fourcc, from the same /proc line as the required rate.
+sc0710_capture_fourcc() {
+    grep -oP '^\s*req bytes/s:.*,\s*\K[A-Za-z0-9]{4}' /proc/sc0710-state 2>/dev/null | head -1
+}
+
+sc0710_state_field() {
+    grep -oP "^\s*$1:\s*\K.*" /proc/sc0710-state 2>/dev/null | head -1
+}
+
+# Produce the verdict block. Written to stdout so it can go both to the
+# top of the dump file and to the terminal.
+# Warn when the loaded module predates this CLI. A stale module is easy to
+# miss: everything loads cleanly, the parameter you passed is logged as
+# "unknown parameter ... ignored" in dmesg and nowhere else, and the output
+# looks normal while silently reflecting the old defaults.
+sc0710_check_module_freshness() {
+    local pdir=/sys/module/sc0710/parameters
+    local name missing=""
+
+    [[ -d "$pdir" ]] || return 0
+    for name in "${SC0710_PERSIST_PARAMS[@]}"; do
+        [[ -e "$pdir/$name" ]] || missing="$missing $name"
+    done
+    [[ -z "$missing" ]] && return 0
+
+    echo "NOTE:          the loaded module is older than this CLI."
+    echo "               Missing parameter(s):$missing"
+    echo "               Rebuild and reload from this source tree, or those"
+    echo "               settings will be silently ignored at load time."
+    echo ""
+}
+
+sc0710_pcie_verdict() {
+    local bdfs bdf req util fmt shorts warn=0 crit=0
+    local -a notes=()
+
+    sc0710_check_module_freshness
+
+    mapfile -t bdfs < <(sc0710_find_bdfs)
+    if [[ ${#bdfs[@]} -eq 0 ]]; then
+        echo "PCIe:          no SC0710 capture card found (vendor 12ab, device 0710/0380)"
+        return
+    fi
+    bdf="${bdfs[0]}"
+    sc0710_pcie_probe "$bdf"
+
+    printf 'Card:          %s\n' "$bdf"
+    printf 'Topology:      %s\n' "${PCIE_PATH:-unknown}"
+    printf 'Link:          %s x%s trained' "$PCIE_CUR_SPEED" "$PCIE_CUR_WIDTH"
+    if [[ "$PCIE_CUR_WIDTH" -gt 0 && "$PCIE_MAX_WIDTH" -gt 0 && "$PCIE_CUR_WIDTH" -lt "$PCIE_MAX_WIDTH" ]]; then
+        printf '  ** DEGRADED (capable of x%s) **\n' "$PCIE_MAX_WIDTH"
+        notes+=("Link trained to x$PCIE_CUR_WIDTH but the card is capable of x$PCIE_MAX_WIDTH.
+    A degraded link starves DMA on its own and looks exactly like a driver
+    bug. Reseat the card, and remove any riser or extension cable.")
+        crit=1
+    else
+        printf ' (max x%s)\n' "$PCIE_MAX_WIDTH"
+    fi
+
+    if [[ "$PCIE_MPS" -gt 0 ]]; then
+        printf 'MaxPayload:    %s bytes\n' "$PCIE_MPS"
+    else
+        printf 'MaxPayload:    unknown (run as root for MPS)\n'
+    fi
+
+    if [[ "$PCIE_USABLE" -gt 0 ]]; then
+        printf 'Usable BW:     ~%s MB/s\n' "$(( PCIE_USABLE / 1000000 ))"
+    fi
+
+    if [[ "$PCIE_UPSTREAM_COUNT" -ge 1 ]]; then
+        printf 'Slot:          behind %s upstream bridge(s) -- SHARED UPLINK\n' "$PCIE_UPSTREAM_COUNT"
+        notes+=("The card is not on CPU-direct lanes: its traffic shares an uplink with
+    whatever else hangs off that bridge (USB, NVMe, networking). At high
+    link utilisation that is enough to truncate a transfer mid-frame.
+    Moving the card to the primary CPU-direct x16 slot is the known fix.")
+        warn=1
+    else
+        printf 'Slot:          CPU-direct (no intermediate bridge)\n'
+    fi
+
+    fmt=$(sc0710_state_field "HDMI")
+    [[ -n "$fmt" ]] && printf 'Signal:        %s\n' "$fmt"
+
+    req=$(sc0710_required_bps)
+    if [[ -n "$req" && "$req" -gt 0 && "$PCIE_USABLE" -gt 0 ]]; then
+        util=$(( req * 100 / PCIE_USABLE ))
+        printf 'Stream needs:  %s MB/s  =  %s%% of usable link bandwidth\n' \
+            "$(( req / 1000000 ))" "$util"
+        if [[ "$util" -ge 85 ]]; then
+            if [[ "$(sc0710_capture_fourcc)" == "YUYV" ]]; then
+                # Already on the cheapest format, so the only remaining
+                # levers are the link itself and the source resolution.
+                notes+=("At ${util}% sustained utilisation there is no headroom left, and the
+    capture is already YUYV (4:2:2) -- there is no cheaper format to fall
+    back to. The link itself has to change: a CPU-direct slot, a wider or
+    faster link, or a lower source resolution or refresh rate.")
+            else
+                notes+=("At ${util}% sustained utilisation there is no headroom left. Corruption
+    here is expected, not a driver fault. The capture is using a packed RGB
+    format; switching it to YUYV (4:2:2) costs a third of the bandwidth for
+    the same picture, and is the cheapest thing to try first.")
+            fi
+            crit=1
+        elif [[ "$util" -ge 65 ]]; then
+            notes+=("${util}% sustained utilisation is high enough that competing PCIe
+    traffic can starve the card intermittently.")
+            warn=1
+        fi
+    elif [[ -z "$req" ]]; then
+        printf 'Stream needs:  unknown (no signal locked, or module not loaded)\n'
+    fi
+
+    shorts=$(grep -oP '^\s*short descr:\s*\K[0-9]+' /proc/sc0710-state 2>/dev/null | head -1)
+    if [[ -n "$shorts" ]]; then
+        printf 'Short descrs:  %s\n' "$shorts"
+        if [[ "$shorts" -gt 0 ]]; then
+            notes+=("The DMA engine completed $shorts descriptor(s) short of their configured
+    length. Each one permanently shifts the frame anchor, which is the
+    'picture moved and never came back' symptom. This confirms starvation
+    rather than a signal or EDID problem.")
+            crit=1
+        fi
+    fi
+
+    echo ""
+    if [[ "$crit" -eq 1 ]]; then
+        echo "VERDICT:       PCIe bandwidth starvation is the likely cause."
+    elif [[ "$warn" -eq 1 ]]; then
+        echo "VERDICT:       Marginal. Starvation is plausible under load."
+    else
+        echo "VERDICT:       PCIe link and bandwidth look healthy."
+        echo "               If the picture still corrupts, it is not starvation --"
+        echo "               capture the dump while it is happening and open an issue."
+    fi
+    if [[ ${#notes[@]} -gt 0 ]]; then
+        echo ""
+        printf '  - %s\n\n' "${notes[@]}"
+    fi
+}
+
 dump_section() {
     printf '\n=== %s ===\n' "$1" >> "$DUMP_FILE"
 }
@@ -561,6 +867,12 @@ write_debug_dump() {
         printf 'Collected by: %s\n' "$DUMP_USER"
     } > "$DUMP_FILE"
 
+    # The verdict goes first: it is the part a reader (or a maintainer
+    # triaging an issue) should see without scrolling through six hundred
+    # lines of lspci output.
+    dump_section "Verdict"
+    sc0710_pcie_verdict >> "$DUMP_FILE" 2>&1
+
     dump_section "System"
     {
         if [[ -f /etc/os-release ]]; then
@@ -573,11 +885,16 @@ write_debug_dump() {
             printf 'Linux Distro: unknown\n'
         fi
         printf 'Kernel Version: %s\n' "$(uname -r)"
-        printf 'System Type: %s\n' "$([[ "$IS_ATOMIC" == "true" ]] && echo Atomic || echo Standard)"
+        printf 'System Type: %s\n' "$(is_steamos && echo SteamOS || { [[ "$IS_ATOMIC" == "true" ]] && echo Atomic || echo Standard; })"
         printf 'Architecture: %s\n' "$(uname -m)"
         printf 'Hostname: %s\n' "$(get_hostname)"
         printf 'Uptime: %s\n' "$(uptime -p 2>/dev/null || uptime 2>/dev/null || echo unknown)"
-        if [[ "$IS_ATOMIC" == "true" ]]; then
+        if is_steamos; then
+            printf 'SteamOS Rootfs: %s\n' "$(sc0710_steamos_rootfs_locked && echo 'read-only' || echo writable)"
+            printf 'Persistent Source: %s\n' "$SC0710_STEAMOS_HOME"
+            printf 'Kernel Headers Package: %s\n' "$(sc0710_steamos_headers_pkg)"
+            printf 'Kernel Headers Present: %s\n' "$(sc0710_steamos_have_headers && echo yes || echo no)"
+        elif [[ "$IS_ATOMIC" == "true" ]]; then
             printf 'Ostree Booted: %s\n' "$([[ -f /run/ostree-booted ]] && echo yes || echo no)"
             command -v rpm-ostree &>/dev/null && printf 'rpm-ostree: available\n' || printf 'rpm-ostree: not found\n'
         fi
@@ -610,7 +927,13 @@ write_debug_dump() {
 
     dump_section "Install State"
     if [[ "$IS_ATOMIC" == "true" ]]; then
-        dump_cmd "rpm-ostree status" bash -c "rpm-ostree status 2>/dev/null || echo '(rpm-ostree unavailable)'"
+        if is_steamos; then
+            dump_cmd "SteamOS release" bash -c "cat /etc/os-release 2>/dev/null || echo '(no os-release)'"
+            dump_cmd "Rootfs state" bash -c "btrfs property get -ts / ro 2>/dev/null || echo '(not btrfs)'"
+            dump_cmd "Neptune headers" bash -c "pacman -Q \$(uname -r | sed -n 's/.*neptune-\\([0-9]*\\).*/linux-neptune-\\1-headers/p') 2>/dev/null || echo '(headers package not installed)'"
+        else
+            dump_cmd "rpm-ostree status" bash -c "rpm-ostree status 2>/dev/null || echo '(rpm-ostree unavailable)'"
+        fi
         dump_cmd "Atomic build service" systemctl status sc0710-build.service --no-pager
         dump_cmd "sc0710-build.service journal (last 50 lines)" bash -c "journalctl -u sc0710-build.service -n 50 --no-pager 2>/dev/null || echo '(no journal entries)'"
         dump_file_if_exists "$SRC_DIR/.built-for-kernel"
@@ -634,9 +957,27 @@ write_debug_dump() {
     done
 
     dump_section "PCI Devices"
-    dump_cmd "lspci (SC0710 / Magewell / Elgato related)" bash -c "lspci -nn 2>/dev/null | grep -iE '12ab:0710|1cfa:|magewell|sc0710' || echo '(no matching PCI devices)'"
+    dump_cmd "lspci (SC0710 / Magewell / Elgato related)" bash -c "lspci -nn 2>/dev/null | grep -iE '12ab:0710|12ab:0380|1cfa:|magewell|sc0710' || echo '(no matching PCI devices)'"
     dump_cmd "lspci -nn (full)" lspci -nn
-    dump_cmd "lspci -nnv (SC0710 device)" bash -c "lspci -nnv -d 12ab:0710 2>/dev/null || echo '(device 12ab:0710 not found)'"
+    dump_cmd "lspci -nnv (SC0710 device)" bash -c "lspci -nnv -d 12ab:0710 2>/dev/null; lspci -nnv -d 12ab:0380 2>/dev/null"
+
+    # Link state for the card and for every bridge between it and the root
+    # complex: a link that trained below its capability anywhere on that
+    # path starves DMA the same way a shared uplink does.
+    printf '\n--- PCIe link state (card and upstream path) ---\n' >> "$DUMP_FILE"
+    {
+        for bdf in $(sc0710_find_bdfs); do
+            for node in $(sc0710_pcie_path "$bdf" | sed 's/->/ /g'); do
+                printf '%s: %s x%s (max %s x%s) %s\n' "$node" \
+                    "$(cat "/sys/bus/pci/devices/$node/current_link_speed" 2>/dev/null || echo '?')" \
+                    "$(cat "/sys/bus/pci/devices/$node/current_link_width" 2>/dev/null || echo '?')" \
+                    "$(cat "/sys/bus/pci/devices/$node/max_link_speed" 2>/dev/null || echo '?')" \
+                    "$(cat "/sys/bus/pci/devices/$node/max_link_width" 2>/dev/null || echo '?')" \
+                    "$(lspci -s "$node" 2>/dev/null | cut -d' ' -f2- | cut -c1-60)"
+            done
+        done
+    } >> "$DUMP_FILE" 2>&1
+    dump_cmd "PCIe AER / error counters" bash -c "lspci -vvv -d 12ab: 2>/dev/null | grep -iE 'UESta|CESta|LnkSta|DevSta|MaxPayload' || echo '(needs root)'"
 
     dump_section "Video Devices"
     dump_cmd "Video device nodes" bash -c "ls -la /dev/video* 2>/dev/null || echo '(no /dev/video* nodes)'"
@@ -1171,7 +1512,7 @@ EOF
 # --- Help Function ---
 show_help() {
     if [[ "$IS_ATOMIC" == "true" ]]; then
-        echo -e "${BOLD}SC0710${NC} Driver Control Utility v${CURRENT_VERSION} (Atomic Edition)"
+        echo -e "${BOLD}SC0710${NC} Driver Control Utility v${CURRENT_VERSION}$(sc0710_edition_label)"
     else
         echo -e "${BOLD}SC0710${NC} Driver Control Utility v${CURRENT_VERSION}"
     fi
@@ -1197,18 +1538,29 @@ show_help() {
     echo -e "    ${BOLD}-U, --update${NC}     Check for updates and reinstall"
     echo -e "    ${BOLD}-r, -R, --remove${NC} Completely uninstall driver and CLI (AUR: uses yay/paru)"
     echo -e "    ${BOLD}--dump${NC}           Save a debug report to the Desktop"
+    echo -e "    ${BOLD}--verdict${NC}        Analyse the PCIe link and diagnose image corruption"
+    echo -e "    ${BOLD}--rate-decode N${NC}  Reload with refresh-rate decoding N (0=legacy, 1=rate, 2=period)"
     if [[ "$IS_ATOMIC" == "true" ]]; then
         echo -e "    ${BOLD}--rebuild${NC}        Force rebuild the module for current kernel"
     fi
     echo -e "    ${BOLD}-v, --version${NC}    Show version information"
     echo -e "    ${BOLD}-h, --help${NC}       Show this help message"
+    if is_steamos; then
+        echo ""
+        echo -e "  ${BOLD}SteamOS notes${NC}"
+        echo -e "    The driver source lives in ${BOLD}${SC0710_STEAMOS_HOME}${NC} — /home is the only"
+        echo -e "    partition a SteamOS update leaves alone. ${BOLD}sc0710-build.service${NC} rebuilds"
+        echo -e "    the module and reinstalls the kernel headers on the first boot after one."
+        echo -e "    These commands unlock the read-only rootfs and re-lock it when they finish."
+        echo -e "    If an update removes the boot service: ${BOLD}sudo bash ${SC0710_STEAMOS_HOME}/steamos-restore.sh${NC}"
+    fi
     echo ""
 }
 
 # --- No Arguments Handler ---
 if [[ $# -eq 0 ]]; then
     if [[ "$IS_ATOMIC" == "true" ]]; then
-        echo -e "${BOLD}SC0710${NC} Driver Control Utility (Atomic Edition)"
+        echo -e "${BOLD}SC0710${NC} Driver Control Utility$(sc0710_edition_label)"
     else
         echo -e "${BOLD}SC0710${NC} Driver Control Utility"
     fi
@@ -1217,6 +1569,16 @@ if [[ $# -eq 0 ]]; then
 fi
 
 # --- Command Handler ---
+# SteamOS: these commands write to /etc, /usr/local or /lib/modules, all on the
+# read-only rootfs. Unlock once here; the trap in steamos_rw re-locks on exit.
+case "$1" in
+    -l|--load|-u|--unload|--restart|-d|--debug|-ht|--hdr-toggle|-it|--image-toggle| \
+    -kaa|--keep-audio-alive|-pt|--procedural-timings|-U|--update|--rebuild|-r|-R|--remove| \
+    --rate-decode)
+        steamos_rw || exit 1
+        ;;
+esac
+
 case "$1" in
     -l|--load)
         if lsmod | grep -q "$DRV_NAME"; then
@@ -1385,7 +1747,8 @@ case "$1" in
         echo ""
         if [[ "$IS_ATOMIC" == "true" ]]; then
             echo -e "${BLUE}::${NC} ${BOLD}System Type${NC}"
-            echo -e "   Atomic/Immutable (boot-time build)"
+            is_steamos && echo -e "   SteamOS (boot-time build, source in ${SC0710_STEAMOS_HOME})" \
+                       || echo -e "   Atomic/Immutable (boot-time build)"
             if [[ -f "$SRC_DIR/.built-for-kernel" ]]; then
                 echo -e "   Last built for: ${BOLD}$(cat "$SRC_DIR/.built-for-kernel")${NC}"
             fi
@@ -1679,6 +2042,13 @@ case "$1" in
             rm -f "$TEMP_TAR"
             [[ -f "$SRC_DIR/scripts/build-and-load.sh" ]] && cp "$SRC_DIR/scripts/build-and-load.sh" "$SRC_DIR/build-and-load.sh" && chmod +x "$SRC_DIR/build-and-load.sh"
             [[ -f "$SRC_DIR/scripts/sc0710-firmware-lib.sh" ]] && cp "$SRC_DIR/scripts/sc0710-firmware-lib.sh" "$SRC_DIR/sc0710-firmware-lib.sh" && chmod +x "$SRC_DIR/sc0710-firmware-lib.sh"
+            # The boot service sources this out of the tree root, so it has to
+            # be refreshed alongside the others.
+            [[ -f "$SRC_DIR/scripts/sc0710-steamos-lib.sh" ]] && cp "$SRC_DIR/scripts/sc0710-steamos-lib.sh" "$SRC_DIR/sc0710-steamos-lib.sh" && chmod +x "$SRC_DIR/sc0710-steamos-lib.sh"
+            if is_steamos; then
+                sc0710_steamos_install_tools "$SRC_DIR" || \
+                    echo -e "${YELLOW}[WARNING]${NC} Could not refresh the sc0710 tools in /usr/local/bin."
+            fi
             NEW_VER="$CURRENT_VERSION"
             [[ -f "$SRC_DIR/version" ]] && NEW_VER=$(cat "$SRC_DIR/version" | tr -d '[:space:]')
             lsmod | grep -q "$DRV_NAME" && "$0" --unload
@@ -1753,7 +2123,7 @@ case "$1" in
         ;;
     --rebuild)
         if [[ "$IS_ATOMIC" != "true" ]]; then
-            echo -e "${RED}[ERROR]${NC} --rebuild is only supported on Atomic distros. Use --update instead."
+            echo -e "${RED}[ERROR]${NC} --rebuild is only supported on Atomic/SteamOS installs. Use --update instead."
             exit 1
         fi
         echo -e "${BLUE}::${NC} Forcing module rebuild..."
@@ -1777,8 +2147,16 @@ case "$1" in
             rm -f /etc/systemd/system/sc0710-build.service
             systemctl daemon-reload
             sc0710_cli_clear_stale_registration
-            rm -rf "$SRC_DIR"
-            echo -e "  ${YELLOW}NOTE:${NC} Layered build packages were left unchanged (no rpm-ostree changes, no reboot needed)."
+            if is_steamos; then
+                # $SRC_DIR is a symlink into /home; removing it alone would
+                # leave the whole driver tree (and the source) behind.
+                rm -rf "${SC0710_STEAMOS_HOME:?}"
+                rm -f /var/lib/sc0710
+                echo -e "  ${YELLOW}NOTE:${NC} Packages installed with pacman (kernel headers, base-devel) were left in place."
+            else
+                rm -rf "$SRC_DIR"
+                echo -e "  ${YELLOW}NOTE:${NC} Layered build packages were left unchanged (no rpm-ostree changes, no reboot needed)."
+            fi
         else
             sc0710_dkms_run_cleanup
         fi
@@ -1807,8 +2185,48 @@ case "$1" in
     --dump)
         write_debug_dump
         ;;
+    --verdict)
+        # Same analysis the dump leads with, straight to the terminal, so
+        # "is my slot the problem?" is answerable without a file.
+        sc0710_pcie_verdict
+        ;;
+    --rate-decode)
+        # Reload with a specific refresh-rate decoding and show the result.
+        # The parameter only takes effect at load time (the rate is derived
+        # behind the timing-change path), so this always reloads.
+        case "$2" in
+            0|1|2) ;;
+            *)
+                echo -e "${RED}error:${NC} --rate-decode needs 0, 1 or 2"
+                echo "  0 = legacy (3600/byte, with the 120Hz special case)"
+                echo "  1 = the byte is the refresh rate"
+                echo "  2 = the byte is a period (3600/byte)"
+                exit 1
+                ;;
+        esac
+        if [[ ! -e /sys/module/sc0710/parameters/hdmi_rate_decode ]] && \
+           lsmod | grep -q "^${DRV_NAME}[[:space:]]"; then
+            echo -e "${YELLOW}[WARNING]${NC} The loaded module has no hdmi_rate_decode parameter."
+            echo -e "  It predates this CLI; rebuild and reinstall from this source tree first."
+            exit 1
+        fi
+        "$0" --unload
+        echo -e "${BLUE}::${NC} Loading with hdmi_rate_decode=$2..."
+        if ! modprobe "$DRV_NAME" "hdmi_rate_decode=$2"; then
+            echo -e "${RED}[ERROR]${NC} Load failed."
+            exit 1
+        fi
+        # An unknown parameter is only ever reported to the kernel log.
+        if dmesg 2>/dev/null | tail -40 | grep -q "unknown parameter"; then
+            echo -e "${YELLOW}[WARNING]${NC} The kernel ignored a parameter:"
+            dmesg | grep "unknown parameter" | tail -3 | sed 's/^/  /'
+        fi
+        sleep 1
+        echo ""
+        sc0710_pcie_verdict
+        ;;
     -v|--version)
-        [[ "$IS_ATOMIC" == "true" ]] && echo -e "${BOLD}SC0710${NC} Driver Control Utility (Atomic Edition)" || echo -e "${BOLD}SC0710${NC} Driver Control Utility"
+        echo -e "${BOLD}SC0710${NC} Driver Control Utility$(sc0710_edition_label)"
         echo -e "Version: ${BOLD}${CURRENT_VERSION}${NC}"
         check_version
         ;;

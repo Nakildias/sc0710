@@ -6,6 +6,8 @@
 #
 # Auto-detects distro type and runs the appropriate installation flow.
 # - Atomic (Bazzite, Silverblue, Bluefin, etc.): rpm-ostree, /var/lib/sc0710, boot-time build
+# - SteamOS: pacman + Neptune headers, /home/sc0710, boot-time build (see
+#   scripts/sc0710-steamos-lib.sh for why the source cannot live in /var)
 # - Non-atomic (Arch, Fedora, Debian, etc.): apt/pacman/dnf, DKMS or manual build
 #
 # Usage: sudo bash install-sc0710.sh [--force] [--noconfirm]
@@ -74,6 +76,67 @@ if ! declare -F sc0710_dkms_cleanup >/dev/null; then
         depmod -a >/dev/null 2>&1 || true
     }
 fi
+
+# --- SteamOS support ---
+# Detection has to work before anything is staged on disk (this script is
+# normally piped straight from curl), so keep the probe self-contained and
+# only pull in the helper library when it is actually needed.
+looks_like_steamos() {
+    local id id_like variant
+    if [[ -r /etc/os-release ]]; then
+        id=$(. /etc/os-release 2>/dev/null; printf '%s' "${ID:-}")
+        id_like=$(. /etc/os-release 2>/dev/null; printf '%s' "${ID_LIKE:-}")
+        variant=$(. /etc/os-release 2>/dev/null; printf '%s' "${VARIANT_ID:-}")
+        [[ "$id" == "steamos" ]] && return 0
+        [[ "$id_like" == *steamos* ]] && return 0
+        [[ "$variant" == "steamdeck" ]] && return 0
+    fi
+    command -v steamos-readonly >/dev/null 2>&1 && return 0
+    return 1
+}
+
+STEAMOS_LIB_URL="https://raw.githubusercontent.com/Nakildias/sc0710/main/scripts/sc0710-steamos-lib.sh"
+
+source_steamos_lib() {
+    local cand tmp
+    for cand in "${PROJECT_ROOT}/scripts/sc0710-steamos-lib.sh" \
+                /home/sc0710/sc0710-steamos-lib.sh \
+                /home/sc0710/scripts/sc0710-steamos-lib.sh \
+                /usr/lib/sc0710/sc0710-steamos-lib.sh; do
+        if [[ -f "$cand" ]]; then
+            # shellcheck source=/dev/null
+            source "$cand"
+            return 0
+        fi
+    done
+
+    tmp="$(mktemp -t sc0710-steamos-lib.XXXXXX.sh)" || return 1
+    if curl -fsSL "$STEAMOS_LIB_URL" -o "$tmp" 2>/dev/null && [[ -s "$tmp" ]]; then
+        # shellcheck source=/dev/null
+        source "$tmp"
+        rm -f "$tmp"
+        return 0
+    fi
+    rm -f "$tmp"
+    return 1
+}
+
+IS_STEAMOS=false
+if looks_like_steamos; then
+    if source_steamos_lib; then
+        IS_STEAMOS=true
+    else
+        echo "error: SteamOS detected but scripts/sc0710-steamos-lib.sh could not be loaded."
+        echo "       Clone the repo and run it locally:"
+        echo "         git clone https://github.com/Nakildias/sc0710.git"
+        echo "         sudo bash sc0710/scripts/install-sc0710.sh"
+        exit 1
+    fi
+fi
+
+is_steamos() {
+    [[ "$IS_STEAMOS" == "true" ]]
+}
 
 # --- Configuration ---
 REPO_URL="https://github.com/Nakildias/sc0710.git"
@@ -152,6 +215,11 @@ cleanup() {
     if [[ -n "$TEMP_DIR" && -d "$TEMP_DIR" ]]; then
         rm -rf "$TEMP_DIR"
         log "Cleaned up temp directory: $TEMP_DIR"
+    fi
+    # SteamOS: always hand the rootfs back in the state we found it in, even
+    # when the install aborts halfway through.
+    if [[ "${IS_STEAMOS:-false}" == "true" ]] && declare -F sc0710_steamos_relock >/dev/null; then
+        sc0710_steamos_relock
     fi
 }
 
@@ -403,15 +471,87 @@ is_atomic() {
 
 msg "Verifying system compatibility..."
 
-if is_atomic; then
-log "=== SC0710 Atomic Driver Installation Started ==="
+if is_atomic || is_steamos; then
+log "=== SC0710 Immutable Driver Installation Started ==="
 log "Version: $DRV_VERSION | Kernel: $KERNEL_VER"
+# Both flavours share the immutable layout: driver source in a persistent
+# directory, rebuilt and insmod'ed by sc0710-build.service on every boot.
 IS_ATOMIC=true
 SOURCE="/var/lib/sc0710"
 SRC_DIR="/var/lib/sc0710"
 SERVICE_NAME="sc0710-build"
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
 
+if is_steamos; then
+
+# --- SteamOS flow ---
+DISTRO_NAME="$(sc0710_steamos_name)"
+
+echo ""
+echo -e "${BOLD}${BLUE}╔═══════════════════════════════════════════════════════════╗${NC}"
+echo -e "${BOLD}${BLUE}║          SC0710 Driver Installer — SteamOS Edition        ║${NC}"
+echo -e "${BOLD}${BLUE}╚═══════════════════════════════════════════════════════════╝${NC}"
+echo ""
+
+msg2 "Detected: $DISTRO_NAME"
+log "Detected distro: $DISTRO_NAME (SteamOS flow)"
+
+# The whole install writes to /etc, /usr/local and /lib/modules, so unlock
+# once here; cleanup() restores the original lock state on every exit path.
+msg "Unlocking the read-only rootfs..."
+if ! sc0710_steamos_unlock; then
+    die "Could not unlock the rootfs. Run 'sudo steamos-readonly disable' manually and retry."
+fi
+msg2 "Rootfs unlocked (it is re-locked automatically when the installer exits)."
+
+# /home is the only partition a SteamOS A/B update leaves alone, so the
+# driver source lives there and /var/lib/sc0710 becomes a symlink to it.
+if ! sc0710_steamos_home_is_persistent; then
+    warning "${SC0710_STEAMOS_HOME} is on the same filesystem as / — a SteamOS update may wipe it."
+    warning "You would then need to re-run this installer after each system update."
+fi
+sc0710_steamos_ensure_layout || die "Could not create ${SC0710_STEAMOS_HOME}."
+SRC_DIR="$SC0710_STEAMOS_HOME"
+SOURCE="$SC0710_STEAMOS_HOME"
+msg2 "Persistent driver location: ${SRC_DIR} (linked from /var/lib/sc0710)"
+
+# --- 2. Permission Check ---
+check_video_group
+
+# --- 3. Build dependencies via pacman (Neptune kernel headers) ---
+msg "Checking build dependencies..."
+
+HEADERS_PKG="$(sc0710_steamos_headers_pkg "$KERNEL_VER")"
+if sc0710_steamos_have_headers "$KERNEL_VER" && command -v gcc >/dev/null 2>&1 && command -v make >/dev/null 2>&1; then
+    msg2 "All build dependencies are present."
+else
+    msg2 "Needed: build tools and ${HEADERS_PKG} (headers for kernel ${KERNEL_VER})."
+    echo ""
+    echo -e "  ${YELLOW}NOTE:${NC} SteamOS wipes packages on every OS update. ${BOLD}sc0710-build.service${NC}"
+    echo -e "  re-installs the headers and rebuilds the driver automatically after one."
+    echo ""
+
+    if confirm "Install build dependencies with pacman now?" "Y"; then
+        sc0710_steamos_init_keyring
+        if ! sc0710_steamos_ensure_build_tools; then
+            die "Could not install the build tools (gcc/make/git)."
+        fi
+        if ! sc0710_steamos_ensure_headers "$KERNEL_VER"; then
+            echo ""
+            error "Kernel headers for $KERNEL_VER are unavailable."
+            echo -e "  ${BOLD}If SteamOS was just updated, reboot first${NC} — the running kernel and"
+            echo -e "  the packages in the repos must match."
+            echo -e "  Manual install: ${BOLD}sudo pacman -Sy ${HEADERS_PKG}${NC}"
+            exit 1
+        fi
+    else
+        die "Cannot proceed without build dependencies."
+    fi
+fi
+
+else
+
+# --- Fedora Atomic flow ---
 echo ""
 echo -e "${BOLD}${BLUE}╔═══════════════════════════════════════════════════════════╗${NC}"
 echo -e "${BOLD}${BLUE}║       SC0710 Driver Installer — Fedora Atomic Edition     ║${NC}"
@@ -533,6 +673,9 @@ if [[ ! -d "/lib/modules/${KERNEL_VER}/build" ]]; then
     exit 1
 fi
 
+fi
+# --- End of the per-distro dependency step; the rest is shared ---
+
 # --- 4. Unload existing module if loaded ---
 if lsmod | grep -q "$DRV_NAME"; then
     warning "Module $DRV_NAME is currently loaded."
@@ -544,8 +687,9 @@ fi
 # --- 5. Source Setup ---
 msg "Setting up driver source..."
 
-# Clean previous installation
-if [[ -d "$SRC_DIR" ]]; then
+# Clean previous installation. Keyed on the Makefile, not on the directory:
+# on SteamOS the persistent directory is created before this point.
+if [[ -f "$SRC_DIR/Makefile" ]]; then
     if [[ "$FORCE_INSTALL" == "true" ]] || confirm "Previous installation found. Replace it?" "Y"; then
         # If the module is currently loaded, try to unload it first
         if lsmod | grep -q "$DRV_NAME"; then
@@ -559,7 +703,7 @@ if [[ -d "$SRC_DIR" ]]; then
     fi
 fi
 
-if [[ ! -d "$SRC_DIR" ]]; then
+if [[ ! -f "$SRC_DIR/Makefile" ]]; then
     mkdir -p "$SRC_DIR"
 
     # --- Local/Online Mode Detection ---
@@ -628,13 +772,38 @@ fi
 # --- 6. Create the boot-time build script ---
 msg "Creating boot-time build script..."
 
-BUILD_SCRIPT="/var/lib/sc0710/build-and-load.sh"
+# SteamOS: point the service at the persistent copy in /home/sc0710. The
+# /var/lib/sc0710 symlink is restored by the build script itself, so the unit
+# must not depend on it.
+BUILD_SCRIPT="${SRC_DIR}/build-and-load.sh"
+# SteamOS may have to download kernel headers and do a cold rebuild after an
+# OS update; Fedora Atomic only ever rebuilds.
+if is_steamos; then
+    SERVICE_TIMEOUT=900
+else
+    SERVICE_TIMEOUT=300
+fi
 if [[ -f "$SOURCE/scripts/build-and-load.sh" ]]; then
     cp "$SOURCE/scripts/build-and-load.sh" "$BUILD_SCRIPT"
     chmod +x "$BUILD_SCRIPT"
     log "Installed build script from source: $BUILD_SCRIPT"
 else
     warning "scripts/build-and-load.sh not found in source tree."
+fi
+
+if is_steamos; then
+    # The build script sources these two out of the persistent tree on boot.
+    if [[ -f "$SOURCE/scripts/sc0710-steamos-lib.sh" ]]; then
+        cp "$SOURCE/scripts/sc0710-steamos-lib.sh" "${SRC_DIR}/sc0710-steamos-lib.sh"
+        chmod +x "${SRC_DIR}/sc0710-steamos-lib.sh"
+    else
+        warning "scripts/sc0710-steamos-lib.sh not found in source tree — boot-time self-repair disabled."
+    fi
+    if [[ -f "$SOURCE/scripts/sc0710-firmware-lib.sh" && ! -f "${SRC_DIR}/sc0710-firmware-lib.sh" ]]; then
+        cp "$SOURCE/scripts/sc0710-firmware-lib.sh" "${SRC_DIR}/sc0710-firmware-lib.sh"
+        chmod +x "${SRC_DIR}/sc0710-firmware-lib.sh"
+    fi
+
 fi
 
 # --- 7. Create the systemd service ---
@@ -645,20 +814,65 @@ cat > "$SERVICE_FILE" <<EOF
 Description=SC0710 Capture Card Driver - Build and Load
 After=local-fs.target basic.target systemd-udev-settle.service
 Wants=systemd-udev-settle.service
-ConditionPathExists=/var/lib/sc0710/build-and-load.sh
+ConditionPathExists=${BUILD_SCRIPT}
 
 [Service]
 Type=oneshot
 Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-ExecStart=/bin/bash /var/lib/sc0710/build-and-load.sh
+ExecStart=/bin/bash ${BUILD_SCRIPT}
 RemainAfterExit=yes
-TimeoutStartSec=300
+TimeoutStartSec=${SERVICE_TIMEOUT}
 StandardOutput=journal
 StandardError=journal
 
 [Install]
 WantedBy=multi-user.target
 EOF
+
+# Offline repair for the one thing /home cannot protect: a SteamOS update that
+# drops the unit from /etc, or empties /usr/local. Embeds the unit just
+# written, so restoring needs neither a network nor a re-download.
+if is_steamos; then
+    {
+        cat <<'RESTORE_HEAD'
+#!/usr/bin/env bash
+# Restore the sc0710 boot service and CLI after a SteamOS update removed them.
+# Everything it needs is already in /home/sc0710 — no network required.
+#
+#   sudo bash /home/sc0710/steamos-restore.sh
+#
+set -euo pipefail
+[[ $EUID -eq 0 ]] || exec sudo bash "$0" "$@"
+
+SRC="/home/sc0710"
+if [[ ! -f "$SRC/build-and-load.sh" || ! -f "$SRC/sc0710-steamos-lib.sh" ]]; then
+    echo "error: $SRC is incomplete — re-run the sc0710 installer."
+    exit 1
+fi
+
+# shellcheck source=/dev/null
+source "$SRC/sc0710-steamos-lib.sh"
+trap 'sc0710_steamos_relock' EXIT
+sc0710_steamos_unlock || { echo "error: could not unlock the rootfs."; exit 1; }
+sc0710_steamos_ensure_layout
+
+cat > /etc/systemd/system/sc0710-build.service <<'UNITEOF'
+RESTORE_HEAD
+        cat "$SERVICE_FILE"
+        cat <<'RESTORE_TAIL'
+UNITEOF
+
+systemctl daemon-reload
+systemctl enable sc0710-build.service
+sc0710_steamos_install_tools "$SRC" || echo "warning: could not reinstall the sc0710 CLI."
+echo "sc0710: boot service and CLI restored. Building the driver..."
+systemctl restart sc0710-build.service || \
+    echo "warning: the build service failed — check: journalctl -u sc0710-build.service -b"
+RESTORE_TAIL
+    } > "${SRC_DIR}/steamos-restore.sh"
+    chmod +x "${SRC_DIR}/steamos-restore.sh"
+    log "Wrote offline restore helper: ${SRC_DIR}/steamos-restore.sh"
+fi
 
 systemctl daemon-reload
 systemctl enable "${SERVICE_NAME}.service"
@@ -741,8 +955,13 @@ if [[ ${#FAILED_DEPS[@]} -gt 0 ]]; then
     echo -e "${YELLOW}${DEP_ERRORS}${NC}"
     echo -e "  This indicates a problem with the kernel package, not the driver."
     echo -e "  Possible solutions:"
-    echo -e "    1. Reinstall kernel modules: ${BOLD}sudo rpm-ostree override reset kernel${NC}"
-    echo -e "    2. Wait for a system update from your distribution"
+    if is_steamos; then
+        echo -e "    1. Reinstall the kernel modules: ${BOLD}sudo pacman -S linux-neptune-$(uname -r | sed -n 's/.*neptune-\([0-9]*\).*/\1/p')${NC}"
+        echo -e "    2. Reboot — the running kernel may not match the installed image"
+    else
+        echo -e "    1. Reinstall kernel modules: ${BOLD}sudo rpm-ostree override reset kernel${NC}"
+        echo -e "    2. Wait for a system update from your distribution"
+    fi
     echo ""
     echo -e "${BOLD}Recent kernel messages:${NC}"
     dmesg | tail -10 | sed 's/^/  /'
@@ -1034,7 +1253,24 @@ log "=== Installation completed successfully ==="
 echo ""
 echo -e "${BOLD}${GREEN}::${NC} ${BOLD}Installation Complete.${NC}"
 echo ""
-if [[ "$IS_ATOMIC" == "true" ]]; then
+if is_steamos; then
+    echo -e " ${BLUE}->${NC} Installed for: ${BOLD}${DISTRO_NAME:-SteamOS}${NC}"
+    echo ""
+    echo -e " ${BLUE}->${NC} ${BOLD}How it works on SteamOS:${NC}"
+    echo -e "    The driver source lives in ${BOLD}${SRC_DIR}/${NC} — on /home, the only partition"
+    echo -e "    a SteamOS A/B update leaves untouched (${BOLD}/var/lib/sc0710${NC} links to it)."
+    echo -e "    ${BOLD}sc0710-build.service${NC} runs on every boot and, after a SteamOS update,"
+    echo -e "    re-installs the Neptune kernel headers, rebuilds the module and puts"
+    echo -e "    ${BOLD}sc0710-cli${NC} back into /usr/local/bin by itself."
+    echo ""
+    if [[ "${SC0710_STEAMOS_ORIG_LOCKED:-1}" == "1" ]]; then
+        echo -e "    The read-only rootfs is re-locked as this installer exits."
+    else
+        echo -e "    The rootfs was already unlocked before this install; it is left that way."
+    fi
+    echo -e "    If an update ever removes the boot service itself, restore it offline with:"
+    echo -e "      ${BOLD}sudo bash ${SRC_DIR}/steamos-restore.sh${NC}"
+elif [[ "$IS_ATOMIC" == "true" ]]; then
     echo -e " ${BLUE}->${NC} Installed for: ${BOLD}${DISTRO_NAME:-Fedora Atomic}${NC}"
     echo ""
     echo -e " ${BLUE}->${NC} ${BOLD}How it works on atomic distros:${NC}"

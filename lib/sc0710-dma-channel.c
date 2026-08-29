@@ -1625,6 +1625,133 @@ static struct sc0710_client *sc0710_dma_zc_client(struct sc0710_dma_channel *ch,
 	return zc_client;
 }
 
+/* ---- Short-descriptor detection (dma_short_desc_detect) ---------------- *
+ *
+ * The DMA engine is permitted to complete a descriptor short of its
+ * configured lengthBytes. The service loop below only tests the writeback
+ * words for "nonzero", then delivers the full configured size regardless,
+ * so a short silently shifts the frame anchor: every later frame boundary
+ * lands in the wrong place, nothing is logged, and only a ring rebuild
+ * restores it. That is the "image shifted and never recovers" failure.
+ *
+ * Which writeback word carries the transferred length is not documented
+ * for this part, so it is learned instead of assumed. During calibration
+ * both words are compared against each descriptor's configured length; a
+ * word that matches everywhere for SC0710_WB_CAL_LAPS laps is locked in.
+ * If neither word survives, detection reports that and disables itself
+ * rather than inventing shorts out of unrelated status bits.
+ */
+void sc0710_short_desc_reset(struct sc0710_dma_channel *ch)
+{
+	ch->wb_len_word   = -1;
+	ch->wb_cal_laps   = 0;
+	ch->wb_cal_cand   = 0x3;
+	ch->wb_cal_failed = false;
+}
+
+/* Scan one completed lap for descriptors that transferred short. Runs only
+ * with dma_short_desc_detect set, before the service loop clears the
+ * chain's writebacks. Returns the number of short descriptors found. */
+static u32 sc0710_short_desc_scan(struct sc0710_dma_channel *ch,
+	struct sc0710_dma_descriptor_chain *chain, u32 chain_idx)
+{
+	struct sc0710_dev *dev = ch->dev;
+	u32 shorts = 0;
+	u32 j;
+
+	if (ch->wb_cal_failed)
+		return 0;
+
+	if (ch->wb_len_word < 0) {
+		u32 cand = ch->wb_cal_cand;
+
+		for (j = 0; j < chain->numAllocations && cand; j++) {
+			struct sc0710_dma_descriptor_chain_allocation *dca =
+				&chain->allocations[j];
+			u32 expect = dca->desc->lengthBytes;
+
+			if ((cand & 0x1) && *dca->wbm[0] != expect)
+				cand &= ~0x1;
+			if ((cand & 0x2) && *dca->wbm[1] != expect)
+				cand &= ~0x2;
+		}
+		ch->wb_cal_cand = cand;
+
+		if (!cand) {
+			/* Neither word tracks the configured length on this
+			 * part. Say so once: it disproves the length-word
+			 * theory for this hardware rather than hiding it. */
+			ch->wb_cal_failed = true;
+			printk(KERN_INFO "%s: [ch%d] short-desc detect: no writeback "
+				"word tracks descriptor length (last lap wbm %08x %08x, "
+				"expected %08x) - detection disabled\n",
+				dev->name, ch->nr,
+				*chain->allocations[0].wbm[0],
+				*chain->allocations[0].wbm[1],
+				chain->allocations[0].desc->lengthBytes);
+			return 0;
+		}
+
+		if (++ch->wb_cal_laps >= SC0710_WB_CAL_LAPS) {
+			ch->wb_len_word = (cand & 0x1) ? 0 : 1;
+			printk(KERN_INFO "%s: [ch%d] short-desc detect: writeback word %d "
+				"carries the transferred length (calibrated over %u laps)\n",
+				dev->name, ch->nr, ch->wb_len_word, ch->wb_cal_laps);
+		}
+		return 0;
+	}
+
+	for (j = 0; j < chain->numAllocations; j++) {
+		struct sc0710_dma_descriptor_chain_allocation *dca =
+			&chain->allocations[j];
+		u32 expect = dca->desc->lengthBytes;
+		u32 actual = *dca->wbm[ch->wb_len_word];
+
+		/* A descriptor the engine never wrote this lap reads zero;
+		 * that is a missed completion, not a short transfer. */
+		if (actual == 0 || actual == expect)
+			continue;
+
+		shorts++;
+		ch->short_desc_count++;
+		ch->short_last_expect  = expect;
+		ch->short_last_actual  = actual;
+		ch->short_last_chain   = chain_idx;
+		ch->short_last_desc    = j;
+		ch->short_last_jiffies = jiffies;
+
+		/* Whether the byte loss is a multiple of 3 decides whether the
+		 * BGR channel order survives the slip - a shifted raster with
+		 * correct colour, or shifted with the hue rotated. */
+		printk_ratelimited(KERN_WARNING "%s: [ch%d] short descriptor: chain %u "
+			"desc %u transferred %u of %u bytes (short by %u, mod3 %u)\n",
+			dev->name, ch->nr, chain_idx, j, actual, expect,
+			expect - actual, (expect - actual) % 3);
+	}
+
+	if (shorts) {
+		ch->short_desc_laps++;
+		if (dma_short_desc_detect >= 2)
+			dev->tear_resync_pending = 1;
+	}
+
+	return shorts;
+}
+
+/* Clear every descriptor's active writeback half. The service loop only
+ * clears the chain's last descriptor (all it needs for completion
+ * detection), which would leave a short length latched on a mid-chain
+ * descriptor and re-reported on every later lap. Detection-only. */
+static void sc0710_short_desc_clear(struct sc0710_dma_descriptor_chain *chain)
+{
+	u32 j;
+
+	for (j = 0; j < chain->numAllocations; j++) {
+		*chain->allocations[j].wbm[0] = 0;
+		*chain->allocations[j].wbm[1] = 0;
+	}
+}
+
 int sc0710_dma_channel_service(struct sc0710_dma_channel *ch)
 {
 	struct sc0710_dev *dev = ch->dev;
@@ -1752,6 +1879,11 @@ int sc0710_dma_channel_service(struct sc0710_dma_channel *ch)
 
 			consumed++;
 
+			/* Before anything clears the writebacks: check this
+			 * lap for a descriptor that transferred short. */
+			if (dma_short_desc_detect && !stale_completion)
+				sc0710_short_desc_scan(ch, chain, i);
+
 			if (sc0710_debug_mode > 2) {
 				printk("%s ch#%d    [%02d] %08x - wbm %08x %08x (DQ) segs: %d\n",
 					ch->dev->name,
@@ -1796,6 +1928,8 @@ int sc0710_dma_channel_service(struct sc0710_dma_channel *ch)
 			}
 
 			/* Reset the descriptor state so we know when it's complete next time. */
+			if (dma_short_desc_detect)
+				sc0710_short_desc_clear(chain);
 			*(dca->wbm[0]) = 0;
 			*(dca->wbm[1]) = 0;
 
@@ -1846,6 +1980,10 @@ static int sc0710_dma_channel_chains_link(struct sc0710_dma_channel *ch)
 	 * page 2 the writeback slots at the same stride. */
 	BUILD_BUG_ON(SC0710_MAX_CHANNEL_DESCRIPTOR_CHAINS * SC0710_MAX_CHAIN_DESCRIPTORS *
 		     sizeof(struct sc0710_dma_descriptor) > PAGE_SIZE);
+
+	/* A rebuilt ring re-anchors DMA, so any learned writeback layout and
+	 * short-descriptor history belongs to the previous ring. */
+	sc0710_short_desc_reset(ch);
 
 	/* Now that we have all of the dma allocations, we can update the descriptor tables with DMA io addresses. */
 	for (i = 0; i < ch->numDescriptorChains; i++) {
