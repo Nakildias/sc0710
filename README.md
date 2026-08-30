@@ -19,7 +19,7 @@ High-performance, multi-client Linux driver for the Elgato 4K60 Pro MK.2, 4K Pro
 |------|-------------|-------|
 | **Elgato 4K60 Pro MK.2** | `1cfa:000e` | Plug-and-play after driver load. No FPGA firmware step. |
 | **Elgato 4K Pro** | `1cfa:0012` | Requires **ECP5 FPGA firmware** programming on every **cold boot**. Handled automatically by the installer and the AUR package; manual `insmod` builds need extra steps (see below). |
-| **Elgato Cam Link Pro** | `1cfa:0011` | Experimental. One HDMI-1 video/audio path, native 3840x2160 NV12 capture, and cold-boot firmware loading have been tested. Four simultaneous inputs are not implemented. |
+| **Elgato Cam Link Pro** | `1cfa:0011` | Experimental. Four independent HDMI video and audio endpoints, native 3840x2160 NV12 capture on every port, hot-plug recovery, and cold-boot firmware loading have been tested on attached hardware. Simultaneous live sources still need multi-source testing. |
 
 All three cards share the same `12ab:0710` PCI device ID but use different board profiles in the driver.
 
@@ -195,7 +195,7 @@ Same command as above. It checks the module, DKMS, CLI, systemd units, config fi
 * **DKMS integration** — automatic rebuilds on kernel updates (standard distros)
 * **Atomic / immutable support** — boot-time rebuild via `sc0710-build.service` (Bazzite, Silverblue, etc.)
 * **ECP5 auto-programming**: card-specific firmware extraction at install time; the driver programs the FPGA at load and refuses to bind if it cannot
-* **Cam Link Pro native 4K**: genuine 3840x2160 NV12 capture on the tested HDMI-1 path without host-side 1080p upscaling
+* **Cam Link Pro four-input capture**: four V4L2 video nodes and four independently routed ALSA inputs, with genuine 3840x2160 NV12 capture tested on every HDMI port without host-side 1080p upscaling
 * **Status images** — storage-efficient No Signal / No Device screens
 * **Connection sensing** — distinguishes unplugged cables from signal loss (not 100% reliable)
 * **Video formats** — 4K60, 1440p144, 1080p240. **EDID Source control (Internal/Display/Merged) on both cards** via the `EDID Source` V4L2 control (`v4l2-ctl --set-ctrl=edid_source=N`). **Custom EDID read/write on both cards** via `VIDIOC_G_EDID`/`VIDIOC_S_EDID` — the 4K Pro through its EEPROM (`edid=` boot param, profiles from `scripts/extract-firmware.sh`), the MK.2 through its MCU (runtime only). The graphical **EDID Config app** (`sc0710-cli --edid-config`) manages this for both cards and can fetch Elgato's official EDID profiles
@@ -221,8 +221,9 @@ v4l2-ctl -d /dev/video0 --set-fmt-video=pixelformat=BGR3   # select 4:4:4
 # OBS / ffmpeg pick it via the normal format menu / -pixel_format bgr24
 ```
 
-The Cam Link Pro path currently exposes one fixed format: `NV12` at 3840x2160. YUYV,
-BGR24, four simultaneous HDMI nodes, and multiview are not implemented for that card.
+The Cam Link Pro exposes one `NV12` video node and one stereo ALSA capture device for each
+HDMI port. A 4K source is delivered at 3840x2160; ordinary sources use a 1920x1080 delivery
+shape. YUYV, BGR24, and multiview are not implemented for that card.
 
 On **MK.2**, HDR mode can also auto-select the format while idle:
 
@@ -242,10 +243,10 @@ bit-perfect.
 
 ### Always-on audio capture
 
-By default the card's audio DMA starts and stops with video streaming: the ALSA capture
-device only produces samples while something is capturing video from `/dev/videoN`. That is
-fine for a normal OBS setup, but it breaks always-on uses — routing the HDMI audio through
-a hardware mixer, or monitoring it without a video client running.
+On the 4K60 Pro MK.2 and 4K Pro, audio DMA starts and stops with video streaming by default:
+the ALSA capture device only produces samples while something captures video. The Cam Link
+Pro's four ALSA inputs are always standalone, matching the card's multi-input use: opening an
+HDMI audio input starts the shared DMA session even when no video app is open.
 
 `keep_audio_alive=1` decouples the two. An ALSA client then holds the audio session open on
 its own, so the input stays live with no video capture in progress. Video is unaffected
@@ -349,7 +350,9 @@ For GitHub issues, attach output from `sc0710-cli --dump`.
 
 * **4K60 DMA tearing** — horizontal tears or frame shifts at 4K60 (~995 MB/s) under heavy load; **under active investigation**
 * **10-bit planar formats** — P010/P016 not implemented; HDR passthrough uses native **BGR24** 4:4:4 instead
-* **Cam Link Pro ports 2 through 4**: the current Linux node captures the selected/native stream. Four simultaneous V4L2 and ALSA endpoints are not implemented yet.
+* **Cam Link Pro simultaneous live sources**: all four video nodes can stream together and all four ALSA endpoints can run together, but only one live HDMI source was available during development. One live 4K source plus three idle streams is hardware-tested; two or more live sources at once still need verification.
+* **Cam Link Pro non-4K modes**: the 1920x1080 delivery path is implemented but has not yet been tested with a real 1080p source.
+* **Cam Link Pro EDID control**: per-input EDID routing is not mapped yet, so the Cam Link Pro nodes do not expose the EDID controls available on the 4K60 Pro MK.2 and 4K Pro.
 
 ## Help wanted
 
@@ -358,7 +361,7 @@ Maintainer **[Nakildias](https://github.com/Nakildias)** only has an **Elgato 4K
 Contributions and testing help are especially welcome for:
 
 * **Elgato 4K Pro** — ECP5 cold-boot behavior, atomic/Bazzite installs, and general capture stability
-* **Elgato Cam Link Pro**: four-input stream tagging, simultaneous capture, and multi-input audio testing
+* **Elgato Cam Link Pro**: two or more simultaneous live HDMI sources, especially mixed 4K/1080p modes and their independent audio
 * **Unsupported cards** — other `12ab:0710` subsystem IDs (e.g. HD60 Pro) that are not yet fully supported
 * **Open issues** — bugs that need reproduction on hardware the maintainer does not own (4K60 tearing, edge-case distros, etc.)
 

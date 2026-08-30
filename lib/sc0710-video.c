@@ -398,6 +398,11 @@ static void sc0710_fill_colorimetry(struct sc0710_dev *dev,
 static unsigned char *nosignal_frame_buffer = NULL;
 static unsigned char *nodevice_frame_buffer = NULL;
 static int status_frames_generated = 0;
+static unsigned char *clp_nosignal_hd_buffer;
+static unsigned char *clp_nodevice_hd_buffer;
+static unsigned char *clp_nosignal_4k_buffer;
+static unsigned char *clp_nodevice_4k_buffer;
+static int clp_status_frames_generated;
 /* Guards generation: two clients' first STREAMONs run under distinct vb2
  * locks, so nothing else serializes the lazy init. */
 static DEFINE_MUTEX(status_frames_lock);
@@ -501,41 +506,100 @@ static void generate_status_frame(unsigned char *dest, const struct overlay_spri
 	}
 }
 
+static void generate_clp_status_frame(unsigned char *dest,
+	const unsigned char *src, bool four_k)
+{
+	u32 width = four_k ? SC0710_CLP_WIDTH : SC0710_CLP_HD_WIDTH;
+	u32 height = four_k ? SC0710_CLP_HEIGHT : SC0710_CLP_HD_HEIGHT;
+	u32 y, x;
+
+	if (four_k) {
+		for (y = 0; y < STATUS_IMAGE_HEIGHT; y++) {
+			const u8 *src_row = src +
+				(size_t)y * STATUS_IMAGE_WIDTH * 2;
+			u8 *row0 = dest + (size_t)(2 * y) * width;
+			u8 *row1 = row0 + width;
+
+			for (x = 0; x < STATUS_IMAGE_WIDTH; x++) {
+				u8 luma = src_row[2 * x];
+
+				row0[2 * x] = luma;
+				row0[2 * x + 1] = luma;
+				row1[2 * x] = luma;
+				row1[2 * x + 1] = luma;
+			}
+		}
+	} else {
+		for (y = 0; y < height; y++)
+			for (x = 0; x < width; x++)
+				dest[(size_t)y * width + x] =
+					src[((size_t)y * width + x) * 2];
+	}
+	memset(dest + (size_t)width * height, 0x80,
+		(size_t)width * height / 2);
+}
+
 /* Generate status frames from hybrid-optimized gradient + overlay data.
  * Called once lazily on first use.
  */
-static void generate_status_frames_if_needed(void)
+static void generate_status_frames_if_needed(struct sc0710_dev *dev)
 {
 	unsigned int frame_size = STATUS_IMAGE_WIDTH * STATUS_IMAGE_HEIGHT * 2;
-	unsigned char *nosignal, *nodevice;
+	unsigned char *nosignal = NULL, *nodevice = NULL;
+	unsigned char *ns_hd = NULL, *nd_hd = NULL;
+	unsigned char *ns_4k = NULL, *nd_4k = NULL;
 
 	mutex_lock(&status_frames_lock);
-	if (status_frames_generated) {
-		mutex_unlock(&status_frames_lock);
-		return;
+	if (!status_frames_generated) {
+		/* Build both frames completely before publishing the pointers: the
+		 * timer path reads them without the lock, so a half-drawn frame or
+		 * error-path vfree must never be visible through them. */
+		nosignal = vmalloc(frame_size);
+		nodevice = vmalloc(frame_size);
+		if (!nosignal || !nodevice) {
+			vfree(nosignal);
+			vfree(nodevice);
+			printk(KERN_WARNING "sc0710: Failed to allocate status frame buffers\n");
+			goto out;
+		}
+
+		generate_status_frame(nosignal, &no_signal_sprite);
+		generate_status_frame(nodevice, &no_device_sprite);
+		nosignal_frame_buffer = nosignal;
+		nodevice_frame_buffer = nodevice;
+		status_frames_generated = 1;
+		printk(KERN_INFO "sc0710: Generated status frames from hybrid-optimized data\n");
 	}
 
-	/* Build both frames completely before publishing the pointers: the
-	 * timer path reads them without the lock, so a half-drawn frame or an
-	 * error-path vfree must never be visible through them. */
-	nosignal = vmalloc(frame_size);
-	nodevice = vmalloc(frame_size);
-	if (!nosignal || !nodevice) {
-		vfree(nosignal);
-		vfree(nodevice);
-		printk(KERN_WARNING "sc0710: Failed to allocate status frame buffers\n");
-		mutex_unlock(&status_frames_lock);
-		return;
+	if (dev->board != SC0710_BOARD_ELGATO_CAMLINK_PRO ||
+	    clp_status_frames_generated)
+		goto out;
+
+	/* Cache the NV12 conversions once. Rebuilding three or four status
+	 * pictures in the timer callback can otherwise starve the polling DMA
+	 * service long enough for the hardware ring to overrun. */
+	ns_hd = vmalloc(SC0710_CLP_HD_SIZEIMAGE);
+	nd_hd = vmalloc(SC0710_CLP_HD_SIZEIMAGE);
+	ns_4k = vmalloc(SC0710_CLP_SIZEIMAGE);
+	nd_4k = vmalloc(SC0710_CLP_SIZEIMAGE);
+	if (!ns_hd || !nd_hd || !ns_4k || !nd_4k) {
+		vfree(ns_hd);
+		vfree(nd_hd);
+		vfree(ns_4k);
+		vfree(nd_4k);
+		printk(KERN_WARNING "sc0710: Failed to allocate Cam Link Pro status frame cache\n");
+		goto out;
 	}
-
-	/* Generate frames from overlays */
-	generate_status_frame(nosignal, &no_signal_sprite);
-	generate_status_frame(nodevice, &no_device_sprite);
-
-	nosignal_frame_buffer = nosignal;
-	nodevice_frame_buffer = nodevice;
-	status_frames_generated = 1;
-	printk(KERN_INFO "sc0710: Generated status frames from hybrid-optimized data\n");
+	generate_clp_status_frame(ns_hd, nosignal_frame_buffer, false);
+	generate_clp_status_frame(nd_hd, nodevice_frame_buffer, false);
+	generate_clp_status_frame(ns_4k, nosignal_frame_buffer, true);
+	generate_clp_status_frame(nd_4k, nodevice_frame_buffer, true);
+	clp_nosignal_hd_buffer = ns_hd;
+	clp_nodevice_hd_buffer = nd_hd;
+	clp_nosignal_4k_buffer = ns_4k;
+	clp_nodevice_4k_buffer = nd_4k;
+	clp_status_frames_generated = 1;
+out:
 	mutex_unlock(&status_frames_lock);
 }
 
@@ -548,54 +612,67 @@ void sc0710_video_free_status_frames(void)
 	nosignal_frame_buffer = NULL;
 	vfree(nodevice_frame_buffer);
 	nodevice_frame_buffer = NULL;
+	vfree(clp_nosignal_hd_buffer);
+	clp_nosignal_hd_buffer = NULL;
+	vfree(clp_nodevice_hd_buffer);
+	clp_nodevice_hd_buffer = NULL;
+	vfree(clp_nosignal_4k_buffer);
+	clp_nosignal_4k_buffer = NULL;
+	vfree(clp_nodevice_4k_buffer);
+	clp_nodevice_4k_buffer = NULL;
 	status_frames_generated = 0;
+	clp_status_frames_generated = 0;
 	mutex_unlock(&status_frames_lock);
 }
 
-/* The shared status artwork is generated as 1920x1080 YUYV. Cam Link Pro
- * userspace buffers are 3840x2160 NV12, so copy each Y sample into a 2x2
- * block and supply neutral chroma. */
+/* The shared status artwork is generated as 1920x1080 YUYV. A 4K Cam Link
+ * Pro node copies each Y sample into a 2x2 block and supplies neutral chroma. */
 static void sc0710_clp_fill_status_nv12(u8 *dst, unsigned long buf_size,
 	const u8 *img)
 {
-	u32 y, x;
+	const u8 *cached = img == nosignal_frame_buffer ?
+		clp_nosignal_4k_buffer : clp_nodevice_4k_buffer;
 
 	if (buf_size < SC0710_CLP_SIZEIMAGE)
 		return;
 
-	if (!img || !use_status_images) {
+	if (!img || !use_status_images || !cached) {
 		memset(dst, 0x10, SC0710_CLP_WIDTH * SC0710_CLP_HEIGHT);
 	} else {
-		for (y = 0; y < STATUS_IMAGE_HEIGHT; y++) {
-			const u8 *src = img +
-				(size_t)y * STATUS_IMAGE_WIDTH * 2;
-			u8 *row0 = dst + (size_t)(2 * y) * SC0710_CLP_WIDTH;
-			u8 *row1 = row0 + SC0710_CLP_WIDTH;
-
-			for (x = 0; x < STATUS_IMAGE_WIDTH; x++) {
-				u8 luma = src[2 * x];
-
-				row0[2 * x] = luma;
-				row0[2 * x + 1] = luma;
-				row1[2 * x] = luma;
-				row1[2 * x + 1] = luma;
-			}
-		}
+		memcpy(dst, cached, SC0710_CLP_SIZEIMAGE);
+		return;
 	}
 
 	memset(dst + SC0710_CLP_WIDTH * SC0710_CLP_HEIGHT, 0x80,
 		SC0710_CLP_WIDTH * SC0710_CLP_HEIGHT / 2);
 }
 
+static void sc0710_clp_fill_status_hd_nv12(u8 *dst, unsigned long buf_size,
+	const u8 *img)
+{
+	const u8 *cached = img == nosignal_frame_buffer ?
+		clp_nosignal_hd_buffer : clp_nodevice_hd_buffer;
+
+	if (buf_size < SC0710_CLP_HD_SIZEIMAGE)
+		return;
+	if (!img || !use_status_images || !cached) {
+		memset(dst, 0x10, SC0710_CLP_HD_WIDTH * SC0710_CLP_HD_HEIGHT);
+	} else {
+		memcpy(dst, cached, SC0710_CLP_HD_SIZEIMAGE);
+		return;
+	}
+	memset(dst + SC0710_CLP_HD_WIDTH * SC0710_CLP_HD_HEIGHT, 0x80,
+		SC0710_CLP_HD_WIDTH * SC0710_CLP_HD_HEIGHT / 2);
+}
+
 /* Compute the output dimensions and frame size for a detected format. */
 static void sc0710_get_effective_size(struct sc0710_dev *dev,
-	const struct sc0710_format *fmt, u32 *width, u32 *height, u32 *framesize)
+	const struct sc0710_format *fmt, u8 input, u32 *width, u32 *height,
+	u32 *framesize)
 {
-	/* Cam Link Pro: native 4K is a 3840x2160 NV12 chunk stream. The older
-	 * 1920-wide scaler path remains a fallback for smaller inputs and is
-	 * expanded to the same delivered shape. Everything that negotiates
-	 * with userspace (g/try/s_fmt, enum ioctls, queue sizing, the
-	 * client's stream-lifetime lock) funnels through here. */
+	/* Cam Link Pro keeps normal inputs at the Windows driver's practical
+	 * 1920x1080 capture shape. A genuine 4K input gets native 3840x2160.
+	 * Everything userspace negotiates funnels through this helper. */
 	if (dev->board == SC0710_BOARD_ELGATO_CAMLINK_PRO) {
 		if (clp_raw) {
 			/* Bring-up microscope: expose the DMA ring 1:1. */
@@ -607,9 +684,17 @@ static void sc0710_get_effective_size(struct sc0710_dev *dev,
 			*framesize = ring;
 			return;
 		}
-		*width = SC0710_CLP_WIDTH;
-		*height = SC0710_CLP_HEIGHT;
-		*framesize = SC0710_CLP_SIZEIMAGE;
+		if (input < SC0710_CLP_INPUTS &&
+		    READ_ONCE(dev->clp_input[input].width) >= SC0710_CLP_WIDTH &&
+		    READ_ONCE(dev->clp_input[input].height) >= SC0710_CLP_HEIGHT) {
+			*width = SC0710_CLP_WIDTH;
+			*height = SC0710_CLP_HEIGHT;
+			*framesize = SC0710_CLP_SIZEIMAGE;
+		} else {
+			*width = SC0710_CLP_HD_WIDTH;
+			*height = SC0710_CLP_HD_HEIGHT;
+			*framesize = SC0710_CLP_HD_SIZEIMAGE;
+		}
 		return;
 	}
 	*width = fmt->width;
@@ -998,41 +1083,70 @@ const struct sc0710_format *sc0710_format_find_by_timing_and_rate(u32 timingH, u
 
 
 
-static int vidioc_s_dv_timings(struct file *file, void *_fh, struct v4l2_dv_timings *timings)
+static struct sc0710_video_node *sc0710_video_node_from_file(struct file *file)
 {
-	struct sc0710_dma_channel *ch = video_drvdata(file);
-	struct sc0710_dev *dev = ch->dev;
+	return video_drvdata(file);
+}
 
-	dprintk(1, "%s()\n", __func__);
+static struct sc0710_dma_channel *sc0710_video_channel_from_file(struct file *file)
+{
+	return sc0710_video_node_from_file(file)->ch;
+}
 
-	return -EINVAL; /* No support for setting DV Timings */
+static const struct sc0710_format *sc0710_clp_input_format(
+	struct sc0710_video_node *node, bool require_lock)
+{
+	struct sc0710_dev *dev = node->ch->dev;
+	struct sc0710_clp_input_status status;
+
+	if (dev->board != SC0710_BOARD_ELGATO_CAMLINK_PRO)
+		return READ_ONCE(dev->fmt);
+
+	mutex_lock(&dev->signalMutex);
+	status = dev->clp_input[node->input];
+	mutex_unlock(&dev->signalMutex);
+	if (require_lock && !status.locked)
+		return NULL;
+	if (!status.pixelLineH || !status.pixelLineV)
+		return NULL;
+
+	return sc0710_format_find_by_timing_and_rate(status.pixelLineH,
+		status.pixelLineV, status.rate);
 }
 
 static int vidioc_g_dv_timings(struct file *file, void *_fh, struct v4l2_dv_timings *timings)
 {
-	struct sc0710_dma_channel *ch = video_drvdata(file);
+	struct sc0710_video_node *node = sc0710_video_node_from_file(file);
+	struct sc0710_dma_channel *ch = node->ch;
 	struct sc0710_dev *dev = ch->dev;
+	const struct sc0710_format *fmt;
 
 	dprintk(0, "%s()\n", __func__);
 
-	if (dev->fmt == NULL)
-		return -EINVAL;
+	fmt = dev->board == SC0710_BOARD_ELGATO_CAMLINK_PRO ?
+		sc0710_clp_input_format(node, false) : READ_ONCE(dev->fmt);
+	if (!fmt)
+		fmt = dev->last_fmt ? dev->last_fmt : sc0710_get_default_format();
 
 	/* Return the current detected timings. */
-	*timings = dev->fmt->dv_timings;
+	*timings = fmt->dv_timings;
 
 	return 0;
 }
 
 static int vidioc_query_dv_timings(struct file *file, void *_fh, struct v4l2_dv_timings *timings)
 {
-	struct sc0710_dma_channel *ch = video_drvdata(file);
+	struct sc0710_video_node *node = sc0710_video_node_from_file(file);
+	struct sc0710_dma_channel *ch = node->ch;
 	struct sc0710_dev *dev = ch->dev;
+	const struct sc0710_format *fmt;
 
-	if (dev->fmt == NULL)
+	fmt = dev->board == SC0710_BOARD_ELGATO_CAMLINK_PRO ?
+		sc0710_clp_input_format(node, true) : READ_ONCE(dev->fmt);
+	if (!fmt)
 		return -ENODATA;
 
-	*timings = dev->fmt->dv_timings;
+	*timings = fmt->dv_timings;
 	return 0;
 }
 
@@ -1069,34 +1183,48 @@ static int vidioc_dv_timings_cap(struct file *file, void *_fh, struct v4l2_dv_ti
 
 static int vidioc_querycap(struct file *file, void *priv, struct v4l2_capability *cap)
 {
-	struct sc0710_dma_channel *ch = video_drvdata(file);
+	struct sc0710_video_node *node = sc0710_video_node_from_file(file);
+	struct sc0710_dma_channel *ch = node->ch;
 	struct sc0710_dev *dev = ch->dev;
 
 	strscpy(cap->driver, "sc0710", sizeof(cap->driver));
-	strscpy(cap->card, sc0710_boards[dev->board].name, sizeof(cap->card));
-	snprintf(cap->bus_info, sizeof(cap->bus_info), "PCIe:%s", pci_name(dev->pci));
+	if (dev->board == SC0710_BOARD_ELGATO_CAMLINK_PRO) {
+		snprintf(cap->card, sizeof(cap->card), "Elgato Cam Link Pro HDMI-%u",
+			node->input + 1);
+		snprintf(cap->bus_info, sizeof(cap->bus_info), "PCIe:%s/input%u",
+			pci_name(dev->pci), node->input + 1);
+	} else {
+		strscpy(cap->card, sc0710_boards[dev->board].name,
+			sizeof(cap->card));
+		snprintf(cap->bus_info, sizeof(cap->bus_info), "PCIe:%s",
+			pci_name(dev->pci));
+	}
 
 	return 0;
 }
 
 static int vidioc_enum_input(struct file *file, void *priv, struct v4l2_input *i)
 {
-	struct sc0710_dma_channel *ch = video_drvdata(file);
+	struct sc0710_video_node *node = sc0710_video_node_from_file(file);
+	struct sc0710_dma_channel *ch = node->ch;
 	struct sc0710_dev *dev = ch->dev;
 	dprintk(1, "%s()\n", __func__);
 
 	if (i->index != 0)
 		return -EINVAL;
 
-	i->type  = V4L2_INPUT_TYPE_CAMERA;
-	strscpy(i->name, "HDMI", sizeof(i->name));
+	i->type = V4L2_INPUT_TYPE_CAMERA;
+	if (dev->board == SC0710_BOARD_ELGATO_CAMLINK_PRO)
+		snprintf(i->name, sizeof(i->name), "HDMI-%u", node->input + 1);
+	else
+		strscpy(i->name, "HDMI", sizeof(i->name));
 
 	return 0;
 }
 
 static int vidioc_s_input(struct file *file, void *priv, unsigned int i)
 {
-	struct sc0710_dma_channel *ch = video_drvdata(file);
+	struct sc0710_dma_channel *ch = sc0710_video_channel_from_file(file);
 	struct sc0710_dev *dev = ch->dev;
 
 	dprintk(1, "%s(%d)\n", __func__, i);
@@ -1109,7 +1237,7 @@ static int vidioc_s_input(struct file *file, void *priv, unsigned int i)
 
 static int vidioc_g_input(struct file *file, void *priv, unsigned int *i)
 {
-	struct sc0710_dma_channel *ch = video_drvdata(file);
+	struct sc0710_dma_channel *ch = sc0710_video_channel_from_file(file);
 	struct sc0710_dev *dev = ch->dev;
 	dprintk(1, "%s()\n", __func__);
 
@@ -1120,7 +1248,7 @@ static int vidioc_g_input(struct file *file, void *priv, unsigned int *i)
 
 static int vidioc_enum_fmt_vid_cap(struct file *file, void *priv, struct v4l2_fmtdesc *f)
 {
-	struct sc0710_dma_channel *ch = video_drvdata(file);
+	struct sc0710_dma_channel *ch = sc0710_video_channel_from_file(file);
 
 	/* Cam Link Pro delivers NV12 and nothing else. */
 	if (ch->dev->board == SC0710_BOARD_ELGATO_CAMLINK_PRO) {
@@ -1137,7 +1265,8 @@ static int vidioc_enum_fmt_vid_cap(struct file *file, void *priv, struct v4l2_fm
 
 static int vidioc_g_fmt_vid_cap(struct file *file, void *priv, struct v4l2_format *f)
 {
-	struct sc0710_dma_channel *ch = video_drvdata(file);
+	struct sc0710_video_node *node = sc0710_video_node_from_file(file);
+	struct sc0710_dma_channel *ch = node->ch;
 	struct sc0710_dev *dev = ch->dev;
 	const struct sc0710_format *fmt;
 	u32 eff_w, eff_h, eff_fs;
@@ -1145,7 +1274,8 @@ static int vidioc_g_fmt_vid_cap(struct file *file, void *priv, struct v4l2_forma
 	/* Use real format if available, otherwise use lastfmt, then default */
 	fmt = dev->fmt ? dev->fmt : (dev->last_fmt ? dev->last_fmt : sc0710_get_default_format());
 
-	sc0710_get_effective_size(dev, fmt, &eff_w, &eff_h, &eff_fs);
+	sc0710_get_effective_size(dev, fmt, node->input,
+		&eff_w, &eff_h, &eff_fs);
 
 	f->fmt.pix.width = eff_w;
 	f->fmt.pix.height = eff_h;
@@ -1169,7 +1299,8 @@ static int vidioc_g_fmt_vid_cap(struct file *file, void *priv, struct v4l2_forma
 
 static int vidioc_try_fmt_vid_cap(struct file *file, void *priv, struct v4l2_format *f)
 {
-	struct sc0710_dma_channel *ch = video_drvdata(file);
+	struct sc0710_video_node *node = sc0710_video_node_from_file(file);
+	struct sc0710_dma_channel *ch = node->ch;
 	struct sc0710_dev *dev = ch->dev;
 	const struct sc0710_format *fmt;
 	const struct sc0710_pixfmt *pf;
@@ -1178,7 +1309,8 @@ static int vidioc_try_fmt_vid_cap(struct file *file, void *priv, struct v4l2_for
 	/* Use real format if available, otherwise use lastfmt, then default */
 	fmt = dev->fmt ? dev->fmt : (dev->last_fmt ? dev->last_fmt : sc0710_get_default_format());
 
-	sc0710_get_effective_size(dev, fmt, &eff_w, &eff_h, &eff_fs);
+	sc0710_get_effective_size(dev, fmt, node->input,
+		&eff_w, &eff_h, &eff_fs);
 
 	/* Unknown formats clamp to YUYV, as do formats the field weave can't
 	 * produce for an interlaced source. Size for the requested format,
@@ -1197,7 +1329,7 @@ static int vidioc_try_fmt_vid_cap(struct file *file, void *priv, struct v4l2_for
 	sc0710_fill_colorimetry(dev, pf, &f->fmt.pix);
 
 	if (dev->board == SC0710_BOARD_ELGATO_CAMLINK_PRO) {
-		/* Whatever was asked for, the answer is NV12 3840x2160. */
+		/* Whatever was asked for, return this input's NV12 delivery shape. */
 		f->fmt.pix.pixelformat = V4L2_PIX_FMT_NV12;
 		f->fmt.pix.field = V4L2_FIELD_NONE;
 		f->fmt.pix.bytesperline = eff_w;
@@ -1209,7 +1341,7 @@ static int vidioc_try_fmt_vid_cap(struct file *file, void *priv, struct v4l2_for
 
 static int vidioc_s_fmt_vid_cap(struct file *file, void *priv, struct v4l2_format *f)
 {
-	struct sc0710_dma_channel *ch = video_drvdata(file);
+	struct sc0710_dma_channel *ch = sc0710_video_channel_from_file(file);
 	struct sc0710_dev *dev = ch->dev;
 	struct sc0710_client *client;
 	unsigned long flags;
@@ -1223,8 +1355,11 @@ static int vidioc_s_fmt_vid_cap(struct file *file, void *priv, struct v4l2_forma
 	 * capture is stopped, so the DMA sizing and the 0xD0 format bit stay
 	 * consistent for the whole session; a change request during capture is
 	 * rejected unless it matches the active format. */
-	if (ch->state == STATE_RUNNING)
+	if (ch->state == STATE_RUNNING) {
+		if (dev->board == SC0710_BOARD_ELGATO_CAMLINK_PRO)
+			return 0;
 		return f->fmt.pix.pixelformat == dev->pixfmt->fourcc ? 0 : -EBUSY;
+	}
 
 	/* Same rule while any client holds buffers: they were negotiated and
 	 * mapped at the current format's size. The buffer ioctls serialize on
@@ -1237,8 +1372,11 @@ static int vidioc_s_fmt_vid_cap(struct file *file, void *priv, struct v4l2_forma
 		}
 	}
 	spin_unlock_irqrestore(&ch->client_list_lock, flags);
-	if (busy)
+	if (busy) {
+		if (dev->board == SC0710_BOARD_ELGATO_CAMLINK_PRO)
+			return 0;
 		return f->fmt.pix.pixelformat == dev->pixfmt->fourcc ? 0 : -EBUSY;
+	}
 
 	/* Cam Link Pro: try_fmt normalised the request to NV12, which has no
 	 * entry in the packed-format table; dev->pixfmt stays on the YUYV
@@ -1252,7 +1390,8 @@ static int vidioc_s_fmt_vid_cap(struct file *file, void *priv, struct v4l2_forma
 
 static int vidioc_enum_framesizes(struct file *file, void *priv, struct v4l2_frmsizeenum *fsize)
 {
-	struct sc0710_dma_channel *ch = video_drvdata(file);
+	struct sc0710_video_node *node = sc0710_video_node_from_file(file);
+	struct sc0710_dma_channel *ch = node->ch;
 	struct sc0710_dev *dev = ch->dev;
 	const struct sc0710_format *fmt;
 	u32 eff_w, eff_h, eff_fs;
@@ -1274,7 +1413,8 @@ static int vidioc_enum_framesizes(struct file *file, void *priv, struct v4l2_frm
 	 * a ~1.4ms select deadline against the 1Hz placeholder timer. */
 	fmt = dev->fmt ? dev->fmt : (dev->last_fmt ? dev->last_fmt : sc0710_get_default_format());
 
-	sc0710_get_effective_size(dev, fmt, &eff_w, &eff_h, &eff_fs);
+	sc0710_get_effective_size(dev, fmt, node->input,
+		&eff_w, &eff_h, &eff_fs);
 
 	fsize->type = V4L2_FRMSIZE_TYPE_DISCRETE;
 	fsize->discrete.width = eff_w;
@@ -1285,7 +1425,8 @@ static int vidioc_enum_framesizes(struct file *file, void *priv, struct v4l2_frm
 
 static int vidioc_enum_frameintervals(struct file *file, void *priv, struct v4l2_frmivalenum *fival)
 {
-	struct sc0710_dma_channel *ch = video_drvdata(file);
+	struct sc0710_video_node *node = sc0710_video_node_from_file(file);
+	struct sc0710_dma_channel *ch = node->ch;
 	struct sc0710_dev *dev = ch->dev;
 	const struct sc0710_format *fmt;
 	u32 eff_w, eff_h, eff_fs;
@@ -1301,9 +1442,13 @@ static int vidioc_enum_frameintervals(struct file *file, void *priv, struct v4l2
 
 	/* See vidioc_enum_framesizes: enumerate the same format g_fmt reports,
 	 * including the no-signal fallback. */
-	fmt = dev->fmt ? dev->fmt : (dev->last_fmt ? dev->last_fmt : sc0710_get_default_format());
+	fmt = dev->board == SC0710_BOARD_ELGATO_CAMLINK_PRO ?
+		sc0710_clp_input_format(node, false) : READ_ONCE(dev->fmt);
+	if (!fmt)
+		fmt = dev->last_fmt ? dev->last_fmt : sc0710_get_default_format();
 
-	sc0710_get_effective_size(dev, fmt, &eff_w, &eff_h, &eff_fs);
+	sc0710_get_effective_size(dev, fmt, node->input,
+		&eff_w, &eff_h, &eff_fs);
 
 	if (fival->width != eff_w || fival->height != eff_h)
 		return -EINVAL;
@@ -1317,7 +1462,8 @@ static int vidioc_enum_frameintervals(struct file *file, void *priv, struct v4l2
 
 static int vidioc_g_parm(struct file *file, void *priv, struct v4l2_streamparm *parm)
 {
-	struct sc0710_dma_channel *ch = video_drvdata(file);
+	struct sc0710_video_node *node = sc0710_video_node_from_file(file);
+	struct sc0710_dma_channel *ch = node->ch;
 	struct sc0710_dev *dev = ch->dev;
 	const struct sc0710_format *fmt;
 
@@ -1331,7 +1477,10 @@ static int vidioc_g_parm(struct file *file, void *priv, struct v4l2_streamparm *
 	/* Same fallback chain as g_fmt and the enum ioctls: a hardcoded
 	 * no-signal rate here would contradict what enum_frameintervals
 	 * advertises for the very same format. */
-	fmt = dev->fmt ? dev->fmt : (dev->last_fmt ? dev->last_fmt : sc0710_get_default_format());
+	fmt = dev->board == SC0710_BOARD_ELGATO_CAMLINK_PRO ?
+		sc0710_clp_input_format(node, false) : READ_ONCE(dev->fmt);
+	if (!fmt)
+		fmt = dev->last_fmt ? dev->last_fmt : sc0710_get_default_format();
 
 	parm->parm.capture.timeperframe.numerator = fmt->fpsden;
 	parm->parm.capture.timeperframe.denominator = fmt->fpsnum;
@@ -1373,7 +1522,8 @@ static int sc0710_queue_setup(struct vb2_queue *q,
 	/* Use real format if available, otherwise use lastfmt, then default */
 	fmt = dev->fmt ? dev->fmt : (dev->last_fmt ? dev->last_fmt : sc0710_get_default_format());
 
-	sc0710_get_effective_size(dev, fmt, &eff_w, &eff_h, &eff_fs);
+	sc0710_get_effective_size(dev, fmt, client->input,
+		&eff_w, &eff_h, &eff_fs);
 
 	if (*num_buffers < 2)
 		*num_buffers = 2;
@@ -1403,7 +1553,8 @@ static int sc0710_buf_prepare(struct vb2_buffer *vb)
 	/* Use real format if available, otherwise use lastfmt, then default */
 	fmt = dev->fmt ? dev->fmt : (dev->last_fmt ? dev->last_fmt : sc0710_get_default_format());
 
-	sc0710_get_effective_size(dev, fmt, &eff_w, &eff_h, &eff_fs);
+	sc0710_get_effective_size(dev, fmt, client->input,
+		&eff_w, &eff_h, &eff_fs);
 
 	/* While streaming, delivery writes at most the locked stream size
 	 * (mismatched sources are skipped and placeholders clamp to the
@@ -1505,7 +1656,7 @@ static int sc0710_start_streaming(struct vb2_queue *q, unsigned int count)
 
 	/* Ensure status images are generated (safe process context here) */
 	if (use_status_images)
-		generate_status_frames_if_needed();
+		generate_status_frames_if_needed(dev);
 
 	/* Record the resolution this client expects for its entire stream
 	 * lifetime.  Frames are delivered only while the source still
@@ -1518,7 +1669,8 @@ static int sc0710_start_streaming(struct vb2_queue *q, unsigned int count)
 
 		sfmt = dev->fmt ? dev->fmt :
 			(dev->last_fmt ? dev->last_fmt : sc0710_get_default_format());
-		sc0710_get_effective_size(dev, sfmt, &sw, &sh, &sfs);
+		sc0710_get_effective_size(dev, sfmt, client->input,
+			&sw, &sh, &sfs);
 		client->stream_width = sw;
 		client->stream_height = sh;
 		client->stream_framesize = sfs;
@@ -1552,15 +1704,17 @@ static int sc0710_start_streaming(struct vb2_queue *q, unsigned int count)
 	 * sc0710_dma_sync_session starts video DMA only when a signal is
 	 * present, and leaves an ALSA-held audio session running if one is
 	 * already up. */
-	if (refcount == 1) {
+	if (refcount == 1 || dev->board == SC0710_BOARD_ELGATO_CAMLINK_PRO) {
 		mutex_lock(&dev->kthread_dma_lock);
 		if (READ_ONCE(dev->disconnected)) {
 			ret = -ENODEV;
 		} else {
+			if (dev->board == SC0710_BOARD_ELGATO_CAMLINK_PRO)
+				sc0710_i2c_sync_input_paths(dev);
 			if (dev->fmt == NULL)
 				dprintk(1, "%s() No signal - will deliver placeholder frames\n",
 					__func__);
-			ret = sc0710_dma_sync_session(dev);
+			ret = refcount == 1 ? sc0710_dma_sync_session(dev) : 0;
 		}
 		mutex_unlock(&dev->kthread_dma_lock);
 		if (ret < 0) {
@@ -1605,23 +1759,28 @@ static void sc0710_stop_streaming(struct vb2_queue *q)
 	 * no clients left.  Stop the channels first (serialized against the
 	 * service thread via ch->lock), then delete the timer, so a service
 	 * pass can't re-arm the timer after timer_delete_sync(). */
-	if (refcount <= 0) {
+	if (refcount <= 0 || dev->board == SC0710_BOARD_ELGATO_CAMLINK_PRO) {
 		mutex_lock(&dev->kthread_dma_lock);
-		atomic_set(&ch->streaming_refcount, 0); /* Clamp to 0 */
+		if (refcount <= 0)
+			atomic_set(&ch->streaming_refcount, 0); /* Clamp to 0 */
 		/* After a disconnect the remove path owns the hardware (the
 		 * engines are stopped, the BARs may be unmapped): only the
 		 * software teardown below remains ours. */
 		if (!READ_ONCE(dev->disconnected)) {
-			sc0710_dma_sync_session(dev);
+			if (dev->board == SC0710_BOARD_ELGATO_CAMLINK_PRO)
+				sc0710_i2c_sync_input_paths(dev);
+			if (refcount <= 0)
+				sc0710_dma_sync_session(dev);
 			/* Point the chains back at the scratch ring: vb2 is
 			 * about to unmap the client's buffers, and no
 			 * descriptor may retain their DMA addresses (the sync
 			 * above quiesced the video engine when it was
 			 * running). */
-			if (zero_copy)
+			if (refcount <= 0 && zero_copy)
 				sc0710_dma_channel_untarget_all(ch);
 		}
-		timer_delete_sync(&ch->timeout);
+		if (refcount <= 0)
+			timer_delete_sync(&ch->timeout);
 		mutex_unlock(&dev->kthread_dma_lock);
 	}
 
@@ -1653,7 +1812,8 @@ static const struct vb2_ops sc0710_video_qops = {
 static int sc0710_video_open(struct file *file)
 {
 	struct video_device *vdev = video_devdata(file);
-	struct sc0710_dma_channel *ch = video_drvdata(file);
+	struct sc0710_video_node *node = sc0710_video_node_from_file(file);
+	struct sc0710_dma_channel *ch = node->ch;
 	struct sc0710_dev *dev = ch->dev;
 	struct sc0710_fh *fh;
 	struct vb2_queue *q;
@@ -1670,6 +1830,7 @@ static int sc0710_video_open(struct file *file)
 	fh->ch   = ch;
 	fh->fp   = file;
 	fh->type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+	fh->input = node->input;
 
 	/* Initialize multi-client tracking with per-client VB2 queue */
 	fh->client = kzalloc(sizeof(*fh->client), GFP_KERNEL);
@@ -1679,6 +1840,7 @@ static int sc0710_video_open(struct file *file)
 	}
 	fh->client->fh = fh;
 	fh->client->streaming = false;
+	fh->client->input = node->input;
 	INIT_LIST_HEAD(&fh->client->buffer_list);
 	spin_lock_init(&fh->client->buffer_lock);
 
@@ -1923,7 +2085,7 @@ static const struct v4l2_file_operations video_fops = {
  * the MCU-served internal image (see sc0710_mk2_read_edid in sc0710-i2c.c). */
 static int vidioc_g_edid(struct file *file, void *_fh, struct v4l2_edid *edid)
 {
-	struct sc0710_dma_channel *ch = video_drvdata(file);
+	struct sc0710_dma_channel *ch = sc0710_video_channel_from_file(file);
 	struct sc0710_dev *dev = ch->dev;
 	u8 buf[512];
 	u32 total_blocks;
@@ -1970,7 +2132,7 @@ static int vidioc_g_edid(struct file *file, void *_fh, struct v4l2_edid *edid)
 
 static int vidioc_s_edid(struct file *file, void *_fh, struct v4l2_edid *edid)
 {
-	struct sc0710_dma_channel *ch = video_drvdata(file);
+	struct sc0710_dma_channel *ch = sc0710_video_channel_from_file(file);
 	struct sc0710_dev *dev = ch->dev;
 
 	if (edid->pad)
@@ -1991,7 +2153,6 @@ static const struct v4l2_ioctl_ops video_ioctl_ops =
 {
 	.vidioc_querycap         = vidioc_querycap,
 
-	.vidioc_s_dv_timings     = vidioc_s_dv_timings,
 	.vidioc_g_dv_timings     = vidioc_g_dv_timings,
 	.vidioc_g_edid           = vidioc_g_edid,
 	.vidioc_s_edid           = vidioc_s_edid,
@@ -2107,7 +2268,7 @@ static void sc0710_vid_timeout(struct timer_list *t)
 	/* Use lastfmt for placeholder frames to render at last known resolution */
 	fmt = dev->last_fmt ? dev->last_fmt : sc0710_get_default_format();
 
-	sc0710_get_effective_size(dev, fmt, &eff_w, &eff_h, &eff_fs);
+	sc0710_get_effective_size(dev, fmt, 0, &eff_w, &eff_h, &eff_fs);
 
 	/* With a live signal and a running channel, DMA is delivering to
 	 * every client whose locked resolution matches the detected format;
@@ -2139,10 +2300,18 @@ static void sc0710_vid_timeout(struct timer_list *t)
 
 		any_streaming = 1;
 
-		if (dma_active &&
-		    client->stream_width == live_w &&
-		    client->stream_height == live_h)
-			continue;
+		if (dma_active) {
+			if (dev->board == SC0710_BOARD_ELGATO_CAMLINK_PRO) {
+				if (client->input < SC0710_CLP_INPUTS &&
+				    time_before(jiffies,
+					ch->cv.last_picture_jiffies[client->input] +
+					VBUF_TIMEOUT))
+					continue;
+			} else if (client->stream_width == live_w &&
+				   client->stream_height == live_h) {
+				continue;
+			}
+		}
 
 		spin_lock_irqsave(&client->buffer_lock, buf_flags);
 
@@ -2163,16 +2332,21 @@ static void sc0710_vid_timeout(struct timer_list *t)
 				u32 fill_w = eff_w, fill_h = eff_h, fill_fs = eff_fs;
 
 				if (dev->board == SC0710_BOARD_ELGATO_CAMLINK_PRO) {
-					/* Scale the shared 1080p artwork to the
-					 * fixed 4K NV12 delivery geometry. */
-					const u8 *img = dev->cable_connected ?
+					sc0710_get_effective_size(dev, fmt, client->input,
+						&fill_w, &fill_h, &fill_fs);
+					bool cable = client->input < SC0710_CLP_INPUTS ?
+						READ_ONCE(dev->clp_input[client->input].cable_connected) :
+						READ_ONCE(dev->cable_connected);
+					const u8 *img = cable ?
 						nosignal_frame_buffer :
 						nodevice_frame_buffer;
 
-					sc0710_clp_fill_status_nv12(dst, buf_sz, img);
+					if (fill_w == SC0710_CLP_WIDTH)
+						sc0710_clp_fill_status_nv12(dst, buf_sz, img);
+					else
+						sc0710_clp_fill_status_hd_nv12(dst, buf_sz, img);
 					vb2_set_plane_payload(&buf->vb.vb2_buf, 0,
-						buf_sz >= SC0710_CLP_SIZEIMAGE ?
-						SC0710_CLP_SIZEIMAGE : 0);
+						buf_sz >= fill_fs ? fill_fs : 0);
 				} else if (dev->pixfmt->rgb) {
 					/* The pattern renderer and the dims
 					 * fallbacks below are YUYV-only;
@@ -2227,11 +2401,11 @@ static void sc0710_vid_timeout(struct timer_list *t)
 		mod_timer(&ch->timeout, jiffies + VBUF_TIMEOUT);
 }
 
-void sc0710_video_notify_source_change(struct sc0710_dev *dev)
+void sc0710_video_notify_source_change_mask(struct sc0710_dev *dev, u8 input_mask)
 {
 	struct sc0710_dma_channel *ch;
 	struct v4l2_event ev = {};
-	int ch_idx;
+	int ch_idx, input;
 
 	ev.type = V4L2_EVENT_SOURCE_CHANGE;
 	ev.u.src_change.changes = V4L2_EVENT_SRC_CH_RESOLUTION;
@@ -2240,23 +2414,34 @@ void sc0710_video_notify_source_change(struct sc0710_dev *dev)
 		ch = &dev->channel[ch_idx];
 		if (!ch->enabled || ch->mediatype != CHTYPE_VIDEO)
 			continue;
-		if (!video_is_registered(&ch->vdev))
-			continue;
+		for (input = 0; input < SC0710_CLP_INPUTS; input++) {
+			struct video_device *vdev = &ch->vnode[input].vdev;
 
-		v4l2_event_queue(&ch->vdev, &ev);
+			if ((input_mask & BIT(input)) && video_is_registered(vdev))
+				v4l2_event_queue(vdev, &ev);
+		}
 	}
 
-	printk(KERN_INFO "%s: SOURCE_CHANGE event queued\n", dev->name);
+	printk(KERN_INFO "%s: SOURCE_CHANGE event queued for input mask 0x%x\n",
+		dev->name, input_mask);
+}
+
+void sc0710_video_notify_source_change(struct sc0710_dev *dev)
+{
+	sc0710_video_notify_source_change_mask(dev,
+		GENMASK(SC0710_CLP_INPUTS - 1, 0));
 }
 
 void sc0710_video_unregister(struct sc0710_dma_channel *ch)
 {
 	struct sc0710_dev *dev = ch->dev;
+	int input;
 
 	dprintk(1, "%s()\n", __func__);
 
-	if (video_is_registered(&ch->vdev))
-		video_unregister_device(&ch->vdev);
+	for (input = 0; input < SC0710_CLP_INPUTS; input++)
+		if (video_is_registered(&ch->vnode[input].vdev))
+			video_unregister_device(&ch->vnode[input].vdev);
 
 	/* The control handler stays alive: open file handles unsubscribe
 	 * their control events through it at close. It is freed with dev,
@@ -2284,7 +2469,9 @@ void sc0710_video_disconnect(struct sc0710_dma_channel *ch)
 int sc0710_video_register(struct sc0710_dma_channel *ch)
 {
 	struct sc0710_dev *dev = ch->dev;
-	int err;
+	int inputs = dev->board == SC0710_BOARD_ELGATO_CAMLINK_PRO ?
+		SC0710_CLP_INPUTS : 1;
+	int err, input;
 	struct vb2_queue *q = &ch->vb2_queue;
 
 	/* Initialize vb2 queue */
@@ -2315,21 +2502,6 @@ int sc0710_video_register(struct sc0710_dma_channel *ch)
 	timer_setup(&ch->timeout, sc0710_vid_timeout, 0);
 #endif
 
-	memcpy(&ch->vdev, &sc0710_video_template, sizeof(sc0710_video_template));
-	ch->vdev.lock = &ch->v4l2_lock;
-	ch->vdev.release = video_device_release_empty;
-	ch->vdev.vfl_dir = VFL_DIR_RX;
-	ch->vdev.queue = q;
-	ch->vdev.device_caps = V4L2_CAP_STREAMING | V4L2_CAP_READWRITE | V4L2_CAP_VIDEO_CAPTURE;
-	ch->vdev.v4l2_dev = &dev->v4l2_dev;
-
-#if LINUX_VERSION_CODE <= KERNEL_VERSION(4,0,0)
-	ch->v4l_device->parent = &dev->pci->dev;
-#else
-	ch->vdev.dev_parent = &dev->pci->dev;
-#endif
-	strscpy(ch->vdev.name, "sc0710 video", sizeof(ch->vdev.name));
-
 	/* The EDID source selector works on both supported boards: the MK2 MCU
 	 * speaks the same fn-call protocol with the same ack signatures,
 	 * verified on real hardware (see the MK2 notes in sc0710-i2c.c). */
@@ -2343,35 +2515,59 @@ int sc0710_video_register(struct sc0710_dma_channel *ch)
 			v4l2_ctrl_handler_free(&dev->ctrl_handler);
 			return err;
 		}
-		ch->vdev.ctrl_handler = &dev->ctrl_handler;
-	}
-	/* EDID: the 4K Pro reads/writes its EEPROM directly; the MK2 reads the
-	 * MCU-served internal image (ReadEDID protocol, all on the safe 0x33
-	 * port) and gets S_EDID too. Both supported boards get G_EDID and
-	 * S_EDID; other boards get neither. */
-	if (dev->board != SC0710_BOARD_ELGATEO_4KP &&
-	    dev->board != SC0710_BOARD_ELGATEO_4KP60_MK2) {
-		v4l2_disable_ioctl(&ch->vdev, VIDIOC_G_EDID);
-		v4l2_disable_ioctl(&ch->vdev, VIDIOC_S_EDID);
 	}
 
-	video_set_drvdata(&ch->vdev, ch);
+	for (input = 0; input < inputs; input++) {
+		struct sc0710_video_node *node = &ch->vnode[input];
+		struct video_device *vdev = &node->vdev;
 
-	err = video_register_device(&ch->vdev,
+		node->ch = ch;
+		node->input = input;
+		memcpy(vdev, &sc0710_video_template, sizeof(*vdev));
+		vdev->lock = &ch->v4l2_lock;
+		vdev->release = video_device_release_empty;
+		vdev->vfl_dir = VFL_DIR_RX;
+		vdev->queue = q;
+		vdev->device_caps = V4L2_CAP_STREAMING | V4L2_CAP_READWRITE |
+			V4L2_CAP_VIDEO_CAPTURE;
+		vdev->v4l2_dev = &dev->v4l2_dev;
+		vdev->dev_parent = &dev->pci->dev;
+		if (inputs > 1)
+			snprintf(vdev->name, sizeof(vdev->name),
+				"sc0710 HDMI-%u", input + 1);
+		else
+			strscpy(vdev->name, "sc0710 video", sizeof(vdev->name));
+
+		if (dev->board == SC0710_BOARD_ELGATEO_4KP ||
+		    dev->board == SC0710_BOARD_ELGATEO_4KP60_MK2)
+			vdev->ctrl_handler = &dev->ctrl_handler;
+
+		/* Cam Link Pro EDID routing is not mapped per input yet. */
+		if (dev->board != SC0710_BOARD_ELGATEO_4KP &&
+		    dev->board != SC0710_BOARD_ELGATEO_4KP60_MK2) {
+			v4l2_disable_ioctl(vdev, VIDIOC_G_EDID);
+			v4l2_disable_ioctl(vdev, VIDIOC_S_EDID);
+		}
+
+		video_set_drvdata(vdev, node);
+		err = video_register_device(vdev,
 #if LINUX_VERSION_CODE <= KERNEL_VERSION(4,0,0)
-		VFL_TYPE_GRABBER,
+			VFL_TYPE_GRABBER,
 #else
-		VFL_TYPE_VIDEO,
+			VFL_TYPE_VIDEO,
 #endif
-		-1);
-	if (err < 0) {
-		printk(KERN_INFO "%s: can't register video device\n", dev->name);
-		return -EIO;
-	}
+			-1);
+		if (err < 0) {
+			printk(KERN_INFO "%s: can't register HDMI input %d video device\n",
+				dev->name, input + 1);
+			sc0710_video_unregister(ch);
+			return -EIO;
+		}
 
-	if (sc0710_debug_mode)
-		printk(KERN_INFO "%s: registered device %s [v4l2]\n",
-	       dev->name, video_device_node_name(&ch->vdev));
+		if (sc0710_debug_mode)
+			printk(KERN_INFO "%s: registered HDMI input %d as %s [v4l2]\n",
+				dev->name, input + 1, video_device_node_name(vdev));
+	}
 
 	return 0; /* Success */
 }

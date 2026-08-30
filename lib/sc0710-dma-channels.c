@@ -180,10 +180,9 @@ int sc0710_dma_channels_start(struct sc0710_dev *dev)
 /* Align the running DMA engines with who actually wants them:
  *  - video: a V4L2 client is streaming (streaming_refcount > 0) and a signal
  *    is present (dev->fmt).
- *  - audio: an ALSA client holds the session (audio_users > 0, only ever taken
- *    while keep_audio_alive is set), or the video session is up. The second
- *    term is what makes the default path identical to the old
- *    channels_start/channels_stop coupling.
+ *  - audio: an ALSA client holds the session (audio_users > 0; always for
+ *    Cam Link Pro, opt-in with keep_audio_alive on older cards), or the video
+ *    session is up. The second term preserves the older cards' coupled path.
  * Either user keeps the shared FPGA GO bit asserted. Caller holds
  * kthread_dma_lock; may sleep (start_prep).
  */

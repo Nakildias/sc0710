@@ -540,15 +540,19 @@ static enum sc0710_eotf_e sc0710_eotf_from_hdmi(u8 hint_flags,
 	return EOTF_SDR;
 }
 
+static void __sc0710_i2c_apply_4k_mode_locked(struct sc0710_dev *dev,
+	bool force_clear);
+
 /* Cam Link Pro: the MCU keeps one status block per HDMI input in a flat
  * buffer, 0x3C bytes apart (found by scanning the subaddress space with a
  * camera on HDMI-3: input i's block sits at subaddress i * 0x3C, same
  * field layout as the MK.2's single block, plus what look like the procamp
- * defaults at block offset 0x13). Until the driver grows four video nodes,
- * this picks which input the single pipeline watches. */
+ * defaults at block offset 0x13). The shared FPGA geometry follows the
+ * largest active input; hdmi_input is only the idle/preferred fallback. */
 unsigned int sc0710_hdmi_input;
 module_param_named(hdmi_input, sc0710_hdmi_input, int, 0644);
-MODULE_PARM_DESC(hdmi_input, "Cam Link Pro: HDMI input to capture, 0-3 (default 0 = HDMI-1)");
+MODULE_PARM_DESC(hdmi_input,
+	"Cam Link Pro diagnostic: preferred pipeline timing source while idle, 0-3 (default HDMI-1)");
 
 int sc0710_i2c_read_hdmi_status(struct sc0710_dev *dev)
 {
@@ -563,29 +567,146 @@ int sc0710_i2c_read_hdmi_status(struct sc0710_dev *dev)
 	int raw_locked;
 	int refresh_only_change = 0;
 	u32 new_pixelLineH = 0, new_pixelLineV = 0;
+	u8 clp_status[SC0710_CLP_INPUTS][0x14] = {{ 0 }};
+	bool clp_valid[SC0710_CLP_INPUTS] = { false };
+	u8 clp_change_mask = 0;
+	int clp_master = sc0710_hdmi_input & 3;
 
 	/* We're going to update dev->fmt and other shared state, so take the lock early 
        Use trylock or lock - check precedent. core.c calls this with kthread_hdmi_lock held,
        but dev->signalMutex protects the fmt.
     */
-	if (dev->board == SC0710_BOARD_ELGATO_CAMLINK_PRO)
-		wbuf[0] = (sc0710_hdmi_input & 3) * 0x3c;
-
 	mutex_lock(&dev->signalMutex);
 
 	/* Remember previous lock state to detect signal restoration */
 	was_locked = dev->locked;
 
-	for (attempt = 0; attempt < SC0710_I2C_HDMI_RETRIES; attempt++) {
-		ret = __sc0710_i2c_writeread(dev, I2C_DEV__ARM_MCU,
+	if (dev->board == SC0710_BOARD_ELGATO_CAMLINK_PRO) {
+		int input;
+
+		ret = -EIO;
+		for (input = 0; input < SC0710_CLP_INPUTS; input++) {
+			struct sc0710_clp_input_status *status = &dev->clp_input[input];
+			struct sc0710_clp_input_status old_status = *status;
+			u8 *s = clp_status[input];
+			int timing_present;
+			bool raw_input_locked;
+
+			wbuf[0] = input * 0x3c;
+			for (attempt = 0; attempt < SC0710_I2C_HDMI_RETRIES; attempt++) {
+				ret = __sc0710_i2c_writeread(dev, I2C_DEV__ARM_MCU,
+					&wbuf[0], sizeof(wbuf), s, sizeof(clp_status[input]));
+				if (ret == 0)
+					break;
+				if (attempt + 1 < SC0710_I2C_HDMI_RETRIES)
+					usleep_range(SC0710_I2C_HDMI_RETRY_DELAY_US,
+						SC0710_I2C_HDMI_RETRY_DELAY_US + 5000);
+			}
+			if (ret < 0)
+				continue;
+
+			clp_valid[input] = true;
+			timing_present = s[4] | s[5] | s[6] | s[7];
+			raw_input_locked = s[8] != 0;
+
+			/* The MCU occasionally returns an all-zero block for one poll.
+			 * Give every port the same dropout and unplug debounce as the
+			 * original single-input state machine so one bad poll does not
+			 * flash a placeholder or make an application renegotiate. */
+			if (raw_input_locked) {
+				status->locked = 1;
+				status->cable_connected = 1;
+				status->lock_dropout_count = 0;
+				status->unlocked_no_timing_count = 0;
+				status->pixelLineV = s[5] << 8 | s[4];
+				status->pixelLineH = s[7] << 8 | s[6];
+				status->height = s[9] << 8 | s[8];
+				status->width = s[11] << 8 | s[10];
+				status->interlaced = s[13] & 1;
+				if (status->interlaced)
+					status->height *= 2;
+				status->rate = s[12];
+				status->hint_flags = s[13];
+			} else if (status->locked &&
+				   status->lock_dropout_count < SC0710_LOCK_DROPOUT_MAX) {
+				status->lock_dropout_count++;
+			} else {
+				status->locked = 0;
+				status->lock_dropout_count = 0;
+				if (timing_present) {
+					status->cable_connected = 1;
+					status->unlocked_no_timing_count = 0;
+				} else if (++status->unlocked_no_timing_count >=
+					   SC0710_NO_TIMING_THRESHOLD) {
+					status->cable_connected = 0;
+					status->unlocked_no_timing_count =
+						SC0710_NO_TIMING_THRESHOLD;
+				}
+			}
+			if (old_status.locked != status->locked ||
+			    old_status.cable_connected != status->cable_connected ||
+			    old_status.pixelLineH != status->pixelLineH ||
+			    old_status.pixelLineV != status->pixelLineV ||
+			    old_status.width != status->width ||
+			    old_status.height != status->height ||
+			    old_status.interlaced != status->interlaced ||
+			    old_status.rate != status->rate)
+				clp_change_mask |= BIT(input);
+		}
+		if (clp_change_mask)
+			sc0710_video_notify_source_change_mask(dev, clp_change_mask);
+		if (clp_change_mask)
+			__sc0710_i2c_apply_4k_mode_locked(dev, false);
+
+		/* The FPGA pipeline geometry is shared. Drive it from the largest
+		 * locked input that actually has a consumer. This preserves native
+		 * 4K when HDMI-1 is active beside one or more 1080p inputs. Fall back
+		 * to the requested port, then any locked port, while idle. */
+		if (dev->clp_active_mask) {
+			u32 best_area = 0;
+
+			for (input = 0; input < SC0710_CLP_INPUTS; input++) {
+				u32 area;
+
+				if (!(dev->clp_active_mask & BIT(input)) ||
+				    !clp_valid[input] || !dev->clp_input[input].locked)
+					continue;
+				area = dev->clp_input[input].width *
+					dev->clp_input[input].height;
+				if (area > best_area) {
+					best_area = area;
+					clp_master = input;
+				}
+			}
+		}
+		if (!clp_valid[clp_master] || !dev->clp_input[clp_master].locked) {
+			clp_master = sc0710_hdmi_input & 3;
+			if (!clp_valid[clp_master] || !dev->clp_input[clp_master].locked)
+				for (input = 0; input < SC0710_CLP_INPUTS; input++)
+					if (clp_valid[input] && dev->clp_input[input].locked) {
+						clp_master = input;
+						break;
+					}
+		}
+		if (!clp_valid[clp_master]) {
+			ret = -EIO;
+		} else {
+			memcpy(rbuf, clp_status[clp_master], sizeof(rbuf));
+			dev->clp_master_input = clp_master;
+			ret = 0;
+		}
+	} else {
+		for (attempt = 0; attempt < SC0710_I2C_HDMI_RETRIES; attempt++) {
+			ret = __sc0710_i2c_writeread(dev, I2C_DEV__ARM_MCU,
 					     &wbuf[0], sizeof(wbuf),
 					     &rbuf[0], sizeof(rbuf));
-		if (ret == 0)
-			break;
+			if (ret == 0)
+				break;
 
-		if (attempt + 1 < SC0710_I2C_HDMI_RETRIES)
-			usleep_range(SC0710_I2C_HDMI_RETRY_DELAY_US,
-				     SC0710_I2C_HDMI_RETRY_DELAY_US + 5000);
+			if (attempt + 1 < SC0710_I2C_HDMI_RETRIES)
+				usleep_range(SC0710_I2C_HDMI_RETRY_DELAY_US,
+					     SC0710_I2C_HDMI_RETRY_DELAY_US + 5000);
+		}
 	}
 
 	if (ret < 0) {
@@ -1032,7 +1153,11 @@ confirmed_timing_change:
 		}
 	}
 
-	sc0710_video_notify_source_change(dev);
+	if (dev->board == SC0710_BOARD_ELGATO_CAMLINK_PRO)
+		sc0710_video_notify_source_change_mask(dev,
+			BIT(dev->clp_master_input));
+	else
+		sc0710_video_notify_source_change(dev);
 
 	return 0;
 }
@@ -1043,15 +1168,11 @@ confirmed_timing_change:
  * input, subaddress 0x3b + input, choosing between two constants by
  * whether that input's slot in the device extension is non-zero:
  *
- *   sub 0x3b + i = (input i is the one being captured) ? 0x10 : 0x01
+ *   sub 0x3b + i = (input i has a consumer) ? 0x10 : 0x01
  *
- * The exact meaning is still unverified. Writing these values did not switch
- * the single-input payload on its own, so keep the experiment opt-in until a
- * second live source can show whether they enable a multiplexed input stream.
- * This uses the MCU's volatile runtime register port and never touches flash.
- *
- * Triggered one-shot from the HDMI poll thread, which already holds the
- * locks that serialise MCU access, so it cannot race the status poll.
+ * Windows writes the four values from its four active capture-pin fields.
+ * Linux mirrors that with the logical V4L2 and ALSA consumers. This uses the
+ * MCU's volatile runtime register port and never touches flash.
  */
 unsigned int sc400_input_regs;
 module_param(sc400_input_regs, uint, 0644);
@@ -1075,19 +1196,88 @@ MODULE_PARM_DESC(sc400_input_off,
 
 void sc0710_i2c_set_input_path(struct sc0710_dev *dev)
 {
+	u8 mask = BIT(sc0710_hdmi_input & 3);
+
+	dev->clp_active_mask = 0;
+	/* Preserve the bring-up trigger as a one-input manual override. */
+	{
+		u8 devaddr = (u8)((sc400_input_dev & 0x7f) << 1);
+		int i, ret;
+
+		mutex_lock(&dev->signalMutex);
+		for (i = 0; i < SC0710_CLP_INPUTS; i++) {
+			u8 wbuf[2] = { (u8)(0x3b + i),
+				(u8)((mask & BIT(i)) ? sc400_input_on : sc400_input_off) };
+
+			ret = sc0710_i2c_write(dev, devaddr, wbuf, sizeof(wbuf));
+			printk(KERN_INFO "%s: input path: dev 0x%02x sub 0x%02x = 0x%02x (%d)\n",
+				dev->name, sc400_input_dev, wbuf[0], wbuf[1], ret);
+			msleep(2);
+		}
+		mutex_unlock(&dev->signalMutex);
+		dev->clp_active_mask = mask;
+	}
+}
+
+void sc0710_i2c_sync_input_paths(struct sc0710_dev *dev)
+{
+	struct sc0710_dma_channel *video = &dev->channel[0];
+	struct sc0710_dma_channel *audio = &dev->channel[1];
+	struct sc0710_client *client;
+	unsigned long flags;
 	u8 devaddr = (u8)((sc400_input_dev & 0x7f) << 1);
-	int active = sc0710_hdmi_input & 3;
+	u8 mask = 0;
+	u8 changed_mask;
+	bool failed = false;
 	int i, ret;
 
-	for (i = 0; i < 4; i++) {
+	if (dev->board != SC0710_BOARD_ELGATO_CAMLINK_PRO)
+		return;
+
+	spin_lock_irqsave(&video->client_list_lock, flags);
+	list_for_each_entry(client, &video->client_list, list)
+		if (client->streaming && client->input < SC0710_CLP_INPUTS)
+			mask |= BIT(client->input);
+	spin_unlock_irqrestore(&video->client_list_lock, flags);
+
+	for (i = 0; i < SC0710_CLP_INPUTS; i++)
+		if (audio->audio_dev[i] &&
+		    (READ_ONCE(audio->audio_dev[i]->running) ||
+		     atomic_read(&audio->audio_dev[i]->dma_want)))
+			mask |= BIT(i);
+
+	if (mask == dev->clp_active_mask)
+		return;
+	changed_mask = mask ^ dev->clp_active_mask;
+
+	mutex_lock(&dev->signalMutex);
+	for (i = 0; i < SC0710_CLP_INPUTS; i++) {
 		u8 wbuf[2] = { (u8)(0x3b + i),
-			       (u8)(i == active ? sc400_input_on
-						: sc400_input_off) };
+			       (u8)((mask & BIT(i)) ? sc400_input_on
+						       : sc400_input_off) };
+
+		/* The four registers are independent. Only write paths whose
+		 * consumer state changed, keeping the polling DMA service out of
+		 * this sleeping I2C section for as little time as possible. */
+		if (!(changed_mask & BIT(i)))
+			continue;
 
 		ret = sc0710_i2c_write(dev, devaddr, wbuf, sizeof(wbuf));
-		printk(KERN_INFO "%s: input path: dev 0x%02x sub 0x%02x = 0x%02x (%d)\n",
-			dev->name, sc400_input_dev, wbuf[0], wbuf[1], ret);
+		if (ret < 0) {
+			failed = true;
+			printk(KERN_WARNING "%s: HDMI-%d path update failed (%d)\n",
+				dev->name, i + 1, ret);
+		}
 		msleep(2);
+	}
+	mutex_unlock(&dev->signalMutex);
+	if (!failed) {
+		dev->clp_active_mask = mask;
+		printk(KERN_INFO "%s: Cam Link Pro active input mask 0x%x\n",
+			dev->name, mask);
+		/* The 4K MCU bits are per input too. Recompute them whenever the
+		 * consumer mask changes, including an HDMI-3-only session. */
+		sc0710_i2c_apply_4k_mode(dev);
 	}
 }
 
@@ -1113,63 +1303,57 @@ module_param_named(clp_4k_switch, clp_4k_switch, int, 0644);
 MODULE_PARM_DESC(clp_4k_switch,
 	"Cam Link Pro diagnostic: 1 = reapply automatic MCU 4K bit, 2 = force clear once");
 
-void sc0710_i2c_apply_4k_mode(struct sc0710_dev *dev)
+static void __sc0710_i2c_apply_4k_mode_locked(struct sc0710_dev *dev,
+	bool force_clear)
 {
-	int active = sc0710_hdmi_input & 3;
-	int bit, want, changed = 0;
+	u8 want_bits = 0;
+	int changed = 0;
 	u8 wbuf[2] = { 0x03, 0 };
 	u8 rbuf[1] = { 0 };
 	int ret;
 
-	if (dev->board != SC0710_BOARD_ELGATO_CAMLINK_PRO)
-		return;
-
-	/* The vendor maps input index 0 -> bit 0, index 2 -> bit 1. Other
-	 * inputs have no documented 4K bit; refuse rather than guess. */
-	if (active == 0)
-		bit = 0x01;
-	else if (active == 2)
-		bit = 0x02;
-	else {
-		printk(KERN_WARNING "%s: 4K switch only known for HDMI input 1/3 (active=%d); ignoring\n",
-			dev->name, active);
-		return;
+	/* The vendor maps HDMI-1 to bit 0 and HDMI-3 to bit 1. Their bits
+	 * follow the matching active capture pins independently. HDMI-2/4
+	 * have no documented 4K bit, so leave unrelated MCU bits untouched. */
+	if (!force_clear) {
+		if ((dev->clp_active_mask & BIT(0)) && dev->clp_input[0].locked &&
+		    dev->clp_input[0].width >= SC0710_CLP_WIDTH &&
+		    dev->clp_input[0].height >= SC0710_CLP_HEIGHT)
+			want_bits |= BIT(0);
+		if ((dev->clp_active_mask & BIT(2)) && dev->clp_input[2].locked &&
+		    dev->clp_input[2].width >= SC0710_CLP_WIDTH &&
+		    dev->clp_input[2].height >= SC0710_CLP_HEIGHT)
+			want_bits |= BIT(1);
 	}
-
-	if (clp_4k_switch == 2) {
-		want = 0; /* force disable */
-	} else {
-		/* Enable only when the detected source really is >= 4K, the
-		 * same geometry gate the Windows driver applies. */
-		want = sc0710_clp_native_4k(dev);
-	}
-
-	mutex_lock(&dev->signalMutex);
 	ret = __sc0710_i2c_writeread(dev, I2C_DEV__ARM_MCU, wbuf, 1, rbuf, 1);
 	if (ret < 0) {
-		mutex_unlock(&dev->signalMutex);
 		printk(KERN_WARNING "%s: 4K switch: read of MCU sub 0x03 failed (%d)\n",
 			dev->name, ret);
 		return;
 	}
 
 	wbuf[0] = 0x03;
-	if (want)
-		wbuf[1] = rbuf[0] | (u8)bit;
-	else
-		wbuf[1] = rbuf[0] & (u8)~bit;
+	wbuf[1] = (rbuf[0] & (u8)~0x03) | want_bits;
 	changed = (wbuf[1] != rbuf[0]);
 
 	if (changed) {
 		ret = sc0710_i2c_write(dev, I2C_DEV__ARM_MCU, wbuf, 2);
-		printk(KERN_INFO "%s: 4K switch: MCU 0x03 0x%02x -> 0x%02x (bit 0x%02x %s, input %d, %ux%u) ret=%d\n",
-			dev->name, rbuf[0], wbuf[1], bit,
-			want ? "set" : "clear", active + 1,
-			dev->width, dev->height, ret);
+		printk(KERN_INFO "%s: 4K switch: MCU 0x03 0x%02x -> 0x%02x (active 4K bits 0x%02x) ret=%d\n",
+			dev->name, rbuf[0], wbuf[1], want_bits, ret);
 	} else {
-		printk(KERN_INFO "%s: 4K switch: MCU 0x03 already 0x%02x (bit 0x%02x %s); no change\n",
-			dev->name, rbuf[0], bit, want ? "set" : "clear");
+		if (sc0710_debug_mode)
+			printk(KERN_INFO "%s: 4K switch: MCU 0x03 already 0x%02x\n",
+				dev->name, rbuf[0]);
 	}
+}
+
+void sc0710_i2c_apply_4k_mode(struct sc0710_dev *dev)
+{
+	if (dev->board != SC0710_BOARD_ELGATO_CAMLINK_PRO)
+		return;
+
+	mutex_lock(&dev->signalMutex);
+	__sc0710_i2c_apply_4k_mode_locked(dev, clp_4k_switch == 2);
 	mutex_unlock(&dev->signalMutex);
 }
 

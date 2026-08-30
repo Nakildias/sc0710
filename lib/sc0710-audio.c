@@ -154,7 +154,7 @@ static void sc0710_audio_dma_work_fn(struct work_struct *work)
 	struct sc0710_audio_dev *chip =
 		container_of(work, struct sc0710_audio_dev, dma_work);
 	struct sc0710_dev *dev = chip->dev;
-	int want = atomic_read(&chip->dma_want);
+	int want;
 
 	if (READ_ONCE(dev->disconnected))
 		return;
@@ -164,8 +164,16 @@ static void sc0710_audio_dma_work_fn(struct work_struct *work)
 		mutex_unlock(&dev->kthread_dma_lock);
 		return;
 	}
+	want = atomic_read(&chip->dma_want);
 
-	atomic_set(&dev->audio_users, want ? 1 : 0);
+	if (want && !chip->dma_held) {
+		atomic_inc(&dev->audio_users);
+		chip->dma_held = true;
+	} else if (!want && chip->dma_held) {
+		atomic_dec(&dev->audio_users);
+		chip->dma_held = false;
+	}
+	sc0710_i2c_sync_input_paths(dev);
 	if (sc0710_dma_sync_session(dev) < 0 && want)
 		printk_ratelimited(KERN_WARNING
 			"%s: failed to start audio DMA session for ALSA\n",
@@ -195,16 +203,21 @@ static void sc0710_audio_release_dma(struct sc0710_audio_dev *chip)
 	atomic_set(&chip->dma_want, 0);
 	sc0710_audio_stop_dma_work(chip);
 
-	if (!atomic_read(&dev->audio_users))
+	if (!chip->dma_held)
 		return;
 
 	if (READ_ONCE(dev->disconnected)) {
-		atomic_set(&dev->audio_users, 0);
+		atomic_dec_if_positive(&dev->audio_users);
+		chip->dma_held = false;
 		return;
 	}
 
 	mutex_lock(&dev->kthread_dma_lock);
-	atomic_set(&dev->audio_users, 0);
+	if (chip->dma_held) {
+		atomic_dec_if_positive(&dev->audio_users);
+		chip->dma_held = false;
+	}
+	sc0710_i2c_sync_input_paths(dev);
 	if (!READ_ONCE(dev->disconnected))
 		sc0710_dma_sync_session(dev);
 	mutex_unlock(&dev->kthread_dma_lock);
@@ -216,8 +229,9 @@ static void sc0710_audio_init_dma_work(struct sc0710_audio_dev *chip)
 	atomic_set(&chip->dma_want, 0);
 }
 
-int sc0710_audio_deliver_samples(struct sc0710_dev *dev, struct sc0710_dma_channel *ch,
-	const u8 *buf, int bitdepth, int strideBytes, int channels, int samplesPerChannel)
+int sc0710_audio_deliver_samples(struct sc0710_dev *dev,
+	struct sc0710_dma_channel *ch, u8 input, const u8 *buf, int bitdepth,
+	int strideBytes, int channels, int samplesPerChannel)
 {
 	struct sc0710_audio_dev *chip;
 	struct snd_pcm_substream *substream;
@@ -226,7 +240,9 @@ int sc0710_audio_deliver_samples(struct sc0710_dev *dev, struct sc0710_dma_chann
 	if (channels != 2 || bitdepth != 16 || samplesPerChannel <= 0)
 		return -1;
 
-	chip = ch->audio_dev;
+	if (input >= SC0710_CLP_INPUTS)
+		return -1;
+	chip = ch->audio_dev[input];
 	if (!chip)
 		return -1;
 
@@ -401,11 +417,11 @@ static int snd_sc0710_capture_trigger(struct snd_pcm_substream *substream, int c
 		chip->running = true;
 		mod_delayed_work(system_wq, &chip->silence_work,
 				 msecs_to_jiffies(SC0710_AUDIO_GAP_MS));
-		/* keep_audio_alive: take the DMA hold so the audio session
-		 * survives with no V4L2 client. Read once here so flipping the
-		 * param mid-stream can't leave a hold nobody drops - it takes
-		 * effect on the next PCM start. */
-		if (keep_audio_alive) {
+		/* Cam Link Pro exposes four standalone audio inputs, so ALSA must
+		 * work without a matching V4L2 stream. Older cards retain their
+		 * opt-in keep_audio_alive policy. */
+		if (keep_audio_alive ||
+		    dev->board == SC0710_BOARD_ELGATO_CAMLINK_PRO) {
 			atomic_set(&chip->dma_want, 1);
 			schedule_work(&chip->dma_work);
 		}
@@ -478,24 +494,26 @@ static void sc0710_audio_private_free(struct snd_card *card)
 void sc0710_audio_unregister(struct sc0710_dev *dev)
 {
 	struct sc0710_dma_channel *channel = &dev->channel[1];
-	struct sc0710_audio_dev *chip = channel->audio_dev;
+	int input;
 
 	dprintk(1, "%s()\n", __func__);
-	dprintk(0, "Unregistered ALSA audio device %p\n", chip);
 
-	/* Normal when audio registration failed or never ran. */
-	if (!chip)
-		return;
+	for (input = 0; input < SC0710_CLP_INPUTS; input++) {
+		struct sc0710_audio_dev *chip = channel->audio_dev[input];
 
-	sc0710_audio_stop_silence(chip);
-	/* Release any ALSA DMA hold and sync-cancel dma_work before the card
-	 * goes away: the work dereferences chip->dev. */
-	sc0710_audio_release_dma(chip);
-	/* Disconnects immediately (open PCM/ctl handles start erroring) and
-	 * defers the card free to the last close, so a handle held open across
-	 * remove - PipeWire keeps one persistently - neither blocks remove nor
-	 * outlives the card. */
-	snd_card_free_when_closed(chip->card);
+		if (!chip)
+			continue;
+		channel->audio_dev[input] = NULL;
+		dprintk(0, "Unregistered ALSA audio input %d device %p\n",
+			input + 1, chip);
+		sc0710_audio_stop_silence(chip);
+		/* Release any ALSA DMA hold and sync-cancel dma_work before the
+		 * card goes away: the work dereferences chip->dev. */
+		sc0710_audio_release_dma(chip);
+		/* Disconnect immediately and defer the final free to the last
+		 * close, since PipeWire may hold a PCM or control handle. */
+		snd_card_free_when_closed(chip->card);
+	}
 }
 
 /*
@@ -518,7 +536,7 @@ static int snd_sc0710_pcm(struct sc0710_audio_dev *chip, int device, char *name)
 	return 0;
 }
 
-int sc0710_audio_register(struct sc0710_dev *dev)
+static int sc0710_audio_register_one(struct sc0710_dev *dev, u8 input)
 {
 	struct snd_card *card;
 	struct sc0710_audio_dev *chip;
@@ -528,6 +546,7 @@ int sc0710_audio_register(struct sc0710_dev *dev)
 	 * video input.
 	 */
 	struct sc0710_dma_channel *channel = &dev->channel[1];
+	char pcm_name[32];
 	int err;
 
 	err = snd_card_new(&dev->pci->dev, SNDRV_DEFAULT_IDX1, SNDRV_DEFAULT_STR1,
@@ -543,6 +562,8 @@ int sc0710_audio_register(struct sc0710_dev *dev)
 	chip->dev = dev;
 	chip->buffer_ptr = 0;
 	chip->running = false;
+	chip->input = input;
+	chip->dma_held = false;
 	sc0710_audio_init_silence_work(chip);
 	sc0710_audio_init_dma_work(chip);
 
@@ -552,7 +573,11 @@ int sc0710_audio_register(struct sc0710_dev *dev)
 	v4l2_device_get(&dev->v4l2_dev);
 	card->private_free = sc0710_audio_private_free;
 
-	err = snd_sc0710_pcm(chip, 0, "HDMI Capture");
+	if (dev->board == SC0710_BOARD_ELGATO_CAMLINK_PRO)
+		snprintf(pcm_name, sizeof(pcm_name), "HDMI-%u Capture", input + 1);
+	else
+		strscpy(pcm_name, "HDMI Capture", sizeof(pcm_name));
+	err = snd_sc0710_pcm(chip, 0, pcm_name);
 	if (err < 0)
 		goto error;
 
@@ -564,7 +589,12 @@ int sc0710_audio_register(struct sc0710_dev *dev)
 	 * card id (hw:CARD=sc0710) is derived from, so device identifiers and
 	 * the PCI-path-based PipeWire node names are unchanged. */
 	strcpy(card->driver, "sc0710");
-	strscpy(card->shortname, sc0710_audio_card_name(dev), sizeof(card->shortname));
+	if (dev->board == SC0710_BOARD_ELGATO_CAMLINK_PRO)
+		snprintf(card->shortname, sizeof(card->shortname), "%s HDMI-%u",
+			sc0710_audio_card_name(dev), input + 1);
+	else
+		strscpy(card->shortname, sc0710_audio_card_name(dev),
+			sizeof(card->shortname));
 	snprintf(card->longname, sizeof(card->longname), "%s at %s",
 		 card->shortname, dev->name);
 	strscpy(card->mixername, card->shortname, sizeof(card->mixername));
@@ -573,13 +603,12 @@ int sc0710_audio_register(struct sc0710_dev *dev)
 	if (err < 0)
 		goto error;
 
-	channel->audio_dev = chip;
-	dev->channel[1].audio_dev = chip;
+	channel->audio_dev[input] = chip;
 
 	snd_card_set_dev(card, &dev->pci->dev);
 
 	dprintk(1, "Registered ALSA audio device %p card %p\n",
-		channel->audio_dev, channel->audio_dev->card);
+		channel->audio_dev[input], channel->audio_dev[input]->card);
 	return 0;
 
 error:
@@ -588,4 +617,20 @@ error:
 	       "audio adapter (%d)\n", __func__, err);
 
 	return err;
+}
+
+int sc0710_audio_register(struct sc0710_dev *dev)
+{
+	int inputs = dev->board == SC0710_BOARD_ELGATO_CAMLINK_PRO ?
+		SC0710_CLP_INPUTS : 1;
+	int input, err;
+
+	for (input = 0; input < inputs; input++) {
+		err = sc0710_audio_register_one(dev, input);
+		if (err < 0) {
+			sc0710_audio_unregister(dev);
+			return err;
+		}
+	}
+	return 0;
 }
