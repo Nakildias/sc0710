@@ -121,6 +121,11 @@ extern unsigned int keep_audio_alive;
 #define SC0710_MAXBOARDS 8
 
 #define VBUF_TIMEOUT (HZ)
+/* Placeholder cadence for clients that are not receiving live frames. OBS
+ * gives up on a device after 48 frame periods (800 ms at 60 fps, 400 ms at
+ * 120 fps) and restarts the stream, which at the old 1 Hz cadence became an
+ * endless reset loop while no signal was present. */
+#define VBUF_PLACEHOLDER_INTERVAL (HZ / 4)
 
 /* Max number of inputs by card */
 #define MAX_SC0710_INPUT 8
@@ -130,6 +135,27 @@ extern unsigned int keep_audio_alive;
 #define SC0710_BOARD_UNKNOWN             0
 #define SC0710_BOARD_ELGATEO_4KP60_MK2   1
 #define SC0710_BOARD_ELGATEO_4KP         2
+#define SC0710_BOARD_ELGATO_CAMLINK_PRO  3
+#define SC0710_CLP_INPUTS                 4
+
+/* Cam Link Pro source and delivery geometry, mapped on real hardware.
+ * With BAR0 0xD0 bit 0x80 set, a 4K input is native 3840x2160 NV12 on the
+ * wire. Each line is [8-byte header][3840 pixels][8-byte 0xff pad]. The old
+ * selector remains as a fallback for smaller inputs and emits the same
+ * headers around a horizontally scaled 1920x2160 picture. */
+#define SC0710_CLP_SRC_WIDTH     3840
+#define SC0710_CLP_LEGACY_WIDTH  1920
+#define SC0710_CLP_SRC_HEIGHT    2160  /* luma lines per picture */
+#define SC0710_CLP_SRC_UV_HEIGHT 1080  /* chroma lines per picture */
+#define SC0710_CLP_WIDTH         3840
+#define SC0710_CLP_HEIGHT        2160
+#define SC0710_CLP_HD_WIDTH      1920
+#define SC0710_CLP_HD_HEIGHT     1080
+#define SC0710_CLP_CHUNK         3856  /* maximum/native chunk size */
+#define SC0710_CLP_LEGACY_CHUNK  1936
+/* What userspace gets: packed NV12, 3840x2160 or 1920x1080. */
+#define SC0710_CLP_SIZEIMAGE    (SC0710_CLP_WIDTH * SC0710_CLP_HEIGHT * 3 / 2)
+#define SC0710_CLP_HD_SIZEIMAGE (SC0710_CLP_HD_WIDTH * SC0710_CLP_HD_HEIGHT * 3 / 2)
 
 enum sc0710_timing_mode {
 	TIMING_MODE_MERGE = 0,           /* Use static match + dynamic fallback */
@@ -270,6 +296,63 @@ struct sc0710_dma_descriptor_chain
 	u32 wbm_phase;
 };
 
+/* Cam Link Pro conveyor transport (the vendor architecture): a circular
+ * ring of many small always-armed descriptors the engine can never starve,
+ * never rewritten while running, with the frame boundaries recovered in
+ * software by the framer. ndesc == 0 means no ring is built (other boards
+ * use the whole-frame chains). */
+#define SC0710_CLP_CONVEYOR_MAX_BLOCKS 32
+struct sc0710_clp_conveyor
+{
+	u32         ndesc;          /* descriptors in the ring; 0 = off */
+	u32         seg;            /* payload bytes per descriptor */
+	u32         segs_per_block; /* uniform carve of the blocks below */
+	u32         nblocks;
+	struct {
+		u8         *cpu;
+		dma_addr_t  dma;
+		u32         size;
+	} block[SC0710_CLP_CONVEYOR_MAX_BLOCKS];
+
+	u64         consumed;       /* descriptors consumed since engine start */
+	u64         stream_bytes;   /* payload bytes consumed since engine start */
+
+	/* Header framer. Each chunk is
+	 * [8-byte header][1920 or 3840 pixel bytes][8-byte pad], the header being
+	 * ff ff ff 00, a little-endian line counter << 3, 00, and a type tag
+	 * (0x4f = luma, 0x6f = chroma). Line counters run 1..2160 (luma) /
+	 * 1..1080 (chroma) and restart at every picture, so the stream is
+	 * self-describing. Native 4K is delivered directly; the old 1920-wide
+	 * fallback is horizontally interpolated. Losing bytes costs exactly the
+	 * lines they carried. Sync recovery is a header scan. */
+	u8         *frame[SC0710_CLP_INPUTS]; /* per-input source Y then UV */
+	u8         *out[SC0710_CLP_INPUTS];   /* per-input delivered 4K NV12 */
+	u8         *alt[SC0710_CLP_INPUTS];   /* same picture at the other size,
+						 * for clients that have not
+						 * renegotiated; lazily allocated */
+	u8          chunk[SC0710_CLP_CHUNK]; /* chunk spanning segments */
+	u32         source_width;   /* 3840 native or 1920 fallback */
+	u32         chunk_size;     /* source_width + header + fixed pad */
+	u32         chunk_fill;
+	bool        synced;         /* chunk grid locked to the stream */
+	u32         lines_placed[SC0710_CLP_INPUTS]; /* luma lines per picture */
+
+	/* Counters (surfaced in /proc/sc0710) */
+	u64         pictures[SC0710_CLP_INPUTS];       /* pictures delivered */
+	u64         pictures_short[SC0710_CLP_INPUTS]; /* incomplete pictures */
+	u64         stale_lines[SC0710_CLP_INPUTS];    /* missing luma lines */
+	u64         chunks[SC0710_CLP_INPUTS];         /* valid chunks seen */
+	unsigned long last_picture_jiffies[SC0710_CLP_INPUTS];
+	u64         resyncs;        /* header scans after a lost chunk grid */
+	u64         pad_errors;     /* chunks with a valid header, dirty pad */
+	u64         overruns;       /* service fell a full ring behind */
+	u64         hw_resyncs;     /* escalations to a hardware restart */
+};
+
+#define SC0710_CLP_HDR           8     /* header bytes per chunk */
+#define SC0710_CLP_ASM_SIZE      (SC0710_CLP_SRC_WIDTH * \
+	(SC0710_CLP_SRC_HEIGHT + SC0710_CLP_SRC_UV_HEIGHT))
+
 /* Forward declaration for multi-client support */
 struct sc0710_fh;
 
@@ -280,6 +363,7 @@ struct sc0710_client {
 	struct list_head         buffer_list;    /* This client's pending buffers */
 	spinlock_t               buffer_lock;    /* Protects buffer_list */
 	bool                     streaming;      /* Is this client streaming? */
+	u8                       input;          /* Cam Link Pro HDMI input 0..3 */
 
 	/* Resolution the client negotiated at STREAMON time.
 	 * Used by dynamic resolution mode to scale frames that arrive
@@ -292,6 +376,16 @@ struct sc0710_client {
 	/* Per-client VB2 queue for multi-app support; q->lock is the node's
 	 * ioctl mutex (ch->v4l2_lock), shared by all clients of the channel. */
 	struct vb2_queue         vb2_queue;
+};
+
+struct sc0710_dma_channel;
+
+/* A Cam Link Pro has four user-facing capture nodes backed by one hardware
+ * DMA channel. Other boards use only element zero. */
+struct sc0710_video_node {
+	struct video_device          vdev;
+	struct sc0710_dma_channel   *ch;
+	u8                           input;
 };
 
 struct sc0710_dma_channel
@@ -318,6 +412,9 @@ struct sc0710_dma_channel
 	u32                          numDescriptorChains;
 	u32                          buf_size;
 	struct sc0710_dma_descriptor_chain chains[SC0710_MAX_CHANNEL_DESCRIPTOR_CHAINS];
+
+	/* Cam Link Pro conveyor transport; cv.ndesc != 0 supersedes chains[]. */
+	struct sc0710_clp_conveyor   cv;
 
 	/* DMA Controller PCI BAR offsets */
 	u32                          register_dma_base;
@@ -349,7 +446,7 @@ struct sc0710_dma_channel
 
 	/* Channel 0 */
 	/* V4L2 */
-	struct video_device          vdev;
+	struct sc0710_video_node     vnode[SC0710_CLP_INPUTS];
 	struct vb2_queue             vb2_queue;
 	spinlock_t                   slock;
 
@@ -405,7 +502,7 @@ struct sc0710_dma_channel
 	unsigned long                short_last_jiffies;
 
 	/* Channel 1 */
-	struct sc0710_audio_dev     *audio_dev;
+	struct sc0710_audio_dev     *audio_dev[SC0710_CLP_INPUTS];
 };
 
 struct sc0710_i2c {
@@ -485,6 +582,8 @@ struct sc0710_audio_dev
 	snd_pcm_uframes_t          buffer_ptr;
 	snd_pcm_uframes_t          period_pos;
 	bool                       running;
+	u8                         input; /* Cam Link Pro HDMI input 0..3 */
+	bool                       dma_held;
 	unsigned long              last_sample_jiffies; /* Last real-sample delivery */
 	struct delayed_work        silence_work;
 
@@ -494,6 +593,18 @@ struct sc0710_audio_dev
 	 * kicks this work. */
 	struct work_struct         dma_work;
 	atomic_t                   dma_want; /* 1 = ALSA wants capture DMA */
+};
+
+struct sc0710_clp_input_status {
+	u32 locked;
+	u32 cable_connected;
+	u32 pixelLineH, pixelLineV;
+	u32 width, height;
+	u32 interlaced;
+	u8  rate;
+	u8  hint_flags;
+	u8  lock_dropout_count;
+	u8  unlocked_no_timing_count;
 };
 
 struct sc0710_dev {
@@ -539,10 +650,9 @@ struct sc0710_dev {
 	 */
 	struct mutex               signalMutex;
 
-	/* ALSA capture hold, only ever taken while keep_audio_alive is set:
-	 * non-zero keeps the audio DMA channel (and the shared FPGA GO bit)
-	 * running with no V4L2 streaming client. Set from the ALSA trigger
-	 * work path, cleared on PCM STOP / close. */
+	/* ALSA capture holds: always standalone on Cam Link Pro, opt-in through
+	 * keep_audio_alive on older cards. Non-zero keeps audio DMA and the
+	 * shared FPGA GO bit running without a V4L2 client. */
 	atomic_t                   audio_users;
 
 	u32                        locked;
@@ -576,6 +686,9 @@ struct sc0710_dev {
 	u32                        cable_connected; /* 5V sense: cable physically present */
 	u32                        unlocked_no_timing_count; /* Consecutive polls with no lock and no timing */
 	u32                        lock_dropout_count;       /* 4K Pro: consecutive polls with no lock while previously locked */
+	u8                         clp_active_mask; /* Cam Link Pro input paths currently enabled */
+	u8                         clp_master_input; /* Input driving shared pipeline geometry */
+	struct sc0710_clp_input_status clp_input[SC0710_CLP_INPUTS];
 
 	/* Frame staging (interlaced weave input, tear validation) */
 	u8                        *frame_staging_buf;   /* Contiguous gather of one source frame */
@@ -634,6 +747,24 @@ static inline u32 sc0710_framesize(const struct sc0710_dev *dev,
 	return fmt ? fmt->width * dev->pixfmt->bpp * fmt->height : 0;
 }
 
+static inline bool sc0710_clp_native_4k(const struct sc0710_dev *dev)
+{
+	return dev->width >= SC0710_CLP_WIDTH &&
+	       dev->height >= SC0710_CLP_HEIGHT;
+}
+
+static inline u32 sc0710_clp_source_width(const struct sc0710_dev *dev)
+{
+	return sc0710_clp_native_4k(dev) ? SC0710_CLP_SRC_WIDTH :
+		SC0710_CLP_LEGACY_WIDTH;
+}
+
+static inline u32 sc0710_clp_chunk_size(const struct sc0710_dev *dev)
+{
+	return sc0710_clp_native_4k(dev) ? SC0710_CLP_CHUNK :
+		SC0710_CLP_LEGACY_CHUNK;
+}
+
 struct sc0710_fh
 {
 	struct v4l2_fh             fh;
@@ -642,6 +773,7 @@ struct sc0710_fh
 	enum v4l2_buf_type         type;
 	struct file               *fp; /* Back-pointer for owner checks */
 	struct sc0710_client      *client;  /* Multi-client tracking */
+	u8                         input;   /* Logical Cam Link Pro input */
 };
 
 /* ----------------------------------------------------------- */
@@ -709,6 +841,11 @@ extern int tm_bgr_chroma;
 extern int force_eotf;
 bool sc0710_edid_header_valid(const u8 *p);
 int sc0710_i2c_read_hdmi_status(struct sc0710_dev *dev);
+void sc0710_i2c_mcu_scan(struct sc0710_dev *dev);
+extern unsigned int sc0710_mcu_scan;
+void sc0710_i2c_sync_input_paths(struct sc0710_dev *dev);
+void sc0710_i2c_apply_4k_mode(struct sc0710_dev *dev);
+extern unsigned int sc0710_hdmi_input;
 int sc0710_i2c_read_status2(struct sc0710_dev *dev);
 int sc0710_i2c_read_status3(struct sc0710_dev *dev);
 int sc0710_i2c_read_procamp(struct sc0710_dev *dev);
@@ -768,6 +905,7 @@ void sc0710_video_disconnect(struct sc0710_dma_channel *ch);
 int  sc0710_video_register(struct sc0710_dma_channel *ch);
 void sc0710_video_free_status_frames(void);
 void sc0710_video_notify_source_change(struct sc0710_dev *dev);
+void sc0710_video_notify_source_change_mask(struct sc0710_dev *dev, u8 input_mask);
 bool sc0710_guess_dims_from_framesize(u32 frame_bytes, u32 *w, u32 *h);
 const char *sc0710_colorimetry_ascii(enum sc0710_colorimetry_e val);
 const char *sc0710_colorspace_ascii(enum sc0710_colorspace_e val);
@@ -787,4 +925,5 @@ void sc0710_dma_chains_dump(struct sc0710_dma_channel *ch);
 int  sc0710_audio_register(struct sc0710_dev *dev);
 void sc0710_audio_unregister(struct sc0710_dev *dev);
 int  sc0710_audio_deliver_samples(struct sc0710_dev *dev, struct sc0710_dma_channel *ch,
-        const u8 *buf, int bitdepth, int strideBytes, int channels, int samplesPerChannel);
+		u8 input, const u8 *buf, int bitdepth, int strideBytes,
+		int channels, int samplesPerChannel);

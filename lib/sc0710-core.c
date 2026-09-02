@@ -98,7 +98,7 @@ static ssize_t color_deep_store(struct device *device,
 
 static DEVICE_ATTR_RW(color_deep);
 
-MODULE_DESCRIPTION("Elgato 4K60 Pro MK.2 / 4K Pro capture driver");
+MODULE_DESCRIPTION("Elgato 4K60 Pro MK.2 / 4K Pro / Cam Link Pro capture driver");
 MODULE_AUTHOR("Steven Toth <stoth@kernellabs.com>, Nakildias <nakildiaspro@gmail.com>");
 MODULE_LICENSE("GPL");
 MODULE_VERSION(SC0710_DRV_VERSION);
@@ -176,11 +176,11 @@ MODULE_PARM_DESC(zc_split,
 unsigned int keep_audio_alive;
 module_param(keep_audio_alive, uint, 0644);
 MODULE_PARM_DESC(keep_audio_alive,
-	"Keep the ALSA capture session alive independently of V4L2 (0=off, default). "
+	"Older cards: keep ALSA capture alive independently of V4L2 (0=off, default). "
 	"Off, audio DMA starts and stops with video streaming, so the card's audio "
 	"input only runs while something is capturing video. On, an ALSA client holds "
 	"the audio session open by itself - useful for hardware mixers and always-on "
-	"monitoring. Read at PCM start, so a change takes effect on the next open.");
+	"monitoring. Cam Link Pro audio is always standalone. Read at PCM start.");
 
 unsigned int dma_resync_validate_frames = 8;
 module_param(dma_resync_validate_frames, int, 0644);
@@ -497,6 +497,29 @@ static int sc0710_proc_state_show(struct seq_file *m, void *v)
 		} else {
 			seq_printf(m, "        HDMI: no signal\n");
 		}
+		if (dev->board == SC0710_BOARD_ELGATO_CAMLINK_PRO) {
+			int input;
+
+			seq_printf(m, " active ports: mask 0x%x, pipeline HDMI-%u\n",
+				dev->clp_active_mask, dev->clp_master_input + 1);
+			for (input = 0; input < SC0710_CLP_INPUTS; input++) {
+				struct sc0710_clp_input_status *status =
+					&dev->clp_input[input];
+
+				if (status->locked)
+					seq_printf(m,
+						"      HDMI-%d: %ux%u%c, totals %ux%u, %u Hz%s\n",
+						input + 1, status->width, status->height,
+						status->interlaced ? 'i' : 'p',
+						status->pixelLineH, status->pixelLineV,
+						status->rate,
+						dev->clp_active_mask & BIT(input) ? " [active]" : "");
+				else
+					seq_printf(m, "      HDMI-%d: %s%s\n", input + 1,
+						status->cable_connected ? "no signal" : "unplugged",
+						dev->clp_active_mask & BIT(input) ? " [active]" : "");
+			}
+		}
 
 		seq_printf(m, " colorimetry: %s\n", sc0710_colorimetry_ascii(dev->colorimetry));
 		seq_printf(m, "  colorspace: %s\n", sc0710_colorspace_ascii(dev->colorspace));
@@ -542,6 +565,29 @@ static int sc0710_proc_state_show(struct seq_file *m, void *v)
 				sc0710_things_per_second_query(&ch->bitsPerSecond) / 1000000 / 8);
 			seq_printf(m, "    descr ps: %lld\n",
 				sc0710_things_per_second_query(&ch->descPerSecond));
+
+			if (ch->cv.ndesc) {
+				u64 pictures = 0, pictures_short = 0, stale_lines = 0;
+				int input;
+
+				for (input = 0; input < SC0710_CLP_INPUTS; input++) {
+					pictures += ch->cv.pictures[input];
+					pictures_short += ch->cv.pictures_short[input];
+					stale_lines += ch->cv.stale_lines[input];
+				}
+				seq_printf(m, "    conveyor: %u desc x %u bytes, consumed %llu\n",
+					ch->cv.ndesc, ch->cv.seg, ch->cv.consumed);
+				seq_printf(m, "    pictures: %llu delivered (%llu short, %llu stale lines)\n",
+					pictures, pictures_short, stale_lines);
+				for (input = 0; input < SC0710_CLP_INPUTS; input++)
+					seq_printf(m, "     input %d: %llu pictures, %llu chunks (%llu short, %llu stale lines)\n",
+						input + 1, ch->cv.pictures[input],
+						ch->cv.chunks[input], ch->cv.pictures_short[input],
+						ch->cv.stale_lines[input]);
+				seq_printf(m, "      framer: %llu resyncs, %llu pad errors, %llu overruns, %llu hw resyncs\n",
+					ch->cv.resyncs, ch->cv.pad_errors,
+					ch->cv.overruns, ch->cv.hw_resyncs);
+			}
 
 			if (zero_copy && ch->mediatype == CHTYPE_VIDEO) {
 				seq_printf(m, "   zc frames: %llu direct, %llu copied\n",
@@ -617,6 +663,19 @@ static int sc0710_proc_show(struct seq_file *m, void *v)
 				val = sc_read(dev, 0, i);
 				if (val) {
 					seq_printf(m, " 0x%04x = %08x\n", i, val);
+				}
+			}
+
+			/* BAR1 (XDMA): register-capture diffing. Some XDMA
+			 * status fields are clear-on-read, so this is a
+			 * diagnostic for stopped engines, not a monitor. */
+			end = min_t(u64, 0x10000,
+				    pci_resource_len(dev->pci, 1));
+			seq_printf(m, "Full BAR1 Register Dump:\n");
+			for (i = 0; i < end; i += 4) {
+				val = sc_read(dev, 1, i);
+				if (val) {
+					seq_printf(m, " B1 0x%04x = %08x\n", i, val);
 				}
 			}
 		}
@@ -862,6 +921,10 @@ static int sc0710_thread_hdmi_function(void *data)
 		}
 
 		sc0710_i2c_read_hdmi_status(dev);
+		if (sc0710_mcu_scan) {
+			sc0710_mcu_scan = 0;
+			sc0710_i2c_mcu_scan(dev);
+		}
 		/* Keep the procamp cache fresh: /proc/sc0710-state prints it but is
 		 * forbidden from running I2C itself. The values are user controls
 		 * that rarely change, so every 10th tick (~2 s at the default
@@ -965,6 +1028,15 @@ static int sc0710_initdev(struct pci_dev *pci_dev,
 	 * interrupt-driven service wakes the DMA thread per completed chain
 	 * and demotes polling to a watchdog tick. MSI only - a shared INTx
 	 * line with a wake-only handler would mask co-devices. */
+	if (irq_service && dev->board == SC0710_BOARD_ELGATO_CAMLINK_PRO) {
+		/* This board's FPGA loses bytes whenever the engine pauses, and
+		 * with it the raster alignment. The classic free-running poll
+		 * service disturbs the ring the least, so it wins here until
+		 * the small-descriptor conveyor redesign lands. */
+		printk(KERN_INFO "%s: Cam Link Pro: using polling DMA service\n",
+			dev->name);
+		irq_service = 0;
+	}
 	if (irq_service) {
 		if (pci_alloc_irq_vectors(pci_dev, 1, 1, PCI_IRQ_MSI) == 1 &&
 		    pci_request_irq(pci_dev, 0, sc0710_irq, NULL, dev,
@@ -1266,4 +1338,3 @@ static void __exit sc0710_fini(void)
 
 module_init(sc0710_init);
 module_exit(sc0710_fini);
-

@@ -33,6 +33,7 @@ int sc0710_dma_channels_resize(struct sc0710_dev *dev)
 	switch (dev->board) {
 	case SC0710_BOARD_ELGATEO_4KP60_MK2:
 	case SC0710_BOARD_ELGATEO_4KP:
+	case SC0710_BOARD_ELGATO_CAMLINK_PRO:
 		ret = sc0710_dma_channel_resize(dev, 0, CHDIR_INPUT, 0x1000, CHTYPE_VIDEO);
 		/* Audio uses fixed buffer size, do not resize as it may be active via ALSA */
 		/* sc0710_dma_channel_resize(dev, 1, CHDIR_INPUT, 0x1100, CHTYPE_AUDIO); */
@@ -49,6 +50,7 @@ int sc0710_dma_channels_alloc(struct sc0710_dev *dev)
 	switch (dev->board) {
 	case SC0710_BOARD_ELGATEO_4KP60_MK2:
 	case SC0710_BOARD_ELGATEO_4KP:
+	case SC0710_BOARD_ELGATO_CAMLINK_PRO:
 		ret = sc0710_dma_channel_alloc(dev, 0, CHDIR_INPUT, 0x1000, CHTYPE_VIDEO);
 		if (ret == 0)
 			ret = sc0710_dma_channel_alloc(dev, 1, CHDIR_INPUT, 0x1100, CHTYPE_AUDIO);
@@ -94,6 +96,13 @@ void sc0710_program_pipeline_regs(struct sc0710_dev *dev)
 {
 	u32 c8 = dev->fmt ? dev->fmt->height : 0x438;
 	u32 d0 = dev->pixfmt->pipeline_d0;
+
+	/* Cam Link Pro: bit 0x80 bypasses the FPGA's horizontal half-scaler.
+	 * It changes the wire payload from 1920 to native 3840 bytes per line.
+	 * Keep the old selector for smaller inputs, whose native layout has not
+	 * been mapped. */
+	if (dev->board == SC0710_BOARD_ELGATO_CAMLINK_PRO)
+		d0 = sc0710_clp_native_4k(dev) ? 0x4180 : 0x4100;
 
 	sc_write(dev, 0, BAR0_00C8, c8);
 
@@ -154,10 +163,9 @@ int sc0710_dma_channels_start(struct sc0710_dev *dev)
 /* Align the running DMA engines with who actually wants them:
  *  - video: a V4L2 client is streaming (streaming_refcount > 0) and a signal
  *    is present (dev->fmt).
- *  - audio: an ALSA client holds the session (audio_users > 0, only ever taken
- *    while keep_audio_alive is set), or the video session is up. The second
- *    term is what makes the default path identical to the old
- *    channels_start/channels_stop coupling.
+ *  - audio: an ALSA client holds the session (audio_users > 0; always for
+ *    Cam Link Pro, opt-in with keep_audio_alive on older cards), or the video
+ *    session is up. The second term preserves the older cards' coupled path.
  * Either user keeps the shared FPGA GO bit asserted. Caller holds
  * kthread_dma_lock; may sleep (start_prep).
  */
@@ -207,6 +215,19 @@ int sc0710_dma_sync_session(struct sc0710_dev *dev)
 				return ret;
 			need_video_dma = false;
 		}
+	}
+
+	/* Cam Link Pro: the FPGA only frame-aligns its output stream on a
+	 * fresh pipeline GO. A video start joining a running audio-only
+	 * session would arm its ring mid-stream and every frame would arrive
+	 * vertically wrapped at a random line. Restart the whole session so
+	 * video always begins at a frame boundary (one audible dropout on
+	 * the audio side, same as a session start). */
+	if (dev->board == SC0710_BOARD_ELGATO_CAMLINK_PRO &&
+	    need_video_dma && vch && vch->state != STATE_RUNNING &&
+	    any_running) {
+		sc0710_dma_channels_stop(dev);
+		any_running = false;
 	}
 
 	if (!any_running) {

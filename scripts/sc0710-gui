@@ -44,6 +44,7 @@ APP_NAME = "sc0710"
 
 CARDS = {
     0x000e: "4K60 Pro MK.2",
+    0x0011: "Cam Link Pro",
     0x0012: "4K Pro",
 }
 PARAM_DIR = "/sys/module/sc0710/parameters"

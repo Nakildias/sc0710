@@ -224,25 +224,17 @@ save_config() {
     echo -e "  ${BOLD}options sc0710$opts${NC}"
 }
 
-sc0710_is_4k_pro_card() {
+sc0710_is_ecp5_card() {
     local fw_lib=""
 
-    if [[ "$IS_ATOMIC" == "true" && -f "$SRC_DIR/sc0710-firmware-lib.sh" ]]; then
-        fw_lib="$SRC_DIR/sc0710-firmware-lib.sh"
-    elif [[ -f /usr/lib/sc0710/sc0710-firmware-lib.sh ]]; then
-        fw_lib="/usr/lib/sc0710/sc0710-firmware-lib.sh"
-    elif [[ -f /usr/local/libexec/sc0710-firmware-lib.sh ]]; then
-        fw_lib="/usr/local/libexec/sc0710-firmware-lib.sh"
-    fi
-
-    if [[ -n "$fw_lib" ]]; then
+    if fw_lib=$(sc0710_firmware_lib_path 2>/dev/null); then
         # shellcheck source=/dev/null
         source "$fw_lib"
-        sc0710_is_4k_pro
+        sc0710_requires_ecp5_firmware
         return $?
     fi
 
-    lspci -n -v -d 12ab:0710 2>/dev/null | grep -qi "1cfa:0012"
+    lspci -n -v -d 12ab:0710 2>/dev/null | grep -qiE "1cfa:00(11|12)"
 }
 
 sc0710_dkms_lib_path() {
@@ -291,13 +283,19 @@ sc0710_dkms_run_cleanup() {
 }
 
 sc0710_firmware_lib_path() {
-    if [[ "$IS_ATOMIC" == "true" && -f "$SRC_DIR/sc0710-firmware-lib.sh" ]]; then
-        echo "$SRC_DIR/sc0710-firmware-lib.sh"
-    elif [[ -f /usr/lib/sc0710/sc0710-firmware-lib.sh ]]; then
-        echo "/usr/lib/sc0710/sc0710-firmware-lib.sh"
-    elif [[ -f /usr/local/libexec/sc0710-firmware-lib.sh ]]; then
-        echo "/usr/local/libexec/sc0710-firmware-lib.sh"
-    fi
+    local path cli_dir
+    cli_dir="$(dirname "$(sc0710_cli_path)")"
+    for path in \
+        "$SRC_DIR/sc0710-firmware-lib.sh" \
+        /usr/lib/sc0710/sc0710-firmware-lib.sh \
+        /usr/local/libexec/sc0710-firmware-lib.sh \
+        "$cli_dir/sc0710-firmware-lib.sh" \
+        "$DKMS_SRC/scripts/sc0710-firmware-lib.sh"; do
+        [[ -f "$path" ]] || continue
+        echo "$path"
+        return 0
+    done
+    return 1
 }
 
 # Installed extract-firmware.sh, per layout: AUR, atomic source dir, DKMS source dir.
@@ -453,7 +451,7 @@ sc0710_detect_install_method() {
 sc0710_cli_ensure_ecp5() {
     local attempts="${1:-3}"
     local fw_lib fw_script
-    sc0710_is_4k_pro_card || return 0
+    sc0710_is_ecp5_card || return 0
     fw_lib=$(sc0710_firmware_lib_path) || return 1
     mkdir -p /var/log/sc0710
     # shellcheck source=/dev/null
@@ -516,16 +514,19 @@ EOF
 
 sc0710_remove_firmware_files() {
     rm -f /lib/firmware/sc0710/SC0710.FWI.HEX 2>/dev/null || true
+    rm -f /lib/firmware/sc0710/CAMLINKPRO.FWI.HEX 2>/dev/null || true
     rm -rf /lib/firmware/sc0710/edid 2>/dev/null || true
     rmdir /lib/firmware/sc0710 2>/dev/null || true
 
     rm -f /etc/firmware/sc0710/SC0710.FWI.HEX /etc/firmware/sc0710/edid 2>/dev/null || true
+    rm -f /etc/firmware/sc0710/CAMLINKPRO.FWI.HEX 2>/dev/null || true
     if [[ -L /etc/firmware/sc0710 ]]; then
         rm -f /etc/firmware/sc0710 2>/dev/null || true
     fi
     rmdir /etc/firmware/sc0710 2>/dev/null || true
 
     rm -f /var/lib/sc0710/firmware/SC0710.FWI.HEX 2>/dev/null || true
+    rm -f /var/lib/sc0710/firmware/CAMLINKPRO.FWI.HEX 2>/dev/null || true
     rm -rf /var/lib/sc0710/firmware/edid 2>/dev/null || true
     rmdir /var/lib/sc0710/firmware 2>/dev/null || true
 
@@ -981,7 +982,9 @@ write_debug_dump() {
         [[ -d "/var/lib/dkms/${DRV_NAME}" ]] && printf 'DKMS lib dir present: /var/lib/dkms/%s\n' "$DRV_NAME" >> "$DUMP_FILE" \
             || printf 'DKMS lib dir: not present\n' >> "$DUMP_FILE"
     fi
-    for fw in /var/lib/sc0710/firmware/SC0710.FWI.HEX /etc/firmware/sc0710/SC0710.FWI.HEX /lib/firmware/sc0710/SC0710.FWI.HEX; do
+    for fw in /var/lib/sc0710/firmware/{SC0710.FWI.HEX,CAMLINKPRO.FWI.HEX} \
+              /etc/firmware/sc0710/{SC0710.FWI.HEX,CAMLINKPRO.FWI.HEX} \
+              /lib/firmware/sc0710/{SC0710.FWI.HEX,CAMLINKPRO.FWI.HEX}; do
         [[ -f "$fw" ]] && printf 'Firmware present: %s\n' "$fw" >> "$DUMP_FILE"
     done
 
@@ -1611,7 +1614,7 @@ esac
 case "$1" in
     -l|--load)
         if lsmod | grep -q "$DRV_NAME"; then
-            if sc0710_is_4k_pro_card && sc0710_firmware_lib_path >/dev/null; then
+            if sc0710_is_ecp5_card && sc0710_firmware_lib_path >/dev/null; then
                 echo -e "${BLUE}::${NC} Driver loaded — verifying ECP5 FPGA..."
                 if sc0710_cli_ensure_ecp5 3; then
                     echo -e "${GREEN}[OK]${NC} Driver loaded and ECP5 FPGA programmed."
@@ -1628,7 +1631,7 @@ case "$1" in
         echo -e "${BLUE}::${NC} Loading driver..."
         if [[ "$IS_ATOMIC" == "true" ]]; then
             if sc0710_cli_atomic_load; then
-                if sc0710_is_4k_pro_card && sc0710_firmware_lib_path >/dev/null; then
+                if sc0710_is_ecp5_card && sc0710_firmware_lib_path >/dev/null; then
                     # shellcheck source=/dev/null
                     SC0710_FW_LOG_FILE="/var/log/sc0710/load_$(date '+%Y%m%d_%H%M%S').log" source "$(sc0710_firmware_lib_path)"
                     mkdir -p /var/log/sc0710
@@ -1654,7 +1657,7 @@ case "$1" in
                 modprobe "$dep" 2>/dev/null || true
             done
             if modprobe "$DRV_NAME"; then
-                if sc0710_is_4k_pro_card && sc0710_firmware_lib_path >/dev/null; then
+                if sc0710_is_ecp5_card && sc0710_firmware_lib_path >/dev/null; then
                     if sc0710_cli_ensure_ecp5 3; then
                         echo -e "${GREEN}[OK]${NC} Driver loaded and ECP5 FPGA programmed."
                     else
@@ -1750,7 +1753,7 @@ case "$1" in
     --restart)
         # Always a real unload+load, even when the card is bound and healthy:
         # a reload is how new firmware/EDID files and module params get picked
-        # up. --load re-verifies the ECP5 on the 4K Pro afterwards.
+        # up. --load re-verifies the ECP5 on cards that require runtime firmware.
         "$0" --unload
         sleep 1
         exec "$0" --load
@@ -1854,6 +1857,7 @@ case "$1" in
                         else
                             case "$SUBVEN:$SUBDEV" in
                                 1cfa:000e) BOARD_NAME="Elgato 4K60 Pro MK.2" ;;
+                                1cfa:0011) BOARD_NAME="Elgato Cam Link Pro" ;;
                                 1cfa:0012) BOARD_NAME="Elgato 4K Pro" ;;
                                 1cfa:0006) BOARD_NAME="Elgato HD60 Pro (1cfa:0006)" ;;
                                 *) BOARD_NAME="UNKNOWN/GENERIC" ;;
@@ -1932,11 +1936,20 @@ case "$1" in
             echo -e "   ${RED}○${NC} Parameter not available (module not loaded)"
         fi
         # ECP5 Firmware Status
-        if sc0710_is_4k_pro_card; then
+        if sc0710_is_ecp5_card; then
             echo ""
             echo -e "${BLUE}::${NC} ${BOLD}ECP5 Firmware${NC}"
+            fw_lib=$(sc0710_firmware_lib_path 2>/dev/null || true)
+            if [[ -n "$fw_lib" ]]; then
+                # shellcheck source=/dev/null
+                source "$fw_lib"
+                sc0710_init_firmware_paths
+            fi
             FW_FOUND=false
-            for p in /var/lib/sc0710/firmware/SC0710.FWI.HEX /etc/firmware/sc0710/SC0710.FWI.HEX /lib/firmware/sc0710/SC0710.FWI.HEX; do
+            for p in "${SC0710_FIRMWARE_PATH:-}" \
+                     "/etc/firmware/sc0710/${SC0710_FIRMWARE_FILE:-}" \
+                     "/lib/firmware/sc0710/${SC0710_FIRMWARE_FILE:-}"; do
+                [[ -n "$p" && "$p" != */ ]] || continue
                 if [[ -f "$p" ]]; then FW_FOUND=true; echo -e "   ${GREEN}●${NC} Firmware present: $p"; break; fi
             done
             [[ "$FW_FOUND" == "false" ]] && echo -e "   ${RED}○${NC} Firmware missing. Run: ${BOLD}sudo bash $(sc0710_extract_script_path)${NC}"
@@ -2079,7 +2092,7 @@ case "$1" in
                 chcon -t modules_object_t "$SRC_DIR/build/${DRV_NAME}.ko" 2>/dev/null || true
                 for dep in videodev videobuf2-common videobuf2-v4l2 videobuf2-vmalloc videobuf2-dma-sg snd-pcm; do modprobe "$dep" 2>/dev/null || true; done
                 if sc0710_cli_atomic_load; then
-                    if sc0710_is_4k_pro_card && sc0710_firmware_lib_path >/dev/null; then
+                    if sc0710_is_ecp5_card && sc0710_firmware_lib_path >/dev/null; then
                         if sc0710_cli_ensure_ecp5 5; then
                             echo -e "${GREEN}[OK]${NC} Driver updated (v${NEW_VER}), ECP5 FPGA programmed."
                         else
@@ -2123,7 +2136,7 @@ case "$1" in
                     cp "$NEW_DKMS_SRC/scripts/sc0710-firmware-lib.sh" /usr/local/libexec/sc0710-firmware-lib.sh
                     chmod +x /usr/local/libexec/sc0710-firmware-lib.sh
                 fi
-                if sc0710_is_4k_pro_card && sc0710_firmware_lib_path >/dev/null; then
+                if sc0710_is_ecp5_card && sc0710_firmware_lib_path >/dev/null; then
                     if sc0710_cli_ensure_ecp5 5; then
                         echo -e "${GREEN}[OK]${NC} Driver updated (v${REAL_NEW_VER}), ECP5 FPGA programmed."
                     else

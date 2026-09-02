@@ -280,10 +280,624 @@ static bool sc0710_detect_horizontal_tear(const u8 *buf, u32 width, u32 height, 
  *    to perform transfers.
  */
 
+/* ---- Cam Link Pro line scalers -------------------------------------------
+ * The FPGA's shared output geometry follows the largest active input, so a
+ * picture can arrive 1920 wide while its node delivers 3840 (or the reverse).
+ */
+
+/* Expand one 1920-pixel luma line to 3840 pixels. Source samples land on
+ * even output pixels; odd pixels are the midpoint to the next sample. */
+static void sc0710_clp_upscale_y_line(const u8 *src, u8 *dst)
+{
+	u32 x;
+
+	for (x = 0; x + 1 < SC0710_CLP_LEGACY_WIDTH; x++) {
+		dst[2 * x] = src[x];
+		dst[2 * x + 1] = (src[x] + src[x + 1] + 1) >> 1;
+	}
+	dst[SC0710_CLP_WIDTH - 2] = src[SC0710_CLP_LEGACY_WIDTH - 1];
+	dst[SC0710_CLP_WIDTH - 1] = src[SC0710_CLP_LEGACY_WIDTH - 1];
+}
+
+/* Expand one NV12 chroma line without mixing the interleaved U and V
+ * components. Each source UV pair becomes two output UV pairs. */
+static void sc0710_clp_upscale_uv_line(const u8 *src, u8 *dst)
+{
+	u32 x;
+
+	for (x = 0; x + 2 < SC0710_CLP_LEGACY_WIDTH; x += 2) {
+		dst[2 * x] = src[x];
+		dst[2 * x + 1] = src[x + 1];
+		dst[2 * x + 2] = (src[x] + src[x + 2] + 1) >> 1;
+		dst[2 * x + 3] = (src[x + 1] + src[x + 3] + 1) >> 1;
+	}
+	dst[SC0710_CLP_WIDTH - 4] = src[SC0710_CLP_LEGACY_WIDTH - 2];
+	dst[SC0710_CLP_WIDTH - 3] = src[SC0710_CLP_LEGACY_WIDTH - 1];
+	dst[SC0710_CLP_WIDTH - 2] = src[SC0710_CLP_LEGACY_WIDTH - 2];
+	dst[SC0710_CLP_WIDTH - 1] = src[SC0710_CLP_LEGACY_WIDTH - 1];
+}
+
+static void sc0710_clp_downscale_y_line(const u8 *src, u8 *dst)
+{
+	u32 x;
+
+	for (x = 0; x < SC0710_CLP_HD_WIDTH; x++)
+		dst[x] = src[2 * x];
+}
+
+static void sc0710_clp_downscale_uv_line(const u8 *src, u8 *dst)
+{
+	u32 x;
+
+	for (x = 0; x < SC0710_CLP_HD_WIDTH; x += 2) {
+		dst[x] = src[2 * x];
+		dst[x + 1] = src[2 * x + 1];
+	}
+}
+
+/* ---- Cam Link Pro conveyor transport --------------------------------------
+ *
+ * The vendor driver never asks the engine to carry whole frames: it runs a
+ * small circular ring of tiny always-armed descriptors with per-descriptor
+ * writeback, never rewritten while running, and rebuilds frames in software.
+ * The engine can then never starve waiting on a descriptor, which is the
+ * condition under which the FPGA drops bytes (the source of every visible
+ * glitch when whole-frame chains were tried on this card). When bytes are
+ * lost anyway, the framer re-locks the chunk grid from the headers in
+ * software - the hardware is never restarted for a slip.
+ */
+unsigned int clp_conveyor_desc = 512;
+module_param(clp_conveyor_desc, uint, 0644);
+MODULE_PARM_DESC(clp_conveyor_desc,
+	"Cam Link Pro conveyor: descriptors in the ring (default 512)");
+
+unsigned int clp_conveyor_seg = 0x1e00;
+module_param(clp_conveyor_seg, uint, 0644);
+MODULE_PARM_DESC(clp_conveyor_seg,
+	"Cam Link Pro conveyor: payload bytes per descriptor (default 0x1e00, the vendor value)");
+
+unsigned int clp_wbm_debug;
+module_param(clp_wbm_debug, uint, 0644);
+MODULE_PARM_DESC(clp_wbm_debug,
+	"Cam Link Pro conveyor: log the next N raw writeback pairs");
+
+/* Every chunk ends in 8 fixed pad bytes (0xff native, 0x00 on the 1920-wide
+ * selector); a dirty pad means bytes went missing inside the chunk. */
+static bool sc0710_clp_pad_bad(const u8 *pad, u32 source_width)
+{
+	u8 expected = source_width == SC0710_CLP_SRC_WIDTH ? 0xff : 0x00;
+	u32 x;
+
+	for (x = 0; x < 8; x++)
+		if (pad[x] != expected)
+			return true;
+	return false;
+}
+
+/* Hand one prepared packed-NV12 4K frame to every streaming client. */
+static void sc0710_clp_broadcast_frame(struct sc0710_dma_channel *ch,
+	u8 input, const u8 *frame, u32 width, u32 height, u32 framesize)
+{
+	struct sc0710_client *client;
+	unsigned long flags;
+	int delivered = 0;
+
+	spin_lock_irqsave(&ch->client_list_lock, flags);
+	list_for_each_entry(client, &ch->client_list, list) {
+		struct sc0710_buffer *vb_buf;
+		unsigned long buf_flags;
+		u8 *dst;
+
+		if (!client->streaming || client->input != input ||
+		    client->stream_width != width || client->stream_height != height)
+			continue;
+
+		spin_lock_irqsave(&client->buffer_lock, buf_flags);
+		if (list_empty(&client->buffer_list)) {
+			spin_unlock_irqrestore(&client->buffer_lock, buf_flags);
+			continue;
+		}
+		vb_buf = list_first_entry(&client->buffer_list, struct sc0710_buffer, list);
+		dst = vb2_plane_vaddr(&vb_buf->vb.vb2_buf, 0);
+		if (!dst ||
+		    vb2_plane_size(&vb_buf->vb.vb2_buf, 0) < framesize) {
+			spin_unlock_irqrestore(&client->buffer_lock, buf_flags);
+			continue;
+		}
+
+		memcpy(dst, frame, framesize);
+		vb2_set_plane_payload(&vb_buf->vb.vb2_buf, 0, framesize);
+		vb_buf->vb.vb2_buf.timestamp = ktime_get_ns();
+		vb_buf->vb.sequence = ch->frame_sequence;
+		vb_buf->vb.field = V4L2_FIELD_NONE;
+
+		list_del(&vb_buf->list);
+		vb2_buffer_done(&vb_buf->vb.vb2_buf, VB2_BUF_STATE_DONE);
+		delivered = 1;
+
+		spin_unlock_irqrestore(&client->buffer_lock, buf_flags);
+	}
+	spin_unlock_irqrestore(&ch->client_list_lock, flags);
+
+	if (delivered || !timer_pending(&ch->timeout))
+		mod_timer(&ch->timeout, jiffies + VBUF_TIMEOUT);
+}
+
+/* Does any streaming client of this input hold buffers of the given size? */
+static bool sc0710_clp_client_wants_size(struct sc0710_dma_channel *ch,
+	u8 input, u32 width, u32 height)
+{
+	struct sc0710_client *client;
+	unsigned long flags;
+	bool found = false;
+
+	spin_lock_irqsave(&ch->client_list_lock, flags);
+	list_for_each_entry(client, &ch->client_list, list) {
+		if (client->streaming && client->input == input &&
+		    client->stream_width == width &&
+		    client->stream_height == height) {
+			found = true;
+			break;
+		}
+	}
+	spin_unlock_irqrestore(&ch->client_list_lock, flags);
+	return found;
+}
+
+/* 2:1 NV12 rescale between the two delivery shapes, 3840x2160 and
+ * 1920x1080. Down: every other pixel of every other line. Up: horizontal
+ * midpoint interpolation, lines doubled. */
+static void sc0710_clp_rescale_picture(const u8 *src, u32 src_w, u32 src_h,
+	u8 *dst, u32 dst_w, u32 dst_h)
+{
+	const u8 *suv = src + (size_t)src_w * src_h;
+	u8 *duv = dst + (size_t)dst_w * dst_h;
+	u32 y;
+
+	if (src_w > dst_w) {
+		for (y = 0; y < dst_h; y++)
+			sc0710_clp_downscale_y_line(src + (size_t)2 * y * src_w,
+				dst + (size_t)y * dst_w);
+		for (y = 0; y < dst_h / 2; y++)
+			sc0710_clp_downscale_uv_line(suv + (size_t)2 * y * src_w,
+				duv + (size_t)y * dst_w);
+	} else {
+		for (y = 0; y < src_h; y++) {
+			u8 *d = dst + (size_t)2 * y * dst_w;
+
+			sc0710_clp_upscale_y_line(src + (size_t)y * src_w, d);
+			memcpy(d + dst_w, d, dst_w);
+		}
+		for (y = 0; y < src_h / 2; y++) {
+			u8 *d = duv + (size_t)2 * y * dst_w;
+
+			sc0710_clp_upscale_uv_line(suv + (size_t)y * src_w, d);
+			memcpy(d + dst_w, d, dst_w);
+		}
+	}
+}
+
+/* A client that negotiated before this input changed resolution is told to
+ * renegotiate (V4L2_EVENT_SOURCE_CHANGE), but apps like OBS ignore that
+ * event and would otherwise starve, time out and stop. Keep such clients
+ * fed with the live picture scaled to the size they hold buffers for.
+ * Runs in the DMA service thread, so the lazy allocation may sleep. */
+static void sc0710_clp_deliver_alt_size(struct sc0710_dma_channel *ch,
+	u8 input, const u8 *pic, u32 width, u32 height)
+{
+	struct sc0710_clp_conveyor *cv = &ch->cv;
+	u32 alt_w, alt_h, alt_size;
+
+	if (width == SC0710_CLP_WIDTH) {
+		alt_w = SC0710_CLP_HD_WIDTH;
+		alt_h = SC0710_CLP_HD_HEIGHT;
+		alt_size = SC0710_CLP_HD_SIZEIMAGE;
+	} else {
+		alt_w = SC0710_CLP_WIDTH;
+		alt_h = SC0710_CLP_HEIGHT;
+		alt_size = SC0710_CLP_SIZEIMAGE;
+	}
+
+	if (!sc0710_clp_client_wants_size(ch, input, alt_w, alt_h))
+		return;
+	if (!cv->alt[input]) {
+		cv->alt[input] = vzalloc(SC0710_CLP_SIZEIMAGE);
+		if (!cv->alt[input])
+			return;
+	}
+	sc0710_clp_rescale_picture(pic, width, height, cv->alt[input],
+		alt_w, alt_h);
+	sc0710_clp_broadcast_frame(ch, input, cv->alt[input], alt_w, alt_h,
+		alt_size);
+}
+
+/* A picture is complete when the next one's line 1 arrives. Native 4K is
+ * already packed NV12 and can be delivered directly. The old selector's
+ * 1920-wide fallback is expanded horizontally. Lines that never arrived
+ * keep the previous picture's content. */
+static void sc0710_clp_deliver_picture(struct sc0710_dma_channel *ch, u8 input)
+{
+	struct sc0710_clp_conveyor *cv = &ch->cv;
+	struct sc0710_clp_input_status *status = &ch->dev->clp_input[input];
+	const u8 *ysrc = cv->frame[input];
+	const u8 *uvsrc = cv->frame[input] +
+		cv->source_width * SC0710_CLP_SRC_HEIGHT;
+	const u8 *pic;
+	u8 *yd;
+	u8 *uvd;
+	u32 output_width, output_height, output_size;
+	u32 source_height, source_uv_height;
+	u32 i;
+
+	if (READ_ONCE(status->width) >= SC0710_CLP_WIDTH &&
+	    READ_ONCE(status->height) >= SC0710_CLP_HEIGHT) {
+		output_width = SC0710_CLP_WIDTH;
+		output_height = SC0710_CLP_HEIGHT;
+		output_size = SC0710_CLP_SIZEIMAGE;
+		source_height = SC0710_CLP_HEIGHT;
+	} else {
+		output_width = SC0710_CLP_HD_WIDTH;
+		output_height = SC0710_CLP_HD_HEIGHT;
+		output_size = SC0710_CLP_HD_SIZEIMAGE;
+		source_height = SC0710_CLP_HD_HEIGHT;
+	}
+	source_uv_height = source_height / 2;
+
+	if (cv->lines_placed[input] < source_height) {
+		cv->pictures_short[input]++;
+		cv->stale_lines[input] +=
+			source_height - cv->lines_placed[input];
+	}
+	cv->lines_placed[input] = 0;
+
+	if (ch->skip_next_frames > 0) {
+		ch->skip_next_frames--;
+		return;
+	}
+
+	if (cv->source_width == output_width &&
+	    source_height == SC0710_CLP_SRC_HEIGHT) {
+		pic = cv->frame[input];
+		goto deliver;
+	}
+	yd = cv->out[input];
+	uvd = cv->out[input] + output_width * output_height;
+
+	for (i = 0; i < source_height; i++) {
+		if (cv->source_width == output_width)
+			memcpy(yd, ysrc, output_width);
+		else if (cv->source_width < output_width)
+			sc0710_clp_upscale_y_line(ysrc, yd);
+		else
+			sc0710_clp_downscale_y_line(ysrc, yd);
+		ysrc += cv->source_width;
+		yd += output_width;
+	}
+	for (i = 0; i < source_uv_height; i++) {
+		if (cv->source_width == output_width)
+			memcpy(uvd, uvsrc, output_width);
+		else if (cv->source_width < output_width)
+			sc0710_clp_upscale_uv_line(uvsrc, uvd);
+		else
+			sc0710_clp_downscale_uv_line(uvsrc, uvd);
+		uvsrc += cv->source_width;
+		uvd += output_width;
+	}
+
+	pic = cv->out[input];
+
+deliver:
+	cv->pictures[input]++;
+	cv->last_picture_jiffies[input] = jiffies;
+	sc0710_clp_broadcast_frame(ch, input, pic,
+		output_width, output_height, output_size);
+	sc0710_clp_deliver_alt_size(ch, input, pic, output_width, output_height);
+	/* One sequence number per picture, whichever sizes it went out at. */
+	ch->frame_sequence++;
+}
+
+/* Validate one complete chunk and place its 1920- or 3840-byte payload by
+ * line number. */
+static void sc0710_clp_process_chunk(struct sc0710_dma_channel *ch)
+{
+	struct sc0710_clp_conveyor *cv = &ch->cv;
+	const u8 *c = cv->chunk;
+	u32 field = c[4] | (c[5] << 8);
+	u32 line = field >> 3;
+	u8 input = field & 3;
+
+	if (c[0] != 0xff || c[1] != 0xff || c[2] != 0xff || c[3] != 0x00 ||
+	    c[6] != 0x00 || (c[7] != 0x4f && c[7] != 0x6f) ||
+	    (field & 4) || line == 0) {
+		/* Chunk grid lost (bytes dropped inside a chunk): rescan. */
+		cv->synced = false;
+		cv->resyncs++;
+		return;
+	}
+
+	if (sc0710_clp_pad_bad(c + cv->chunk_size - 8, cv->source_width))
+		cv->pad_errors++;
+	cv->chunks[input]++;
+
+	if (c[7] == 0x4f) {
+		u32 source_height = READ_ONCE(ch->dev->clp_input[input].height) >=
+			SC0710_CLP_HEIGHT ? SC0710_CLP_HEIGHT : SC0710_CLP_HD_HEIGHT;
+
+		if (line > SC0710_CLP_SRC_HEIGHT)
+			return;
+		/* A new picture begins at luma line 1; the threshold keeps a
+		 * duplicated/reordered header from splitting a picture. */
+		if (line == 1 &&
+		    cv->lines_placed[input] > source_height / 4)
+			sc0710_clp_deliver_picture(ch, input);
+		memcpy(cv->frame[input] +
+			(size_t)(line - 1) * cv->source_width,
+			c + SC0710_CLP_HDR, cv->source_width);
+		cv->lines_placed[input]++;
+	} else {
+		/* Chroma chunks are numbered with the ODD luma line they pair
+		 * with (1, 3, 5, ... 2159): UV row = (line + 1) / 2. */
+		u32 uvline = (line + 1) >> 1;
+
+		if (line > SC0710_CLP_SRC_HEIGHT ||
+		    uvline > SC0710_CLP_SRC_UV_HEIGHT)
+			return;
+		memcpy(cv->frame[input] +
+			(size_t)cv->source_width * SC0710_CLP_SRC_HEIGHT +
+			(size_t)(uvline - 1) * cv->source_width,
+			c + SC0710_CLP_HDR, cv->source_width);
+	}
+}
+
+/* Feed consumed conveyor bytes to the framer: chunk reassembly across
+ * segment boundaries, header-scan resync when the grid is lost. */
+static void sc0710_clp_framer_append(struct sc0710_dma_channel *ch,
+	const u8 *src, u32 len)
+{
+	struct sc0710_clp_conveyor *cv = &ch->cv;
+
+	while (len) {
+		u32 n;
+
+		if (!cv->synced) {
+			/* Look for a chunk header: ff ff ff 00 xx xx 00 4f/6f.
+			 * Only whole in-segment matches are taken - losing up
+			 * to one chunk while resyncing is fine. */
+			u32 i;
+
+			cv->chunk_fill = 0;
+			for (i = 0; i + 8 <= len; i++) {
+				if (src[i] == 0xff && src[i + 1] == 0xff &&
+				    src[i + 2] == 0xff && src[i + 3] == 0x00 &&
+				    src[i + 6] == 0x00 &&
+				    (src[i + 7] == 0x4f || src[i + 7] == 0x6f)) {
+					cv->synced = true;
+					break;
+				}
+			}
+			if (!cv->synced)
+				return;
+			src += i;
+			len -= i;
+		}
+
+		n = min(len, cv->chunk_size - cv->chunk_fill);
+		memcpy(cv->chunk + cv->chunk_fill, src, n);
+		cv->chunk_fill += n;
+		src += n;
+		len -= n;
+		if (cv->chunk_fill == cv->chunk_size) {
+			cv->chunk_fill = 0;
+			sc0710_clp_process_chunk(ch);
+		}
+	}
+}
+
+/* Service pass for the conveyor: consume every segment the engine has
+ * completed since last time, in ring order, into the framer. Called from
+ * sc0710_dma_channel_service with ch->lock held and state RUNNING. */
+static int sc0710_clp_conveyor_service(struct sc0710_dma_channel *ch)
+{
+	struct sc0710_dev *dev = ch->dev;
+	struct sc0710_clp_conveyor *cv = &ch->cv;
+	u32 *wbm_base = (u32 *)((u8 *)ch->pt_cpu + ch->pt_size / 2);
+	u32 lag;
+	int consumed = 0;
+
+	/* Everything here is driven by the per-descriptor writebacks in host
+	 * memory: no MMIO in the hot path. A read to the card would have to
+	 * be answered by the same logic that is streaming the video - the
+	 * vendor driver never touches the card while capture runs, and
+	 * neither do we. */
+
+	/* Overrun check: if the slot almost a whole ring ahead of our read
+	 * position has completed, the engine lapped us and overwrote unread
+	 * segments (needs the service thread starved for ~25 ms). Drop the
+	 * whole ring and let the header scan re-lock the stream - no
+	 * hardware restart. */
+	{
+		u32 ahead = (u32)((cv->consumed + cv->ndesc - 32) % cv->ndesc);
+		u32 *wa = wbm_base + ahead * 8;
+
+		rmb();
+		if (wa[0] && wa[1]) {
+			u32 i;
+
+			for (i = 0; i < cv->ndesc; i++) {
+				wbm_base[i * 8] = 0;
+				wbm_base[i * 8 + 1] = 0;
+			}
+			wmb();
+			cv->consumed += cv->ndesc;
+			cv->synced = false;
+			memset(cv->lines_placed, 0, sizeof(cv->lines_placed));
+			cv->overruns++;
+			printk_ratelimited(KERN_WARNING "%s: [ch%d] conveyor overrun (service starved for a full ring); re-locking via headers\n",
+				dev->name, ch->nr);
+			return 0;
+		}
+	}
+
+	lag = cv->ndesc - 64; /* consume at most most-of-a-ring per pass */
+	while (lag--) {
+		u32 idx = (u32)(cv->consumed % cv->ndesc);
+		u32 *w = wbm_base + idx * 8; /* 32-byte writeback stride */
+		u32 len;
+
+		rmb();
+		if (!(w[0] && w[1]))
+			break; /* payload not yet visible; next pass gets it */
+		rmb();
+		/* Writeback layout (mapped on hardware): w[0] = 0x52B4 status
+		 * magic, w[1] = bytes actually written (short on the FPGA's
+		 * TLAST flushes - honor it, the stream continues at the next
+		 * descriptor). */
+		len = min_t(u32, w[1], cv->seg);
+		if (clp_wbm_debug > 0) {
+			clp_wbm_debug--;
+			printk(KERN_INFO "%s: [ch%d] wbm[%u] = %08x %08x\n",
+				dev->name, ch->nr, idx, w[0], w[1]);
+		}
+		sc0710_clp_framer_append(ch,
+			cv->block[idx / cv->segs_per_block].cpu +
+			(idx % cv->segs_per_block) * cv->seg, len);
+		cv->stream_bytes += len;
+		w[0] = 0;
+		w[1] = 0;
+		cv->consumed++;
+		consumed++;
+	}
+	wmb();
+
+	if (consumed) {
+		ch->dma_last_completion_jiffies = jiffies;
+		ch->dma_completed_descriptor_count_last = (u32)cv->consumed;
+		sc0710_things_per_second_update(&ch->bitsPerSecond,
+			(s64)consumed * cv->seg * 8);
+		sc0710_things_per_second_update(&ch->descPerSecond, consumed);
+	}
+	return consumed;
+}
+
+static void sc0710_clp_conveyor_free(struct sc0710_dma_channel *ch)
+{
+	struct sc0710_dev *dev = ch->dev;
+	struct sc0710_clp_conveyor *cv = &ch->cv;
+	u32 i;
+
+	for (i = 0; i < cv->nblocks; i++)
+		if (cv->block[i].cpu)
+			dma_free_coherent(&dev->pci->dev, cv->block[i].size,
+				cv->block[i].cpu, cv->block[i].dma);
+	for (i = 0; i < SC0710_CLP_INPUTS; i++) {
+		vfree(cv->frame[i]);
+		vfree(cv->out[i]);
+		vfree(cv->alt[i]);
+	}
+	memset(cv, 0, sizeof(*cv));
+}
+
+/* Allocate the ring payload blocks and the assembly buffer. The descriptor
+ * table itself lives in ch->pt_cpu and is written by _link below. */
+static int sc0710_clp_conveyor_build(struct sc0710_dma_channel *ch)
+{
+	struct sc0710_dev *dev = ch->dev;
+	struct sc0710_clp_conveyor *cv = &ch->cv;
+	u32 seg = clp_conveyor_seg ? clp_conveyor_seg : 0x1e00;
+	u32 ndesc = clp_conveyor_desc ? clp_conveyor_desc : 512;
+	u32 spb, i;
+
+	sc0710_clp_conveyor_free(ch);
+	cv->source_width = sc0710_clp_source_width(dev);
+	cv->chunk_size = sc0710_clp_chunk_size(dev);
+
+	seg = clamp_t(u32, seg & ~0xfu, 0x200, 0x10000);
+	ndesc = clamp_t(u32, ndesc, 16, 2048);
+
+	/* Uniform blocks of at most ~1 MiB so the coherent allocator never
+	 * has to find one huge contiguous region. */
+	spb = max_t(u32, 1, SZ_1M / seg);
+	if (spb > ndesc)
+		spb = ndesc;
+	if (DIV_ROUND_UP(ndesc, spb) > SC0710_CLP_CONVEYOR_MAX_BLOCKS)
+		ndesc = spb * SC0710_CLP_CONVEYOR_MAX_BLOCKS;
+	cv->nblocks = DIV_ROUND_UP(ndesc, spb);
+	cv->segs_per_block = spb;
+
+	for (i = 0; i < cv->nblocks; i++) {
+		cv->block[i].size = spb * seg;
+		cv->block[i].cpu = dma_alloc_coherent(&dev->pci->dev,
+			cv->block[i].size, &cv->block[i].dma, GFP_KERNEL);
+		if (!cv->block[i].cpu) {
+			cv->nblocks = i;
+			sc0710_clp_conveyor_free(ch);
+			return -ENOMEM;
+		}
+		memset(cv->block[i].cpu, 0, cv->block[i].size);
+	}
+
+	for (i = 0; i < SC0710_CLP_INPUTS; i++) {
+		cv->frame[i] = vzalloc(SC0710_CLP_ASM_SIZE);
+		cv->out[i] = vzalloc(SC0710_CLP_SIZEIMAGE);
+		if (!cv->frame[i] || !cv->out[i]) {
+			sc0710_clp_conveyor_free(ch);
+			return -ENOMEM;
+		}
+	}
+
+	cv->seg = seg;
+	cv->ndesc = ndesc;
+
+	printk(KERN_INFO "%s: [ch%d] conveyor: %u descriptors x %u bytes (%u KiB ring, %u blocks), %u-byte source lines\n",
+		dev->name, ch->nr, ndesc, seg, (ndesc * seg) >> 10, cv->nblocks,
+		cv->source_width);
+	return 0;
+}
+
+/* Write the circular descriptor ring into the page table: descriptors in
+ * the first half of pt, one 32-byte writeback slot per descriptor in the
+ * second half. Nothing here is ever rewritten while the engine runs. */
+static void sc0710_clp_conveyor_link(struct sc0710_dma_channel *ch)
+{
+	struct sc0710_clp_conveyor *cv = &ch->cv;
+	struct sc0710_dma_descriptor *d = (struct sc0710_dma_descriptor *)ch->pt_cpu;
+	dma_addr_t wbm = ch->pt_dma + ch->pt_size / 2;
+	u32 i;
+
+	const u32 per_page = PAGE_SIZE / sizeof(*d);
+
+	for (i = 0; i < cv->ndesc; i++, d++) {
+		dma_addr_t buf = cv->block[i / cv->segs_per_block].dma +
+			(dma_addr_t)(i % cv->segs_per_block) * cv->seg;
+		u32 nidx = (i + 1) % cv->ndesc;
+		dma_addr_t next = ch->pt_dma + nidx * sizeof(*d);
+		dma_addr_t wb = wbm + (dma_addr_t)i * 32;
+		/* Nxt_adj: how many descriptors contiguously follow the next
+		 * one (same 4K page, in ring order), so the fetcher pulls
+		 * descriptors in batches of up to 64 instead of one HostRAM
+		 * round-trip per segment - a fetch stall is exactly when the
+		 * FPGA drops bytes. */
+		u32 adj = min_t(u32, 63, per_page - 1 - (nidx % per_page));
+
+		if (nidx + adj >= cv->ndesc)
+			adj = cv->ndesc - 1 - nidx;
+
+		d->control     = 0xAD4B0000 | (adj << 8);
+		d->lengthBytes = cv->seg;
+		d->src_l       = (u32)wb;
+		d->src_h       = (u32)((u64)wb >> 32);
+		d->dst_l       = (u32)buf;
+		d->dst_h       = (u32)((u64)buf >> 32);
+		d->next_l      = (u32)next;
+		d->next_h      = (u32)((u64)next >> 32);
+	}
+	wmb();
+}
+
 /* Copy the contains of the video chain into a video4linux buffer.
  * Return < 0 on error
  * Return number of buffers we copyinto from dma into user buffers.
- * 
+ *
  * @cached_framesize: Frame size cached at service start to prevent mid-operation changes.
  *                    This ensures consistent behavior even if dev->fmt changes during processing.
  */
@@ -574,8 +1188,7 @@ static void sc0710_dma_dequeue_audio(struct sc0710_dma_channel *ch, struct sc071
 	struct sc0710_dma_descriptor_chain_allocation *dca = &chain->allocations[0];
 	int samplesPerChannel;
 	int stride = 16;
-	int ret;
-	int i;
+	int i, input;
 
 	if (chain->numAllocations != 1) {
 		printk("%s() allocations should be one, dma issue?\n", __func__);
@@ -585,12 +1198,16 @@ static void sc0710_dma_dequeue_audio(struct sc0710_dma_channel *ch, struct sc071
 
 		samplesPerChannel = dca->buf_size / stride;
 
-		ret = sc0710_audio_deliver_samples(ch->dev, ch,
-			(const u8 *)dca->buf_cpu,
-			16,     /* bitwidth */
-			stride,
-			2,      /* channels */
-			samplesPerChannel);
+		for (input = 0; input < SC0710_CLP_INPUTS; input++) {
+			if (!ch->audio_dev[input])
+				continue;
+			sc0710_audio_deliver_samples(ch->dev, ch, input,
+				(const u8 *)dca->buf_cpu + input * 4,
+				16,     /* bitwidth */
+				stride,
+				2,      /* channels */
+				samplesPerChannel);
+		}
 
 		dca++;
 	}
@@ -1069,6 +1686,13 @@ int sc0710_dma_channel_service(struct sc0710_dma_channel *ch)
 		return 0;
 	}
 
+	/* Conveyor transport: its own completion tracking and framer. */
+	if (ch->cv.ndesc && ch->mediatype == CHTYPE_VIDEO) {
+		consumed = sc0710_clp_conveyor_service(ch);
+		mutex_unlock(&ch->lock);
+		return consumed;
+	}
+
 	cached_fmt = READ_ONCE(dev->fmt);
 	cached_framesize = sc0710_framesize(dev, cached_fmt);
 	cached_width = cached_fmt ? cached_fmt->width : 0;
@@ -1462,9 +2086,40 @@ int sc0710_dma_channel_resize(struct sc0710_dev *dev, u32 nr, enum sc0710_channe
 	}
 
 	sc0710_dma_chains_free(ch);
+	sc0710_clp_conveyor_free(ch);
 
 	printk(KERN_INFO "%s channel %d resized for framesize %d\n",
 		dev->name, nr, sc0710_framesize(dev, dev->fmt));
+
+	/* Cam Link Pro video: the conveyor transport replaces the whole-frame
+	 * chains entirely. Its descriptor ring lives in a page table sized
+	 * for the ring (descriptors in the first half, writeback slots in
+	 * the second). */
+	if (ch->mediatype == CHTYPE_VIDEO &&
+	    dev->board == SC0710_BOARD_ELGATO_CAMLINK_PRO) {
+		ret = sc0710_clp_conveyor_build(ch);
+		if (ret < 0) {
+			printk(KERN_ERR "%s: channel %d conveyor allocation failed (%d); channel unusable until the next resize\n",
+				dev->name, nr, ret);
+			return ret;
+		}
+		ch->numDescriptorChains = 0;
+		ch->buf_size = ch->cv.ndesc * ch->cv.seg;
+
+		ch->pt_size = 2 * ALIGN(ch->cv.ndesc *
+			sizeof(struct sc0710_dma_descriptor), PAGE_SIZE);
+		ch->pt_cpu = dma_alloc_coherent(&dev->pci->dev, ch->pt_size,
+			&ch->pt_dma, GFP_KERNEL);
+		if (!ch->pt_cpu) {
+			sc0710_clp_conveyor_free(ch);
+			printk(KERN_ERR "%s: channel %d conveyor page table allocation failed\n",
+				dev->name, nr);
+			return -ENOMEM;
+		}
+		memset(ch->pt_cpu, 0, ch->pt_size);
+		sc0710_clp_conveyor_link(ch);
+		return 0;
+	}
 
 	if (ch->mediatype == CHTYPE_VIDEO) {
 		ch->numDescriptorChains = DMA_TRANSFER_CHAINS;
@@ -1532,6 +2187,7 @@ void sc0710_dma_channel_free(struct sc0710_dev *dev, u32 nr)
 	/* The V4L2/ALSA nodes are taken down by the remove path before any
 	 * hardware teardown; this frees DMA resources only. */
 	sc0710_dma_chains_free(ch);
+	sc0710_clp_conveyor_free(ch);
 
 	if (sc0710_debug_mode)
 		printk(KERN_INFO "%s channel %d deallocated\n", dev->name, nr);
@@ -1578,6 +2234,24 @@ int sc0710_dma_channel_start_prep(struct sc0710_dma_channel *ch)
 	for (i = 0; i < ch->numDescriptorChains; i++)
 		total_descriptors += ch->chains[i].numAllocations;
 	ch->sg_total_descriptors = total_descriptors;
+
+	/* Conveyor: fresh session, fresh framer. The engine's completed count
+	 * was just zeroed above; consumed tracking and the frame phase both
+	 * restart from zero (a fresh pipeline GO starts frame-aligned). */
+	if (ch->cv.ndesc) {
+		ch->sg_total_descriptors = ch->cv.ndesc;
+		memset((u8 *)ch->pt_cpu + ch->pt_size / 2, 0, ch->pt_size / 2);
+		ch->cv.consumed = 0;
+		ch->cv.stream_bytes = 0;
+		ch->cv.chunk_fill = 0;
+		ch->cv.synced = true; /* a fresh GO starts on the chunk grid */
+		memset(ch->cv.lines_placed, 0, sizeof(ch->cv.lines_placed));
+		/* First fetch's adjacency hint (descriptor 0 sits at the head
+		 * of a fresh 4K page of contiguous descriptors). */
+		sc_write(ch->dev, 1, ch->reg_sg_adj,
+			min3((u32)63, (u32)(PAGE_SIZE / sizeof(struct sc0710_dma_descriptor)) - 1,
+				ch->cv.ndesc - 1));
+	}
 
 	/* The writeback ping-pong restarts on clean first halves: residue
 	 * from a previous session must not read as completion or staleness. */

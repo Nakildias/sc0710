@@ -40,6 +40,11 @@ struct sc0710_board sc0710_boards[] = {
 		.name		= "Elgato 4K Pro",
 		.bar1_index	= 1,
 	},
+
+	[SC0710_BOARD_ELGATO_CAMLINK_PRO] = {
+		.name		= "Elgato Cam Link Pro",
+		.bar1_index	= 1,
+	},
 };
 const unsigned int sc0710_bcount = ARRAY_SIZE(sc0710_boards);
 
@@ -52,6 +57,10 @@ struct sc0710_subid sc0710_subids[] = {
 		.subvendor = 0x1cfa,
 		.subdevice = 0x0012,
 		.card      = SC0710_BOARD_ELGATEO_4KP,
+	}, {
+		.subvendor = 0x1cfa,
+		.subdevice = 0x0011,
+		.card      = SC0710_BOARD_ELGATO_CAMLINK_PRO,
 	}
 };
 const unsigned int sc0710_idcount = ARRAY_SIZE(sc0710_subids);
@@ -90,6 +99,8 @@ void sc0710_gpio_setup(struct sc0710_dev *dev)
 	case SC0710_BOARD_ELGATEO_4KP60_MK2:
 
 	case SC0710_BOARD_ELGATEO_4KP:
+
+	case SC0710_BOARD_ELGATO_CAMLINK_PRO:
 		break;
 	}
 }
@@ -207,6 +218,17 @@ void *sc0710_firmware_load(struct sc0710_dev *dev, const char *rel, size_t *out_
 }
 
 MODULE_FIRMWARE("sc0710/SC0710.FWI.HEX");
+MODULE_FIRMWARE("sc0710/CAMLINKPRO.FWI.HEX");
+
+/* Each ECP5 board ships its own bitstream: the 4K Pro blob will not
+ * configure the Cam Link Pro's larger LFE5U-85F, so they get distinct
+ * file names rather than sharing SC0710.FWI.HEX. */
+static const char *sc0710_ecp5_firmware_name(struct sc0710_dev *dev)
+{
+	if (dev->board == SC0710_BOARD_ELGATO_CAMLINK_PRO)
+		return "CAMLINKPRO.FWI.HEX";
+	return "SC0710.FWI.HEX";
+}
 
 static void ecp5_spi_reset(struct sc0710_dev *dev)
 {
@@ -462,7 +484,7 @@ static int sc0710_ecp5_firmware_check(struct sc0710_dev *dev)
 {
 	u8 *fw_data;
 	size_t fw_size;
-	u32 idcode, half_size, status;
+	u32 idcode, payload, first_len, second_len, status;
 	u8 *decoded;
 	int ret, i;
 
@@ -484,12 +506,12 @@ static int sc0710_ecp5_firmware_check(struct sc0710_dev *dev)
 	/* Cold boot: PCI/FPGA may need extra settle time before SPI programming. */
 	msleep(1500);
 
-	fw_data = sc0710_firmware_load(dev, "SC0710.FWI.HEX", &fw_size);
+	fw_data = sc0710_firmware_load(dev, sc0710_ecp5_firmware_name(dev), &fw_size);
 	if (!fw_data) {
-		printk(KERN_ERR "%s: Failed to load firmware sc0710/SC0710.FWI.HEX\n",
-			dev->name);
-		printk(KERN_ERR "%s: Place SC0710.FWI.HEX in /lib/firmware/sc0710/\n",
-			dev->name);
+		printk(KERN_ERR "%s: Failed to load firmware sc0710/%s\n",
+			dev->name, sc0710_ecp5_firmware_name(dev));
+		printk(KERN_ERR "%s: Place %s in /lib/firmware/sc0710/\n",
+			dev->name, sc0710_ecp5_firmware_name(dev));
 		printk(KERN_ERR "%s: Or in /var/lib/sc0710/firmware/ for atomic distros\n",
 			dev->name);
 		return -ENOENT;
@@ -503,30 +525,37 @@ static int sc0710_ecp5_firmware_check(struct sc0710_dev *dev)
 		return -EINVAL;
 	}
 
-	half_size = (fw_size - FWI_HEADER_SIZE) / 2;
-
-	/* FWI format: 16-byte header + two halves with swapped order.
-	 * Full .bit file = (second half XOR 0xA5) + (first half XOR 0x5A).
-	 * Windows sends all 356,448 bytes including text header.
+	/* FWI format: 16-byte header + the bitstream stored as two halves in
+	 * swapped order. Full .bit file = (second half XOR 0xA5) + (first
+	 * half XOR 0x5A). When the payload length is odd (Cam Link Pro:
+	 * 622,035 bytes) the FIRST stored half is the longer one; a floor
+	 * split starts the stream one byte early and truncates its tail,
+	 * and the ECP5 rejects the result with a CRC error at the end of
+	 * the burst. The 4K Pro blob is even-sized, so both splits agree
+	 * there. Windows sends every decoded byte including text header.
 	 */
-	decoded = vmalloc(half_size * 2);
+	payload = fw_size - FWI_HEADER_SIZE;
+	first_len = (payload + 1) / 2;
+	second_len = payload - first_len;
+
+	decoded = vmalloc(payload);
 	if (!decoded) {
 		vfree(fw_data);
 		return -ENOMEM;
 	}
 
 	/* First part of bitstream: FWI second half XOR 0xA5 */
-	for (i = 0; i < half_size; i++)
-		decoded[i] = fw_data[FWI_HEADER_SIZE + half_size + i] ^ FWI_XOR_SECOND;
+	for (i = 0; i < second_len; i++)
+		decoded[i] = fw_data[FWI_HEADER_SIZE + first_len + i] ^ FWI_XOR_SECOND;
 
 	/* Second part of bitstream: FWI first half XOR 0x5A */
-	for (i = 0; i < half_size; i++)
-		decoded[half_size + i] = fw_data[FWI_HEADER_SIZE + i] ^ FWI_XOR_FIRST;
+	for (i = 0; i < first_len; i++)
+		decoded[second_len + i] = fw_data[FWI_HEADER_SIZE + i] ^ FWI_XOR_FIRST;
 
 	vfree(fw_data);
 
 	for (i = 0; i < 3; i++) {
-		ret = ecp5_program_bitstream(dev, decoded, half_size * 2);
+		ret = ecp5_program_bitstream(dev, decoded, payload);
 		if (!ret)
 			break;
 		printk(KERN_WARNING "%s: ECP5 programming attempt %d failed, retrying...\n",
@@ -540,6 +569,34 @@ static int sc0710_ecp5_firmware_check(struct sc0710_dev *dev)
 			dev->name, ret);
 
 	return ret;
+}
+
+/* Soft reset and configure all 8 AXI IIC instances (0x3000-0x3E00).
+ * Windows driver initializes all 8 identically. Each instance is
+ * at a 0x200 offset: SOFTR at base+0x040, timing at base+0x128..0x144.
+ * Without the soft reset, the I2C controller starts wedged. Shared by
+ * the ECP5-based boards (4K Pro and Cam Link Pro, both SC400-family
+ * FPGA designs). */
+static void sc0710_axi_iic_init(struct sc0710_dev *dev)
+{
+	int iic;
+
+	for (iic = 0; iic < 8; iic++) {
+		u32 base = 0x3000 + (iic * 0x200);
+		sc_write(dev, 0, base + 0x040, 0x0000000a); /* SOFTR */
+	}
+	udelay(10);
+	for (iic = 0; iic < 8; iic++) {
+		u32 base = 0x3000 + (iic * 0x200);
+		sc_write(dev, 0, base + 0x128, 0x0000002d); /* TSUSTA */
+		sc_write(dev, 0, base + 0x12c, 0x0000002d); /* TSUSTO */
+		sc_write(dev, 0, base + 0x130, 0x0000002d); /* THDSTA */
+		sc_write(dev, 0, base + 0x134, 0x00000014); /* TSUDAT */
+		sc_write(dev, 0, base + 0x138, 0x00000050); /* TBUF */
+		sc_write(dev, 0, base + 0x13c, 0x00000076); /* THIGH */
+		sc_write(dev, 0, base + 0x140, 0x00000076); /* TLOW */
+		sc_write(dev, 0, base + 0x144, 0x00000001); /* THDDAT */
+	}
 }
 
 int sc0710_card_setup(struct sc0710_dev *dev)
@@ -580,30 +637,7 @@ int sc0710_card_setup(struct sc0710_dev *dev)
 
 		sc_write(dev, 0, BAR0_00C4, 0x000f0000);
 
-		/* Soft reset and configure all 8 AXI IIC instances (0x3000-0x3E00).
-		 * Windows driver initializes all 8 identically. Each instance is
-		 * at a 0x200 offset: SOFTR at base+0x040, timing at base+0x128..0x144.
-		 * Without the soft reset, the 4K Pro's I2C controller starts wedged.
-		 */
-		{
-			int iic;
-			for (iic = 0; iic < 8; iic++) {
-				u32 base = 0x3000 + (iic * 0x200);
-				sc_write(dev, 0, base + 0x040, 0x0000000a); /* SOFTR */
-			}
-			udelay(10);
-			for (iic = 0; iic < 8; iic++) {
-				u32 base = 0x3000 + (iic * 0x200);
-				sc_write(dev, 0, base + 0x128, 0x0000002d); /* TSUSTA */
-				sc_write(dev, 0, base + 0x12c, 0x0000002d); /* TSUSTO */
-				sc_write(dev, 0, base + 0x130, 0x0000002d); /* THDSTA */
-				sc_write(dev, 0, base + 0x134, 0x00000014); /* TSUDAT */
-				sc_write(dev, 0, base + 0x138, 0x00000050); /* TBUF */
-				sc_write(dev, 0, base + 0x13c, 0x00000076); /* THIGH */
-				sc_write(dev, 0, base + 0x140, 0x00000076); /* TLOW */
-				sc_write(dev, 0, base + 0x144, 0x00000001); /* THDDAT */
-			}
-		}
+		sc0710_axi_iic_init(dev);
 
 		sc_write(dev, 1, BAR1_0094, 0x00fffe3e);
 		sc_write(dev, 1, BAR1_0008, 0x00fffe3e);
@@ -629,6 +663,39 @@ int sc0710_card_setup(struct sc0710_dev *dev)
 		sc_write(dev, 0, BAR0_00D0, 0x4100);
 		sc_set(dev, 0, BAR0_00D0, 0x0001);    /* pipeline enable */
 		sc_write(dev, 0, 0xEC, 0x00000020);   /* scaler enable */
+		break;
+	case SC0710_BOARD_ELGATO_CAMLINK_PRO:
+		/* Same ECP5-on-AXI-SPI arrangement as the 4K Pro, but a larger
+		 * part (LFE5U-85F) carrying the four-input SC400_N4_HDMI design.
+		 * The config SRAM is blank on a cold boot; without the upload
+		 * the video frontend is dead, so a failure fails the probe. */
+		ret = sc0710_ecp5_firmware_check(dev);
+		if (ret < 0)
+			return ret;
+
+		sc_write(dev, 0, BAR0_00C4, 0x000f0000);
+
+		sc0710_axi_iic_init(dev);
+
+		/* XDMA interrupt/control setup, identical on the siblings.
+		 * No Windows register trace exists for this board (HVCI blocked
+		 * the dump tools), so start from the common list and only the
+		 * first video channel; the 4K Pro's early pipeline/scaler
+		 * writes are board-specific trace values and are left out. */
+		sc_write(dev, 1, BAR1_0094, 0x00fffe3e);
+		sc_write(dev, 1, BAR1_0008, 0x00fffe3e);
+		sc_write(dev, 1, BAR1_0194, 0x00fffe3e);
+		sc_write(dev, 1, BAR1_0108, 0x00fffe3e);
+		sc_write(dev, 1, BAR1_1094, 0x00fffe7e);
+		sc_write(dev, 1, BAR1_1008, 0x00fffe7e);
+		sc_write(dev, 1, BAR1_1194, 0x00fffe7e);
+		sc_write(dev, 1, BAR1_1108, 0x00fffe7e);
+		sc_write(dev, 1, BAR1_2080, 0);
+		sc_write(dev, 1, BAR1_2084, 0);
+		sc_write(dev, 1, BAR1_2088, 0);
+		sc_write(dev, 1, BAR1_208C, 0);
+		sc_write(dev, 1, BAR1_20A0, 0);
+		sc_write(dev, 1, BAR1_20A4, 0);
 		break;
 	}
 

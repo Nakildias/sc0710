@@ -235,15 +235,19 @@ else
     trace_clear "No /var/log/sc0710"
 fi
 
-# --- 4K Pro firmware ---
-section "4K Pro firmware"
+# --- ECP5 runtime firmware ---
+section "ECP5 runtime firmware"
 
 firmware_any=false
 for fw in \
     "/var/lib/sc0710/firmware/SC0710.FWI.HEX" \
+    "/var/lib/sc0710/firmware/CAMLINKPRO.FWI.HEX" \
     "/home/sc0710/firmware/SC0710.FWI.HEX" \
+    "/home/sc0710/firmware/CAMLINKPRO.FWI.HEX" \
     "/lib/firmware/sc0710/SC0710.FWI.HEX" \
-    "/etc/firmware/sc0710/SC0710.FWI.HEX"; do
+    "/lib/firmware/sc0710/CAMLINKPRO.FWI.HEX" \
+    "/etc/firmware/sc0710/SC0710.FWI.HEX" \
+    "/etc/firmware/sc0710/CAMLINKPRO.FWI.HEX"; do
     if [[ -f "$fw" || -L "$fw" ]]; then
         firmware_any=true
         trace_found "Firmware file or symlink still present" "$fw"
@@ -276,7 +280,7 @@ for fwdir in \
 done
 
 if [[ "$firmware_any" == "false" ]]; then
-    trace_clear "No 4K Pro firmware files found"
+    trace_clear "No ECP5 runtime firmware files found"
 fi
 
 # --- Summary ---

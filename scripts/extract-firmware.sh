@@ -2,18 +2,19 @@
 # Copyright (C) 2025-2026 Nakildias <nakildiaspro@gmail.com>
 # SPDX-License-Identifier: GPL-2.0-or-later
 #
-# Extract the Elgato 4K Pro bits the driver needs from Elgato's own packages and
+# Extract the Elgato ECP5 bits the driver needs from Elgato's own packages and
 # install them under the firmware directory:
 #
-#   1. SC0710.FWI.HEX — the ECP5 runtime firmware, streamed to the FPGA at every
-#      boot. Ships ONLY in the driver installer (.exe).
+#   1. SC0710.FWI.HEX (4K Pro) or CAMLINKPRO.FWI.HEX (Cam Link Pro) — ECP5
+#      runtime firmware, streamed to the FPGA at every boot. Each ships only in
+#      that card's official driver installer (.exe).
 #   2. EDID profiles — named EDIDFiles/*.bin inside the Elgato Studio app package
 #      (.msix). Installed as .../sc0710/edid/<name>.bin for the edid= module param.
 #
 # Note the two-package split: the driver installer carries the runtime firmware;
 # Studio carries the EDIDs (plus persistent-flash updater payloads, which this
-# script deliberately does NOT touch — those reflash the card). Both URLs below
-# are the latest versions as of 2026-07.
+# script deliberately does NOT touch — those reflash the card). Package versions
+# and checksums are pinned below for reproducible extraction.
 #
 # Packages are looked for on disk first (CWD, then next to this script); if absent
 # the script ASKS before downloading — never silently. Every package (local or
@@ -24,17 +25,23 @@
 # Non-atomic: installs to /lib/firmware/sc0710/
 #
 # Requires: 7z (p7zip); curl for approved downloads.
-# Usage: sudo bash extract-firmware.sh [--installer FILE.exe] [--studio FILE.msix]
+# Usage: sudo bash extract-firmware.sh [--force] [--installer FILE.exe]
+#        [--cam-link-pro-installer FILE.exe] [--studio FILE.msix]
 
 set -e
 
 DRIVER_URL="https://edge.elgato.com/egc/windows/drivers/4K_Pro/Elgato_4KPro_1.1.0.202.exe"
 DRIVER_EXE="Elgato_4KPro_1.1.0.202.exe"
 DRIVER_SHA256="b65fa18fe022b17379a6552a91d11272e3792cf363bc18b96d514db562fd1e71"
+CAM_LINK_PRO_DRIVER_URL="https://edge.elgato.com/egc/windows/drivers/cam_link_pro/Cam_Link_Pro_1.1.0.194.6.exe"
+CAM_LINK_PRO_DRIVER_EXE="Cam_Link_Pro_1.1.0.194.6.exe"
+CAM_LINK_PRO_DRIVER_SHA256="2e9087819d36d679e794ae008c6f73c5cb94622803bf7cf8df6084a9a1fbe19c"
 STUDIO_URL="https://edge.elgato.com/egc/windows/estw/1.1.0/Elgato.Studio_1.1.0.1714_x64.msix"
 STUDIO_MSIX="Elgato.Studio_1.1.0.1714_x64.msix"
 STUDIO_SHA256="cfdefa7529cb35b2f1d2dc7d84cf89a3c15dccba7a442d72a534f3a15e2f185e"
-FIRMWARE_FILE="SC0710.FWI.HEX"
+FOUR_K_PRO_FIRMWARE_FILE="SC0710.FWI.HEX"
+CAM_LINK_PRO_FIRMWARE_FILE="CAMLINKPRO.FWI.HEX"
+CAM_LINK_PRO_FIRMWARE_SHA256="ef3e792e8072c3a1d8b003ed4a92bcbedba6256719f866f2bfcbeed092f50b22"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 # Colors
@@ -52,10 +59,14 @@ error(){ echo -e "${RED}error:${NC} $*" >&2; }
 
 # --- Args ---
 DRIVER_PATH=""
+CAM_LINK_PRO_DRIVER_PATH=""
 STUDIO_PATH=""
+FORCE=0
 while [[ $# -gt 0 ]]; do
     case "$1" in
+        --force) FORCE=1 ;;
         --installer) DRIVER_PATH="${2:?missing path after --installer}"; shift ;;
+        --cam-link-pro-installer) CAM_LINK_PRO_DRIVER_PATH="${2:?missing path after --cam-link-pro-installer}"; shift ;;
         --studio)    STUDIO_PATH="${2:?missing path after --studio}"; shift ;;
         -h|--help)   awk 'NR==1{next} /^#/{sub(/^# ?/,""); print; next} {exit}' "$0"; exit 0 ;;
         *) error "unknown option: $1 (see --help)"; exit 1 ;;
@@ -78,33 +89,56 @@ is_atomic() {
 # --- Set paths based on distro type ---
 if is_atomic; then
     FIRMWARE_STORE="/var/lib/sc0710/firmware"
-    FIRMWARE_PATH="$FIRMWARE_STORE/$FIRMWARE_FILE"
     EDID_DIR="$FIRMWARE_STORE/edid"
     DISTRO_TYPE="atomic"
 else
     FIRMWARE_DIR="/lib/firmware/sc0710"
-    FIRMWARE_PATH="$FIRMWARE_DIR/$FIRMWARE_FILE"
     EDID_DIR="$FIRMWARE_DIR/edid"
     DISTRO_TYPE="non-atomic"
 fi
 
 # --- What's still missing? ---
-NEED_FIRMWARE=1
-if [[ -f "$FIRMWARE_PATH" ]]; then
-    echo -e "${GREEN}[OK]${NC} Firmware already present at $FIRMWARE_PATH"
-    NEED_FIRMWARE=0
-elif [[ "$DISTRO_TYPE" == "atomic" && -f "/lib/firmware/sc0710/$FIRMWARE_FILE" ]]; then
-    echo -e "${GREEN}[OK]${NC} Firmware already present at /lib/firmware/sc0710/$FIRMWARE_FILE"
-    NEED_FIRMWARE=0
+WANT_4K_PRO=0
+WANT_CAM_LINK_PRO=0
+[[ -n "$DRIVER_PATH" ]] && WANT_4K_PRO=1
+[[ -n "$CAM_LINK_PRO_DRIVER_PATH" ]] && WANT_CAM_LINK_PRO=1
+lspci -n -v -d 12ab:0710 2>/dev/null | grep -qi '1cfa:0012' && WANT_4K_PRO=1
+lspci -n -v -d 12ab:0710 2>/dev/null | grep -qi '1cfa:0011' && WANT_CAM_LINK_PRO=1
+
+firmware_installed_path() {
+    local file="$1" path
+    if [[ "$DISTRO_TYPE" == "atomic" ]]; then
+        for path in "$FIRMWARE_STORE/$file" "/lib/firmware/sc0710/$file" "/etc/firmware/sc0710/$file"; do
+            [[ -f "$path" ]] && { printf '%s' "$path"; return 0; }
+        done
+    elif [[ -f "$FIRMWARE_DIR/$file" ]]; then
+        printf '%s' "$FIRMWARE_DIR/$file"
+        return 0
+    fi
+    return 1
+}
+
+NEED_4K_PRO_FIRMWARE="$WANT_4K_PRO"
+NEED_CAM_LINK_PRO_FIRMWARE="$WANT_CAM_LINK_PRO"
+if [[ "$FORCE" -eq 0 && "$WANT_4K_PRO" -eq 1 ]] && path="$(firmware_installed_path "$FOUR_K_PRO_FIRMWARE_FILE")"; then
+    echo -e "${GREEN}[OK]${NC} 4K Pro firmware already present at $path"
+    NEED_4K_PRO_FIRMWARE=0
+fi
+if [[ "$FORCE" -eq 0 && "$WANT_CAM_LINK_PRO" -eq 1 ]] && path="$(firmware_installed_path "$CAM_LINK_PRO_FIRMWARE_FILE")"; then
+    echo -e "${GREEN}[OK]${NC} Cam Link Pro firmware already present at $path"
+    NEED_CAM_LINK_PRO_FIRMWARE=0
 fi
 
-NEED_EDID=1
-if [[ -d "$EDID_DIR" ]] && ls "$EDID_DIR"/*.bin &>/dev/null; then
+NEED_EDID=0
+if [[ "$WANT_4K_PRO" -eq 1 || -n "$STUDIO_PATH" ]]; then
+    NEED_EDID=1
+fi
+if [[ "$NEED_EDID" -eq 1 && -d "$EDID_DIR" ]] && ls "$EDID_DIR"/*.bin &>/dev/null; then
     echo -e "${GREEN}[OK]${NC} EDID profiles already present in $EDID_DIR"
     NEED_EDID=0
 fi
 
-if [[ "$NEED_FIRMWARE" -eq 0 && "$NEED_EDID" -eq 0 ]]; then
+if [[ "$NEED_4K_PRO_FIRMWARE" -eq 0 && "$NEED_CAM_LINK_PRO_FIRMWARE" -eq 0 && "$NEED_EDID" -eq 0 ]]; then
     exit 0
 fi
 
@@ -183,9 +217,9 @@ install_deps() {
 }
 
 if [[ "$DISTRO_TYPE" == "atomic" ]]; then
-    msg "Elgato 4K Pro Firmware Extractor (Atomic Edition)"
+    msg "Elgato SC0710 Firmware Extractor (Atomic Edition)"
 else
-    msg "Elgato 4K Pro Firmware Extractor"
+    msg "Elgato SC0710 Firmware Extractor"
 fi
 echo ""
 
@@ -241,37 +275,54 @@ obtain_package() {
     echo "$found"
 }
 
-# --- Stage 1: runtime firmware (required) ---
-if [[ "$NEED_FIRMWARE" -eq 1 ]]; then
-    msg "Runtime firmware ($FIRMWARE_FILE) — from the driver installer"
-    SRC_EXE="$(obtain_package "$DRIVER_EXE" "$DRIVER_URL" "$DRIVER_PATH" "~5 MB" "$DRIVER_SHA256")" || exit 1
-
-    msg "Extracting firmware..."
-    7z x -y -o"$TMPDIR/extracted" "$SRC_EXE" "Final/Game_Capture_4K_Pro/$FIRMWARE_FILE" > /dev/null
-
-    SRC="$TMPDIR/extracted/Final/Game_Capture_4K_Pro/$FIRMWARE_FILE"
-    if [[ ! -f "$SRC" ]]; then
-        error "$FIRMWARE_FILE not found in installer."
-        exit 1
-    fi
-
-    msg "Installing firmware..."
+install_runtime_firmware() {
+    local src="$1" file="$2"
     if [[ "$DISTRO_TYPE" == "atomic" ]]; then
         mkdir -p "$FIRMWARE_STORE"
-        cp "$SRC" "$FIRMWARE_STORE/$FIRMWARE_FILE"
-        chcon -t firmware_t "$FIRMWARE_STORE/$FIRMWARE_FILE" 2>/dev/null || true
-        msg2 "Firmware stored at: $FIRMWARE_STORE/$FIRMWARE_FILE"
+        install -m644 "$src" "$FIRMWARE_STORE/$file"
+        chcon -t firmware_t "$FIRMWARE_STORE/$file" 2>/dev/null || true
+        msg2 "Firmware stored at: $FIRMWARE_STORE/$file"
 
         # Symlink for the kernel firmware loader on immutable distros
         mkdir -p "/etc/firmware/sc0710"
-        ln -sfn "$FIRMWARE_STORE/$FIRMWARE_FILE" "/etc/firmware/sc0710/$FIRMWARE_FILE"
-        chcon -h -t firmware_t "/etc/firmware/sc0710/$FIRMWARE_FILE" 2>/dev/null || true
-        msg2 "Symlink created: /etc/firmware/sc0710/$FIRMWARE_FILE -> $FIRMWARE_STORE/$FIRMWARE_FILE"
+        ln -sfn "$FIRMWARE_STORE/$file" "/etc/firmware/sc0710/$file"
+        chcon -h -t firmware_t "/etc/firmware/sc0710/$file" 2>/dev/null || true
+        msg2 "Symlink created: /etc/firmware/sc0710/$file -> $FIRMWARE_STORE/$file"
     else
         mkdir -p "$FIRMWARE_DIR"
-        cp "$SRC" "$FIRMWARE_DIR/$FIRMWARE_FILE"
-        msg2 "Firmware installed to $FIRMWARE_DIR/$FIRMWARE_FILE"
+        install -m644 "$src" "$FIRMWARE_DIR/$file"
+        msg2 "Firmware installed to $FIRMWARE_DIR/$file"
     fi
+}
+
+# --- Stage 1: runtime firmware (required for the detected ECP5 card) ---
+if [[ "$NEED_4K_PRO_FIRMWARE" -eq 1 ]]; then
+    msg "4K Pro runtime firmware ($FOUR_K_PRO_FIRMWARE_FILE)"
+    SRC_EXE="$(obtain_package "$DRIVER_EXE" "$DRIVER_URL" "$DRIVER_PATH" "~5 MB" "$DRIVER_SHA256")" || exit 1
+
+    msg "Extracting firmware from the official Elgato driver..."
+    7z x -y -o"$TMPDIR/4k-pro" "$SRC_EXE" "Final/Game_Capture_4K_Pro/$FOUR_K_PRO_FIRMWARE_FILE" > /dev/null
+    SRC="$TMPDIR/4k-pro/Final/Game_Capture_4K_Pro/$FOUR_K_PRO_FIRMWARE_FILE"
+    [[ -f "$SRC" ]] || { error "$FOUR_K_PRO_FIRMWARE_FILE not found in installer."; exit 1; }
+
+    msg "Installing firmware..."
+    install_runtime_firmware "$SRC" "$FOUR_K_PRO_FIRMWARE_FILE"
+    echo -e "${GREEN}[OK]${NC} Firmware installed successfully."
+    echo ""
+fi
+
+if [[ "$NEED_CAM_LINK_PRO_FIRMWARE" -eq 1 ]]; then
+    msg "Cam Link Pro runtime firmware ($CAM_LINK_PRO_FIRMWARE_FILE)"
+    SRC_EXE="$(obtain_package "$CAM_LINK_PRO_DRIVER_EXE" "$CAM_LINK_PRO_DRIVER_URL" "$CAM_LINK_PRO_DRIVER_PATH" "~4 MB" "$CAM_LINK_PRO_DRIVER_SHA256")" || exit 1
+
+    msg "Extracting firmware from the official Elgato driver..."
+    7z e -y -o"$TMPDIR/cam-link-pro" "$SRC_EXE" '*CamLinkPro.HEX' > /dev/null
+    SRC="$(find "$TMPDIR/cam-link-pro" -type f -iname 'CamLinkPro.HEX' -print -quit)"
+    [[ -n "$SRC" && -f "$SRC" ]] || { error "CamLinkPro.HEX not found in installer."; exit 1; }
+    verify_sha256 "$SRC" "$CAM_LINK_PRO_FIRMWARE_SHA256" || exit 1
+
+    msg "Installing firmware..."
+    install_runtime_firmware "$SRC" "$CAM_LINK_PRO_FIRMWARE_FILE"
     echo -e "${GREEN}[OK]${NC} Firmware installed successfully."
     echo ""
 fi
