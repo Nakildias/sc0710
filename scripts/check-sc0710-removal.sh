@@ -126,6 +126,16 @@ if [[ "$cli_traces" == "false" ]]; then
     fi
 fi
 
+desktop_traces=false
+for user_home in /home/* /root; do
+    desktop_file="${user_home}/.local/share/applications/sc0710-gui.desktop"
+    if [[ -f "$desktop_file" ]]; then
+        desktop_traces=true
+        trace_found "Desktop launcher present" "$desktop_file"
+    fi
+done
+[[ "$desktop_traces" == "false" ]] && trace_clear "No sc0710-gui.desktop launcher found"
+
 if command -v pacman &>/dev/null; then
   aur_pkg_found=false
   for pkg in sc0710-dkms-git sc0710-dkms; do
