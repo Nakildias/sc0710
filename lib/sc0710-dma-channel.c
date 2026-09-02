@@ -280,27 +280,10 @@ static bool sc0710_detect_horizontal_tear(const u8 *buf, u32 width, u32 height, 
  *    to perform transfers.
  */
 
-/* Copy the contains of the video chain into a video4linux buffer.
- * Return < 0 on error
- * Return number of buffers we copyinto from dma into user buffers.
- * 
- * @cached_framesize: Frame size cached at service start to prevent mid-operation changes.
- *                    This ensures consistent behavior even if dev->fmt changes during processing.
+/* ---- Cam Link Pro line scalers -------------------------------------------
+ * The FPGA's shared output geometry follows the largest active input, so a
+ * picture can arrive 1920 wide while its node delivers 3840 (or the reverse).
  */
-/* Bring-up override for the Cam Link Pro DMA transfer size (0 = the
- * mapped SC0710_CLP_DMA_FRAMESIZE). The card streams continuously with no
- * TLAST framing, so a transfer size that differs from its true bytes-per-
- * frame makes the picture drift vertically; this lets the exact period be
- * measured from userspace. Applied at channel resize (stream start). */
-unsigned int clp_raw;
-module_param(clp_raw, uint, 0644);
-MODULE_PARM_DESC(clp_raw,
-	"Cam Link Pro bring-up: 1 = deliver the raw DMA ring bytes as GREY frames instead of unpacked NV12");
-
-unsigned int clp_dma_override;
-module_param(clp_dma_override, uint, 0644);
-MODULE_PARM_DESC(clp_dma_override,
-	"Cam Link Pro bring-up: video DMA transfer size override in bytes (0=mapped default)");
 
 /* Expand one 1920-pixel luma line to 3840 pixels. Source samples land on
  * even output pixels; odd pixels are the midpoint to the next sample. */
@@ -352,46 +335,6 @@ static void sc0710_clp_downscale_uv_line(const u8 *src, u8 *dst)
 	}
 }
 
-/* Unpack the legacy Cam Link Pro row-triplet stream into packed NV12.
- * src is one SC0710_CLP_DMA_FRAMESIZE gather; dst gets the
- * current 3840x2160 delivery shape. This old bring-up fallback only has
- * 1080 luma lines in one gather, so it doubles them vertically; normal
- * capture uses the header framer below and keeps all native lines. */
-static void sc0710_clp_unpack_nv12(const u8 *src, u8 *dst,
-	u32 source_width, u32 chunk_size)
-{
-	u8 *y = dst;
-	u8 *uv = dst + SC0710_CLP_WIDTH * SC0710_CLP_HEIGHT;
-	u32 t;
-
-	for (t = 0; t < 540; t++) {
-		const u8 *row = src + (size_t)t * 3 * chunk_size;
-
-		if (source_width == SC0710_CLP_SRC_WIDTH)
-			memcpy(y, row + SC0710_CLP_HDR, SC0710_CLP_WIDTH);
-		else
-			sc0710_clp_upscale_y_line(row + SC0710_CLP_HDR, y);
-		memcpy(y + SC0710_CLP_WIDTH, y, SC0710_CLP_WIDTH);
-		y += 2 * SC0710_CLP_WIDTH;
-		if (source_width == SC0710_CLP_SRC_WIDTH)
-			memcpy(y, row + chunk_size + SC0710_CLP_HDR,
-				SC0710_CLP_WIDTH);
-		else
-			sc0710_clp_upscale_y_line(row + chunk_size +
-				SC0710_CLP_HDR, y);
-		memcpy(y + SC0710_CLP_WIDTH, y, SC0710_CLP_WIDTH);
-		y += 2 * SC0710_CLP_WIDTH;
-		if (source_width == SC0710_CLP_SRC_WIDTH)
-			memcpy(uv, row + 2 * chunk_size + SC0710_CLP_HDR,
-				SC0710_CLP_WIDTH);
-		else
-			sc0710_clp_upscale_uv_line(row + 2 * chunk_size +
-				SC0710_CLP_HDR, uv);
-		memcpy(uv + SC0710_CLP_WIDTH, uv, SC0710_CLP_WIDTH);
-		uv += 2 * SC0710_CLP_WIDTH;
-	}
-}
-
 /* ---- Cam Link Pro conveyor transport --------------------------------------
  *
  * The vendor driver never asks the engine to carry whole frames: it runs a
@@ -399,15 +342,10 @@ static void sc0710_clp_unpack_nv12(const u8 *src, u8 *dst,
  * writeback, never rewritten while running, and rebuilds frames in software.
  * The engine can then never starve waiting on a descriptor, which is the
  * condition under which the FPGA drops bytes (the source of every visible
- * glitch on the whole-frame transport). When bytes are lost anyway, the
- * framer measures the loss from the chunk pad grid and re-phases in
+ * glitch when whole-frame chains were tried on this card). When bytes are
+ * lost anyway, the framer re-locks the chunk grid from the headers in
  * software - the hardware is never restarted for a slip.
  */
-unsigned int clp_conveyor = 1;
-module_param(clp_conveyor, uint, 0644);
-MODULE_PARM_DESC(clp_conveyor,
-	"Cam Link Pro: 1 = small-descriptor conveyor transport (default), 0 = legacy whole-frame chains. Applied at the next stream start.");
-
 unsigned int clp_conveyor_desc = 512;
 module_param(clp_conveyor_desc, uint, 0644);
 MODULE_PARM_DESC(clp_conveyor_desc,
@@ -423,10 +361,8 @@ module_param(clp_wbm_debug, uint, 0644);
 MODULE_PARM_DESC(clp_wbm_debug,
 	"Cam Link Pro conveyor: log the next N raw writeback pairs");
 
-
-/* Rows probed by the alignment checks, spread over the frame. */
-static const u16 sc0710_clp_probe_rows[] = { 1, 13, 67, 131, 263, 389, 487, 539 };
-
+/* Every chunk ends in 8 fixed pad bytes (0xff native, 0x00 on the 1920-wide
+ * selector); a dirty pad means bytes went missing inside the chunk. */
 static bool sc0710_clp_pad_bad(const u8 *pad, u32 source_width)
 {
 	u8 expected = source_width == SC0710_CLP_SRC_WIDTH ? 0xff : 0x00;
@@ -436,65 +372,6 @@ static bool sc0710_clp_pad_bad(const u8 *pad, u32 source_width)
 		if (pad[x] != expected)
 			return true;
 	return false;
-}
-
-/* Alignment gate for a gathered SC0710_CLP_DMA_FRAMESIZE frame.
- * The stream carries no framing, so a frame is trusted only if (a) the 8
- * fixed pad bytes closing every chunk land where the grid says
- * (catches sub-chunk slips) and (b) the chunk ROLES hold: interleaved UV
- * data correlates better at 2-byte than 1-byte steps (U with U, V with V),
- * luma the other way round, so the most chroma-like chunk of a triplet must
- * be the third (catches whole-chunk role rotations, which pads survive).
- * On flat grey content the role test scores near zero and abstains.
- * Returns non-zero when the frame is misaligned. */
-static int sc0710_clp_frame_misaligned(const u8 *buf, bool check_roles,
-	u32 chunk_size, u32 source_width)
-{
-	unsigned int k;
-
-	for (k = 0; k < ARRAY_SIZE(sc0710_clp_probe_rows); k++) {
-		const u8 *t = buf +
-			(size_t)sc0710_clp_probe_rows[k] * 3 * chunk_size;
-		unsigned int c;
-
-		for (c = 0; c < 3; c++) {
-			const u8 *pad = t + c * chunk_size + chunk_size - 8;
-
-			if (sc0710_clp_pad_bad(pad, source_width))
-				return 1;
-		}
-	}
-
-	/* The role test misfires on content whose luma has a strong 2-pixel
-	 * periodicity (canvas weave, sensor noise), so it only backs up the
-	 * legacy transport, where whole-chunk rotations have no other tell.
-	 * The conveyor's frames start at a hardware EOP: a rotation without
-	 * pad damage cannot happen there, and the pads above suffice. */
-	if (check_roles) {
-		long roleScore[3] = { 0, 0, 0 };
-		unsigned int c, x;
-
-		for (k = 0; k < ARRAY_SIZE(sc0710_clp_probe_rows); k++) {
-			const u8 *t = buf +
-				(size_t)sc0710_clp_probe_rows[k] * 3 * chunk_size;
-
-			for (c = 0; c < 3; c++) {
-				const u8 *d = t + c * chunk_size + 256;
-
-				for (x = 0; x < 512; x += 2)
-					roleScore[c] +=
-						abs(d[x] - d[x + 2]) -
-						abs(d[x] - d[x + 1]);
-			}
-		}
-		/* roleScore strongly negative = chroma-like. */
-		for (c = 0; c < 2; c++)
-			if (roleScore[c] < roleScore[2] &&
-			    roleScore[c] < -(long)(ARRAY_SIZE(sc0710_clp_probe_rows) * 256))
-				return 1;
-	}
-
-	return 0;
 }
 
 /* Hand one prepared packed-NV12 4K frame to every streaming client. */
@@ -545,50 +422,6 @@ static void sc0710_clp_broadcast_frame(struct sc0710_dma_channel *ch,
 
 	if (delivered || !timer_pending(&ch->timeout))
 		mod_timer(&ch->timeout, jiffies + VBUF_TIMEOUT);
-}
-
-/* Raw microscope (clp_raw=1): hand the continuous stream to userspace in
- * SC0710_CLP_DMA_FRAMESIZE slabs, no parsing - offline stream analysis. */
-static void sc0710_clp_raw_deliver(struct sc0710_dma_channel *ch)
-{
-	struct sc0710_clp_conveyor *cv = &ch->cv;
-	struct sc0710_client *client;
-	unsigned long flags;
-
-	spin_lock_irqsave(&ch->client_list_lock, flags);
-	list_for_each_entry(client, &ch->client_list, list) {
-		struct sc0710_buffer *vb_buf;
-		unsigned long bf;
-		u8 *dst;
-		unsigned long bs;
-		u32 raw_size = 540 * 3 * cv->chunk_size;
-
-		if (!client->streaming)
-			continue;
-		spin_lock_irqsave(&client->buffer_lock, bf);
-		if (list_empty(&client->buffer_list)) {
-			spin_unlock_irqrestore(&client->buffer_lock, bf);
-			continue;
-		}
-		vb_buf = list_first_entry(&client->buffer_list, struct sc0710_buffer, list);
-		dst = vb2_plane_vaddr(&vb_buf->vb.vb2_buf, 0);
-		bs = vb2_plane_size(&vb_buf->vb.vb2_buf, 0);
-		if (dst) {
-			u32 n = min_t(u32, raw_size, (u32)bs);
-
-			memcpy(dst, cv->frame[0], n);
-			vb2_set_plane_payload(&vb_buf->vb.vb2_buf, 0, n);
-			vb_buf->vb.vb2_buf.timestamp = ktime_get_ns();
-			vb_buf->vb.sequence = ch->frame_sequence;
-			vb_buf->vb.field = V4L2_FIELD_NONE;
-			list_del(&vb_buf->list);
-			vb2_buffer_done(&vb_buf->vb.vb2_buf, VB2_BUF_STATE_DONE);
-		}
-		spin_unlock_irqrestore(&client->buffer_lock, bf);
-	}
-	ch->frame_sequence++;
-	spin_unlock_irqrestore(&ch->client_list_lock, flags);
-	mod_timer(&ch->timeout, jiffies + VBUF_TIMEOUT);
 }
 
 /* A picture is complete when the next one's line 1 arrives. Native 4K is
@@ -731,24 +564,6 @@ static void sc0710_clp_framer_append(struct sc0710_dma_channel *ch,
 	const u8 *src, u32 len)
 {
 	struct sc0710_clp_conveyor *cv = &ch->cv;
-
-	if (clp_raw) {
-		u32 raw_size = 540 * 3 * cv->chunk_size;
-
-		while (len) {
-			u32 n = min(len, raw_size - cv->fill);
-
-			memcpy(cv->frame[0] + cv->fill, src, n);
-			cv->fill += n;
-			src += n;
-			len -= n;
-			if (cv->fill == raw_size) {
-				cv->fill = 0;
-				sc0710_clp_raw_deliver(ch);
-			}
-		}
-		return;
-	}
 
 	while (len) {
 		u32 n;
@@ -930,8 +745,7 @@ static int sc0710_clp_conveyor_build(struct sc0710_dma_channel *ch)
 	}
 
 	for (i = 0; i < SC0710_CLP_INPUTS; i++) {
-		cv->frame[i] = vzalloc(max_t(size_t, SC0710_CLP_ASM_SIZE,
-			SC0710_CLP_DMA_FRAMESIZE));
+		cv->frame[i] = vzalloc(SC0710_CLP_ASM_SIZE);
 		cv->out[i] = vzalloc(SC0710_CLP_SIZEIMAGE);
 		if (!cv->frame[i] || !cv->out[i]) {
 			sc0710_clp_conveyor_free(ch);
@@ -988,6 +802,13 @@ static void sc0710_clp_conveyor_link(struct sc0710_dma_channel *ch)
 	wmb();
 }
 
+/* Copy the contains of the video chain into a video4linux buffer.
+ * Return < 0 on error
+ * Return number of buffers we copyinto from dma into user buffers.
+ *
+ * @cached_framesize: Frame size cached at service start to prevent mid-operation changes.
+ *                    This ensures consistent behavior even if dev->fmt changes during processing.
+ */
 static void sc0710_dma_dequeue_video(struct sc0710_dma_channel *ch,
 	struct sc0710_dma_descriptor_chain *chain,
 	u32 cached_framesize,
@@ -1000,12 +821,6 @@ static void sc0710_dma_dequeue_video(struct sc0710_dma_channel *ch,
 	unsigned long flags;
 	u32 source_framesize = cached_framesize;
 	u32 source_w = cached_width, source_h = cached_height;
-	/* Cam Link Pro: the DMA payload (row triplets, source_framesize) and
-	 * the delivered frame (packed NV12) have different sizes and the
-	 * clients are locked to the fixed output geometry, not the detected
-	 * input timing. */
-	int clp = (dev->board == SC0710_BOARD_ELGATO_CAMLINK_PRO);
-	u32 deliver_framesize = clp ? SC0710_CLP_SIZEIMAGE : cached_framesize;
 	int frame_gathered = 0;
 	int delivered = 0;
 	int stale_clients = 0;
@@ -1031,15 +846,6 @@ static void sc0710_dma_dequeue_video(struct sc0710_dma_channel *ch,
 	/* Format negotiation refuses formats the field weave can't produce,
 	 * but the source can go interlaced mid-session; drop rather than
 	 * deliver scrambled frames. */
-	if (clp) {
-		/* Tear validation, field weaving and the host tonemap all
-		 * assume the packed YUYV/BGR payloads; none applies to the
-		 * NV12 triplet stream. */
-		ch->tear_validation_frames_left = 0;
-		want_tm = 0;
-		cached_interlaced = 0;
-	}
-
 	if (cached_interlaced && !dev->pixfmt->weave_ok) {
 		printk_ratelimited(KERN_WARNING "%s: interlaced signal with a capture format the field weave does not support, dropping frames\n",
 			dev->name);
@@ -1064,8 +870,7 @@ static void sc0710_dma_dequeue_video(struct sc0710_dma_channel *ch,
 	 * while holding spinlocks.  We size the buffer once here for
 	 * the tear-validation, interlaced weaving, and host tonemap paths.
 	 */
-	if ((cached_interlaced || ch->tear_validation_frames_left > 0 || want_tm ||
-	     clp) &&
+	if ((cached_interlaced || ch->tear_validation_frames_left > 0 || want_tm) &&
 	    (!dev->frame_staging_buf ||
 	     dev->frame_staging_size < source_framesize)) {
 		u8 *old = dev->frame_staging_buf;
@@ -1196,52 +1001,6 @@ static void sc0710_dma_dequeue_video(struct sc0710_dma_channel *ch,
 		}
 	}
 
-	/* Cam Link Pro: gather the triplet stream once; each client gets it
-	 * unpacked straight into its own buffer below. */
-	if (clp) {
-		int misaligned;
-
-		if (!dev->frame_staging_buf ||
-		    dev->frame_staging_size < source_framesize)
-			return; /* allocation failed; try again next frame */
-		if (sc0710_dma_chain_dq_to_ptr(ch, chain,
-			dev->frame_staging_buf, source_framesize) !=
-				(int)source_framesize)
-			return;
-
-		/* The stream carries no framing, and the FPGA drops bytes on
-		 * the floor whenever the DMA engine hiccups, which slides the
-		 * whole raster out of the ring grid; two bad gathers in a row
-		 * schedule the existing DMA resync, whose fresh pipeline GO
-		 * restarts the stream frame-aligned. */
-		misaligned = sc0710_clp_frame_misaligned(dev->frame_staging_buf, true,
-			sc0710_clp_chunk_size(dev), sc0710_clp_source_width(dev));
-
-		if (misaligned) {
-			ch->clp_aligned_streak = 0;
-			if (++ch->clp_misalign_count >= 2 &&
-			    !dev->tear_resync_pending &&
-			    ch->tear_resync_retries_left > 0) {
-				ch->tear_resync_retries_left--;
-				dev->tear_resync_pending = 1;
-				ch->clp_misalign_count = 0;
-				printk_ratelimited(KERN_INFO
-					"%s: stream slipped (pad check); scheduling DMA resync (%u retries left)\n",
-					dev->name, ch->tear_resync_retries_left);
-			}
-			return; /* never deliver a slipped frame */
-		}
-		ch->clp_misalign_count = 0;
-		/* A long healthy run earns the retry budget back, so weeks of
-		 * uptime aren't capped by the counter while a genuinely sick
-		 * stream still can't resync-storm. */
-		if (++ch->clp_aligned_streak >= 50) {
-			ch->clp_aligned_streak = 0;
-			ch->tear_resync_retries_left = dma_resync_max_tear_retries;
-		}
-		frame_gathered = 1;
-	}
-
 	/* Broadcast frame to all streaming clients */
 	spin_lock_irqsave(&ch->client_list_lock, flags);
 	list_for_each_entry(client, &ch->client_list, list) {
@@ -1257,8 +1016,7 @@ static void sc0710_dma_dequeue_video(struct sc0710_dma_channel *ch,
 		/* A client still locked to a different resolution gets nothing:
 		 * it was told to renegotiate via V4L2_EVENT_SOURCE_CHANGE, and
 		 * mis-sized raw delivery would corrupt the image. */
-		if (!clp &&
-		    client->stream_width && client->stream_height &&
+		if (client->stream_width && client->stream_height &&
 		    (client->stream_width != source_w ||
 		     client->stream_height != source_h)) {
 			stale_clients++;
@@ -1281,23 +1039,7 @@ static void sc0710_dma_dequeue_video(struct sc0710_dma_channel *ch,
 			continue;
 		}
 
-		if (clp && clp_raw) {
-			u32 nraw = min_t(u32, source_framesize, (u32)buffer_size);
-
-			memcpy(dst, dev->frame_staging_buf, nraw);
-			vb2_set_plane_payload(&vb_buf->vb.vb2_buf, 0, nraw);
-		} else if (clp) {
-			if (deliver_framesize > buffer_size) {
-				/* Mis-sized buffer (format renegotiation in
-				 * flight): skip rather than truncate. */
-				spin_unlock_irqrestore(&client->buffer_lock, buf_flags);
-				continue;
-			}
-			sc0710_clp_unpack_nv12(dev->frame_staging_buf, dst,
-				sc0710_clp_source_width(dev),
-				sc0710_clp_chunk_size(dev));
-			vb2_set_plane_payload(&vb_buf->vb.vb2_buf, 0, deliver_framesize);
-		} else if (src_frame) {
+		if (src_frame) {
 			if (source_framesize <= buffer_size) {
 				memcpy(dst, src_frame, source_framesize);
 				vb2_set_plane_payload(&vb_buf->vb.vb2_buf, 0, source_framesize);
@@ -1860,7 +1602,7 @@ int sc0710_dma_channel_service(struct sc0710_dma_channel *ch)
 	}
 
 	cached_fmt = READ_ONCE(dev->fmt);
-	cached_framesize = sc0710_dma_framesize(dev, cached_fmt);
+	cached_framesize = sc0710_framesize(dev, cached_fmt);
 	cached_width = cached_fmt ? cached_fmt->width : 0;
 	cached_height = cached_fmt ? cached_fmt->height : 0;
 	cached_interlaced = cached_fmt ? cached_fmt->interlaced : 0;
@@ -2255,14 +1997,14 @@ int sc0710_dma_channel_resize(struct sc0710_dev *dev, u32 nr, enum sc0710_channe
 	sc0710_clp_conveyor_free(ch);
 
 	printk(KERN_INFO "%s channel %d resized for framesize %d\n",
-		dev->name, nr, sc0710_dma_framesize(dev, dev->fmt));
+		dev->name, nr, sc0710_framesize(dev, dev->fmt));
 
 	/* Cam Link Pro video: the conveyor transport replaces the whole-frame
 	 * chains entirely. Its descriptor ring lives in a page table sized
 	 * for the ring (descriptors in the first half, writeback slots in
 	 * the second). */
 	if (ch->mediatype == CHTYPE_VIDEO &&
-	    dev->board == SC0710_BOARD_ELGATO_CAMLINK_PRO && clp_conveyor) {
+	    dev->board == SC0710_BOARD_ELGATO_CAMLINK_PRO) {
 		ret = sc0710_clp_conveyor_build(ch);
 		if (ret < 0) {
 			printk(KERN_ERR "%s: channel %d conveyor allocation failed (%d); channel unusable until the next resize\n",
@@ -2294,7 +2036,7 @@ int sc0710_dma_channel_resize(struct sc0710_dev *dev, u32 nr, enum sc0710_channe
 		 * size, which could be much larger or smaller than any previous allocation.
 		 * Video transfers vary and need adjustment.
 		 */
-		ch->buf_size = sc0710_dma_framesize(dev, dev->fmt);
+		ch->buf_size = sc0710_framesize(dev, dev->fmt);
 		if (sc0710_debug_mode)
 			printk("Resizing channel for size %d\n", ch->buf_size);
 	} else
@@ -2409,7 +2151,6 @@ int sc0710_dma_channel_start_prep(struct sc0710_dma_channel *ch)
 		memset((u8 *)ch->pt_cpu + ch->pt_size / 2, 0, ch->pt_size / 2);
 		ch->cv.consumed = 0;
 		ch->cv.stream_bytes = 0;
-		ch->cv.fill = 0;
 		ch->cv.chunk_fill = 0;
 		ch->cv.synced = true; /* a fresh GO starts on the chunk grid */
 		memset(ch->cv.lines_placed, 0, sizeof(ch->cv.lines_placed));

@@ -148,10 +148,7 @@ extern unsigned int keep_audio_alive;
 #define SC0710_CLP_HD_HEIGHT     1080
 #define SC0710_CLP_CHUNK         3856  /* maximum/native chunk size */
 #define SC0710_CLP_LEGACY_CHUNK  1936
-#define SC0710_CLP_ROW          (3 * SC0710_CLP_CHUNK)
-/* Legacy DMA/raw-tap slab size. Picture boundaries come from chunk headers. */
-#define SC0710_CLP_DMA_FRAMESIZE (540 * SC0710_CLP_ROW)
-/* What userspace gets: packed 3840x2160 NV12. */
+/* What userspace gets: packed NV12, 3840x2160 or 1920x1080. */
 #define SC0710_CLP_SIZEIMAGE    (SC0710_CLP_WIDTH * SC0710_CLP_HEIGHT * 3 / 2)
 #define SC0710_CLP_HD_SIZEIMAGE (SC0710_CLP_HD_WIDTH * SC0710_CLP_HD_HEIGHT * 3 / 2)
 
@@ -294,11 +291,11 @@ struct sc0710_dma_descriptor_chain
 	u32 wbm_phase;
 };
 
-/* Cam Link Pro conveyor transport (clp_conveyor=1, the vendor
- * architecture): a circular ring of many small always-armed descriptors
- * the engine can never starve, never rewritten while running, with the
- * frame boundaries recovered in software by the framer. ndesc == 0 means
- * the channel is on the legacy whole-frame chain transport. */
+/* Cam Link Pro conveyor transport (the vendor architecture): a circular
+ * ring of many small always-armed descriptors the engine can never starve,
+ * never rewritten while running, with the frame boundaries recovered in
+ * software by the framer. ndesc == 0 means no ring is built (other boards
+ * use the whole-frame chains). */
 #define SC0710_CLP_CONVEYOR_MAX_BLOCKS 32
 struct sc0710_clp_conveyor
 {
@@ -331,7 +328,6 @@ struct sc0710_clp_conveyor
 	u32         chunk_fill;
 	bool        synced;         /* chunk grid locked to the stream */
 	u32         lines_placed[SC0710_CLP_INPUTS]; /* luma lines per picture */
-	u32         fill;           /* clp_raw slab mode only */
 
 	/* Counters (surfaced in /proc/sc0710) */
 	u64         pictures[SC0710_CLP_INPUTS];       /* pictures delivered */
@@ -457,11 +453,6 @@ struct sc0710_dma_channel
 	u32                          tear_streak_count;
 	int                          tear_last_line;
 	u32                          tear_resync_retries_left;
-	/* Cam Link Pro: consecutive gathers whose zero-pad structure was
-	 * misaligned (stream slipped), and consecutive aligned gathers
-	 * (earns back resync retries). */
-	u32                          clp_misalign_count;
-	u32                          clp_aligned_streak;
 
 	/* Zero-copy delivery counters (frames DMA'd straight into a client
 	 * buffer vs. delivered through the copy path while zero_copy=1). */
@@ -766,23 +757,6 @@ static inline u32 sc0710_clp_chunk_size(const struct sc0710_dev *dev)
 		SC0710_CLP_LEGACY_CHUNK;
 }
 
-/* Bytes the DMA engine delivers per frame. The Cam Link Pro uses a mapped
- * chunk-stream slab sized for its native or fallback selector. Everywhere
- * else this is the packed frame size. */
-extern unsigned int clp_dma_override;
-
-static inline u32 sc0710_dma_framesize(const struct sc0710_dev *dev,
-	const struct sc0710_format *fmt)
-{
-	if (dev->board == SC0710_BOARD_ELGATO_CAMLINK_PRO) {
-		if (!fmt)
-			return 0;
-		return clp_dma_override ? clp_dma_override :
-			540 * 3 * sc0710_clp_chunk_size(dev);
-	}
-	return sc0710_framesize(dev, fmt);
-}
-
 struct sc0710_fh
 {
 	struct v4l2_fh             fh;
@@ -861,11 +835,8 @@ bool sc0710_edid_header_valid(const u8 *p);
 int sc0710_i2c_read_hdmi_status(struct sc0710_dev *dev);
 void sc0710_i2c_mcu_scan(struct sc0710_dev *dev);
 extern unsigned int sc0710_mcu_scan;
-void sc0710_i2c_set_input_path(struct sc0710_dev *dev);
 void sc0710_i2c_sync_input_paths(struct sc0710_dev *dev);
 void sc0710_i2c_apply_4k_mode(struct sc0710_dev *dev);
-extern unsigned int clp_4k_switch;
-extern unsigned int sc400_input_regs;
 extern unsigned int sc0710_hdmi_input;
 int sc0710_i2c_read_status2(struct sc0710_dev *dev);
 int sc0710_i2c_read_status3(struct sc0710_dev *dev);

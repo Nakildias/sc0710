@@ -211,7 +211,6 @@ MODULE_PARM_DESC(tm_bgr_chroma,
 /* Module parameter to enable status images (No Signal/No Device BMP)
  * 1 = show BMP images (default), 0 = show colorbars
  */
-extern unsigned int clp_raw;
 int use_status_images = 1;
 module_param(use_status_images, int, 0644);
 MODULE_PARM_DESC(use_status_images, "Show status images (1) or colorbars (0)");
@@ -674,16 +673,6 @@ static void sc0710_get_effective_size(struct sc0710_dev *dev,
 	 * 1920x1080 capture shape. A genuine 4K input gets native 3840x2160.
 	 * Everything userspace negotiates funnels through this helper. */
 	if (dev->board == SC0710_BOARD_ELGATO_CAMLINK_PRO) {
-		if (clp_raw) {
-			/* Bring-up microscope: expose the DMA ring 1:1. */
-			u32 ring = sc0710_dma_framesize(dev, fmt);
-			u32 chunk = sc0710_clp_chunk_size(dev);
-
-			*width = chunk;
-			*height = ring / chunk;
-			*framesize = ring;
-			return;
-		}
 		if (input < SC0710_CLP_INPUTS &&
 		    READ_ONCE(dev->clp_input[input].width) >= SC0710_CLP_WIDTH &&
 		    READ_ONCE(dev->clp_input[input].height) >= SC0710_CLP_HEIGHT) {

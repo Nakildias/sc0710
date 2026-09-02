@@ -540,8 +540,7 @@ static enum sc0710_eotf_e sc0710_eotf_from_hdmi(u8 hint_flags,
 	return EOTF_SDR;
 }
 
-static void __sc0710_i2c_apply_4k_mode_locked(struct sc0710_dev *dev,
-	bool force_clear);
+static void __sc0710_i2c_apply_4k_mode_locked(struct sc0710_dev *dev);
 
 /* Cam Link Pro: the MCU keeps one status block per HDMI input in a flat
  * buffer, 0x3C bytes apart (found by scanning the subaddress space with a
@@ -656,7 +655,7 @@ int sc0710_i2c_read_hdmi_status(struct sc0710_dev *dev)
 		if (clp_change_mask)
 			sc0710_video_notify_source_change_mask(dev, clp_change_mask);
 		if (clp_change_mask)
-			__sc0710_i2c_apply_4k_mode_locked(dev, false);
+			__sc0710_i2c_apply_4k_mode_locked(dev);
 
 		/* The FPGA pipeline geometry is shared. Drive it from the largest
 		 * locked input that actually has a consumer. This preserves native
@@ -1174,50 +1173,9 @@ confirmed_timing_change:
  * Linux mirrors that with the logical V4L2 and ALSA consumers. This uses the
  * MCU's volatile runtime register port and never touches flash.
  */
-unsigned int sc400_input_regs;
-module_param(sc400_input_regs, uint, 0644);
-MODULE_PARM_DESC(sc400_input_regs,
-	"Cam Link Pro bring-up: set to 1 to write the vendor per-input setup registers once");
-
-unsigned int sc400_input_dev = 0x32;
-module_param(sc400_input_dev, uint, 0644);
-MODULE_PARM_DESC(sc400_input_dev,
-	"Cam Link Pro bring-up: 7-bit I2C address for the per-input path registers");
-
-unsigned int sc400_input_on = 0x10;
-module_param(sc400_input_on, uint, 0644);
-MODULE_PARM_DESC(sc400_input_on,
-	"Cam Link Pro bring-up: value written for the captured input");
-
-unsigned int sc400_input_off = 0x01;
-module_param(sc400_input_off, uint, 0644);
-MODULE_PARM_DESC(sc400_input_off,
-	"Cam Link Pro bring-up: value written for the idle inputs");
-
-void sc0710_i2c_set_input_path(struct sc0710_dev *dev)
-{
-	u8 mask = BIT(sc0710_hdmi_input & 3);
-
-	dev->clp_active_mask = 0;
-	/* Preserve the bring-up trigger as a one-input manual override. */
-	{
-		u8 devaddr = (u8)((sc400_input_dev & 0x7f) << 1);
-		int i, ret;
-
-		mutex_lock(&dev->signalMutex);
-		for (i = 0; i < SC0710_CLP_INPUTS; i++) {
-			u8 wbuf[2] = { (u8)(0x3b + i),
-				(u8)((mask & BIT(i)) ? sc400_input_on : sc400_input_off) };
-
-			ret = sc0710_i2c_write(dev, devaddr, wbuf, sizeof(wbuf));
-			printk(KERN_INFO "%s: input path: dev 0x%02x sub 0x%02x = 0x%02x (%d)\n",
-				dev->name, sc400_input_dev, wbuf[0], wbuf[1], ret);
-			msleep(2);
-		}
-		mutex_unlock(&dev->signalMutex);
-		dev->clp_active_mask = mask;
-	}
-}
+#define SC0710_CLP_PATH_SUBADDR 0x3b
+#define SC0710_CLP_PATH_ACTIVE  0x10
+#define SC0710_CLP_PATH_IDLE    0x01
 
 void sc0710_i2c_sync_input_paths(struct sc0710_dev *dev)
 {
@@ -1225,7 +1183,6 @@ void sc0710_i2c_sync_input_paths(struct sc0710_dev *dev)
 	struct sc0710_dma_channel *audio = &dev->channel[1];
 	struct sc0710_client *client;
 	unsigned long flags;
-	u8 devaddr = (u8)((sc400_input_dev & 0x7f) << 1);
 	u8 mask = 0;
 	u8 changed_mask;
 	bool failed = false;
@@ -1252,9 +1209,9 @@ void sc0710_i2c_sync_input_paths(struct sc0710_dev *dev)
 
 	mutex_lock(&dev->signalMutex);
 	for (i = 0; i < SC0710_CLP_INPUTS; i++) {
-		u8 wbuf[2] = { (u8)(0x3b + i),
-			       (u8)((mask & BIT(i)) ? sc400_input_on
-						       : sc400_input_off) };
+		u8 wbuf[2] = { (u8)(SC0710_CLP_PATH_SUBADDR + i),
+			       (u8)((mask & BIT(i)) ? SC0710_CLP_PATH_ACTIVE
+						       : SC0710_CLP_PATH_IDLE) };
 
 		/* The four registers are independent. Only write paths whose
 		 * consumer state changed, keeping the polling DMA service out of
@@ -1262,7 +1219,7 @@ void sc0710_i2c_sync_input_paths(struct sc0710_dev *dev)
 		if (!(changed_mask & BIT(i)))
 			continue;
 
-		ret = sc0710_i2c_write(dev, devaddr, wbuf, sizeof(wbuf));
+		ret = sc0710_i2c_write(dev, I2C_DEV__ARM_MCU, wbuf, sizeof(wbuf));
 		if (ret < 0) {
 			failed = true;
 			printk(KERN_WARNING "%s: HDMI-%d path update failed (%d)\n",
@@ -1273,18 +1230,18 @@ void sc0710_i2c_sync_input_paths(struct sc0710_dev *dev)
 	mutex_unlock(&dev->signalMutex);
 	if (!failed) {
 		dev->clp_active_mask = mask;
-		printk(KERN_INFO "%s: Cam Link Pro active input mask 0x%x\n",
-			dev->name, mask);
+		if (sc0710_debug_mode)
+			printk(KERN_INFO "%s: Cam Link Pro active input mask 0x%x\n",
+				dev->name, mask);
 		/* The 4K MCU bits are per input too. Recompute them whenever the
 		 * consumer mask changes, including an HDMI-3-only session. */
 		sc0710_i2c_apply_4k_mode(dev);
 	}
 }
 
-/* Cam Link Pro true-4K mode switch (Milestone 4 experiment).
+/* Cam Link Pro true-4K mode switch.
  *
- * Reverse-engineered from CamLinkPro.X64.SYS (see
- * captures/windows-analysis/REPORT-4k-mode.md): when the detector sees a
+ * Reverse-engineered from CamLinkPro.X64.SYS: when the detector sees a
  * source >= 3840x2160 on HDMI input 1 (zero-based index 0), the vendor
  * driver does a read-modify-write of MCU (0x32) subaddress 0x03, setting
  * bit 0; index 2 uses bit 1. Dropping below 4K clears the bit. This is
@@ -1293,18 +1250,8 @@ void sc0710_i2c_sync_input_paths(struct sc0710_dev *dev)
  *
  * Reversible and non-destructive: one control byte on the safe status
  * port, exactly as Windows toggles it on every 4K lock. The timing detector
- * applies it automatically. These diagnostic triggers remain available:
- *   echo 1 > /sys/module/sc0710/parameters/clp_4k_switch   (enable)
- *   echo 2 > /sys/module/sc0710/parameters/clp_4k_switch   (force disable)
- * and watch dmesg; then capture a raw tap (clp_raw=1) to learn the 4K
- * chunk geometry. */
-unsigned int clp_4k_switch;
-module_param_named(clp_4k_switch, clp_4k_switch, int, 0644);
-MODULE_PARM_DESC(clp_4k_switch,
-	"Cam Link Pro diagnostic: 1 = reapply automatic MCU 4K bit, 2 = force clear once");
-
-static void __sc0710_i2c_apply_4k_mode_locked(struct sc0710_dev *dev,
-	bool force_clear)
+ * and the input-path sync apply it automatically. */
+static void __sc0710_i2c_apply_4k_mode_locked(struct sc0710_dev *dev)
 {
 	u8 want_bits = 0;
 	int changed = 0;
@@ -1315,16 +1262,14 @@ static void __sc0710_i2c_apply_4k_mode_locked(struct sc0710_dev *dev,
 	/* The vendor maps HDMI-1 to bit 0 and HDMI-3 to bit 1. Their bits
 	 * follow the matching active capture pins independently. HDMI-2/4
 	 * have no documented 4K bit, so leave unrelated MCU bits untouched. */
-	if (!force_clear) {
-		if ((dev->clp_active_mask & BIT(0)) && dev->clp_input[0].locked &&
-		    dev->clp_input[0].width >= SC0710_CLP_WIDTH &&
-		    dev->clp_input[0].height >= SC0710_CLP_HEIGHT)
-			want_bits |= BIT(0);
-		if ((dev->clp_active_mask & BIT(2)) && dev->clp_input[2].locked &&
-		    dev->clp_input[2].width >= SC0710_CLP_WIDTH &&
-		    dev->clp_input[2].height >= SC0710_CLP_HEIGHT)
-			want_bits |= BIT(1);
-	}
+	if ((dev->clp_active_mask & BIT(0)) && dev->clp_input[0].locked &&
+	    dev->clp_input[0].width >= SC0710_CLP_WIDTH &&
+	    dev->clp_input[0].height >= SC0710_CLP_HEIGHT)
+		want_bits |= BIT(0);
+	if ((dev->clp_active_mask & BIT(2)) && dev->clp_input[2].locked &&
+	    dev->clp_input[2].width >= SC0710_CLP_WIDTH &&
+	    dev->clp_input[2].height >= SC0710_CLP_HEIGHT)
+		want_bits |= BIT(1);
 	ret = __sc0710_i2c_writeread(dev, I2C_DEV__ARM_MCU, wbuf, 1, rbuf, 1);
 	if (ret < 0) {
 		printk(KERN_WARNING "%s: 4K switch: read of MCU sub 0x03 failed (%d)\n",
@@ -1353,7 +1298,7 @@ void sc0710_i2c_apply_4k_mode(struct sc0710_dev *dev)
 		return;
 
 	mutex_lock(&dev->signalMutex);
-	__sc0710_i2c_apply_4k_mode_locked(dev, clp_4k_switch == 2);
+	__sc0710_i2c_apply_4k_mode_locked(dev);
 	mutex_unlock(&dev->signalMutex);
 }
 
