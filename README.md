@@ -375,8 +375,9 @@ If you can test, debug, or submit patches for any of the above, please [open an 
 This fork is maintained by **[Nakildias](https://github.com/Nakildias)** (`nakildiaspro@gmail.com`).
 
 * Based on original reverse engineering by **[Steven Toth (@stoth68000)](https://github.com/stoth68000)** and subsequent work by **[@Subtixx](https://github.com/Subtixx)**.
-* Thanks to **[Onhil (@Onhil)](https://github.com/Onhil)** for his work on the Elgato 4K Pro.
-* Thanks to **[JerwuQu (@JerwuQu)](https://github.com/JerwuQu)** for his work on the Elgato 4K Pro EDID Flashing & BRG24 Support.
+* Thanks to **[Onhil (@Onhil)](https://github.com/Onhil)** for his work on the Elgato 4K Pro 1cfa:0012.
+* Thanks to **[JerwuQu (@JerwuQu)](https://github.com/JerwuQu)** for his work on the Elgato 4K Pro EDID 1cfa:0012 Flashing & BRG24 Support.
+* Thanks to **[jakeart123 (@jakeart123](https://github.com/jakeart123)** for adding initial support for the Elgato Cam Link Pro 1cfa:0011.
 
 The kernel module is a derivative of Steven Toth's sc0710 driver (GPL v2). Original copyright notices are preserved in source files; modifications in this fork are attributed separately. Installer scripts are original work in this repository. See **[COPYRIGHT](COPYRIGHT)** for details.
 
