@@ -417,11 +417,98 @@ static void sc0710_clp_broadcast_frame(struct sc0710_dma_channel *ch,
 
 		spin_unlock_irqrestore(&client->buffer_lock, buf_flags);
 	}
-	ch->frame_sequence++;
 	spin_unlock_irqrestore(&ch->client_list_lock, flags);
 
 	if (delivered || !timer_pending(&ch->timeout))
 		mod_timer(&ch->timeout, jiffies + VBUF_TIMEOUT);
+}
+
+/* Does any streaming client of this input hold buffers of the given size? */
+static bool sc0710_clp_client_wants_size(struct sc0710_dma_channel *ch,
+	u8 input, u32 width, u32 height)
+{
+	struct sc0710_client *client;
+	unsigned long flags;
+	bool found = false;
+
+	spin_lock_irqsave(&ch->client_list_lock, flags);
+	list_for_each_entry(client, &ch->client_list, list) {
+		if (client->streaming && client->input == input &&
+		    client->stream_width == width &&
+		    client->stream_height == height) {
+			found = true;
+			break;
+		}
+	}
+	spin_unlock_irqrestore(&ch->client_list_lock, flags);
+	return found;
+}
+
+/* 2:1 NV12 rescale between the two delivery shapes, 3840x2160 and
+ * 1920x1080. Down: every other pixel of every other line. Up: horizontal
+ * midpoint interpolation, lines doubled. */
+static void sc0710_clp_rescale_picture(const u8 *src, u32 src_w, u32 src_h,
+	u8 *dst, u32 dst_w, u32 dst_h)
+{
+	const u8 *suv = src + (size_t)src_w * src_h;
+	u8 *duv = dst + (size_t)dst_w * dst_h;
+	u32 y;
+
+	if (src_w > dst_w) {
+		for (y = 0; y < dst_h; y++)
+			sc0710_clp_downscale_y_line(src + (size_t)2 * y * src_w,
+				dst + (size_t)y * dst_w);
+		for (y = 0; y < dst_h / 2; y++)
+			sc0710_clp_downscale_uv_line(suv + (size_t)2 * y * src_w,
+				duv + (size_t)y * dst_w);
+	} else {
+		for (y = 0; y < src_h; y++) {
+			u8 *d = dst + (size_t)2 * y * dst_w;
+
+			sc0710_clp_upscale_y_line(src + (size_t)y * src_w, d);
+			memcpy(d + dst_w, d, dst_w);
+		}
+		for (y = 0; y < src_h / 2; y++) {
+			u8 *d = duv + (size_t)2 * y * dst_w;
+
+			sc0710_clp_upscale_uv_line(suv + (size_t)y * src_w, d);
+			memcpy(d + dst_w, d, dst_w);
+		}
+	}
+}
+
+/* A client that negotiated before this input changed resolution is told to
+ * renegotiate (V4L2_EVENT_SOURCE_CHANGE), but apps like OBS ignore that
+ * event and would otherwise starve, time out and stop. Keep such clients
+ * fed with the live picture scaled to the size they hold buffers for.
+ * Runs in the DMA service thread, so the lazy allocation may sleep. */
+static void sc0710_clp_deliver_alt_size(struct sc0710_dma_channel *ch,
+	u8 input, const u8 *pic, u32 width, u32 height)
+{
+	struct sc0710_clp_conveyor *cv = &ch->cv;
+	u32 alt_w, alt_h, alt_size;
+
+	if (width == SC0710_CLP_WIDTH) {
+		alt_w = SC0710_CLP_HD_WIDTH;
+		alt_h = SC0710_CLP_HD_HEIGHT;
+		alt_size = SC0710_CLP_HD_SIZEIMAGE;
+	} else {
+		alt_w = SC0710_CLP_WIDTH;
+		alt_h = SC0710_CLP_HEIGHT;
+		alt_size = SC0710_CLP_SIZEIMAGE;
+	}
+
+	if (!sc0710_clp_client_wants_size(ch, input, alt_w, alt_h))
+		return;
+	if (!cv->alt[input]) {
+		cv->alt[input] = vzalloc(SC0710_CLP_SIZEIMAGE);
+		if (!cv->alt[input])
+			return;
+	}
+	sc0710_clp_rescale_picture(pic, width, height, cv->alt[input],
+		alt_w, alt_h);
+	sc0710_clp_broadcast_frame(ch, input, cv->alt[input], alt_w, alt_h,
+		alt_size);
 }
 
 /* A picture is complete when the next one's line 1 arrives. Native 4K is
@@ -435,6 +522,7 @@ static void sc0710_clp_deliver_picture(struct sc0710_dma_channel *ch, u8 input)
 	const u8 *ysrc = cv->frame[input];
 	const u8 *uvsrc = cv->frame[input] +
 		cv->source_width * SC0710_CLP_SRC_HEIGHT;
+	const u8 *pic;
 	u8 *yd;
 	u8 *uvd;
 	u32 output_width, output_height, output_size;
@@ -469,11 +557,8 @@ static void sc0710_clp_deliver_picture(struct sc0710_dma_channel *ch, u8 input)
 
 	if (cv->source_width == output_width &&
 	    source_height == SC0710_CLP_SRC_HEIGHT) {
-		cv->pictures[input]++;
-		cv->last_picture_jiffies[input] = jiffies;
-		sc0710_clp_broadcast_frame(ch, input, cv->frame[input],
-			output_width, output_height, output_size);
-		return;
+		pic = cv->frame[input];
+		goto deliver;
 	}
 	yd = cv->out[input];
 	uvd = cv->out[input] + output_width * output_height;
@@ -499,10 +584,16 @@ static void sc0710_clp_deliver_picture(struct sc0710_dma_channel *ch, u8 input)
 		uvd += output_width;
 	}
 
+	pic = cv->out[input];
+
+deliver:
 	cv->pictures[input]++;
 	cv->last_picture_jiffies[input] = jiffies;
-	sc0710_clp_broadcast_frame(ch, input, cv->out[input],
+	sc0710_clp_broadcast_frame(ch, input, pic,
 		output_width, output_height, output_size);
+	sc0710_clp_deliver_alt_size(ch, input, pic, output_width, output_height);
+	/* One sequence number per picture, whichever sizes it went out at. */
+	ch->frame_sequence++;
 }
 
 /* Validate one complete chunk and place its 1920- or 3840-byte payload by
@@ -701,6 +792,7 @@ static void sc0710_clp_conveyor_free(struct sc0710_dma_channel *ch)
 	for (i = 0; i < SC0710_CLP_INPUTS; i++) {
 		vfree(cv->frame[i]);
 		vfree(cv->out[i]);
+		vfree(cv->alt[i]);
 	}
 	memset(cv, 0, sizeof(*cv));
 }

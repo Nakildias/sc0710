@@ -121,6 +121,11 @@ extern unsigned int keep_audio_alive;
 #define SC0710_MAXBOARDS 8
 
 #define VBUF_TIMEOUT (HZ)
+/* Placeholder cadence for clients that are not receiving live frames. OBS
+ * gives up on a device after 48 frame periods (800 ms at 60 fps, 400 ms at
+ * 120 fps) and restarts the stream, which at the old 1 Hz cadence became an
+ * endless reset loop while no signal was present. */
+#define VBUF_PLACEHOLDER_INTERVAL (HZ / 4)
 
 /* Max number of inputs by card */
 #define MAX_SC0710_INPUT 8
@@ -322,6 +327,9 @@ struct sc0710_clp_conveyor
 	 * lines they carried. Sync recovery is a header scan. */
 	u8         *frame[SC0710_CLP_INPUTS]; /* per-input source Y then UV */
 	u8         *out[SC0710_CLP_INPUTS];   /* per-input delivered 4K NV12 */
+	u8         *alt[SC0710_CLP_INPUTS];   /* same picture at the other size,
+						 * for clients that have not
+						 * renegotiated; lazily allocated */
 	u8          chunk[SC0710_CLP_CHUNK]; /* chunk spanning segments */
 	u32         source_width;   /* 3840 native or 1920 fallback */
 	u32         chunk_size;     /* source_width + header + fixed pad */

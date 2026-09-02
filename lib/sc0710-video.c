@@ -1714,8 +1714,18 @@ static int sc0710_start_streaming(struct vb2_queue *q, unsigned int count)
 		dprintk(1, "%s() No signal - will deliver placeholder frames\n", __func__);
 	}
 
-	/* Start timer for delivering frames (real or placeholder) */
-	mod_timer(&ch->timeout, jiffies + VBUF_TIMEOUT);
+	/* Start timer for delivering frames (real or placeholder). With no
+	 * signal the first placeholder goes out almost at once, so the client
+	 * has a frame before its own watchdog fires; with a live signal the
+	 * first real frame arrives well inside the normal timeout. */
+	{
+		bool live = dev->board == SC0710_BOARD_ELGATO_CAMLINK_PRO ?
+			(client->input < SC0710_CLP_INPUTS &&
+			 READ_ONCE(dev->clp_input[client->input].locked)) :
+			READ_ONCE(dev->fmt) != NULL;
+
+		mod_timer(&ch->timeout, jiffies + (live ? VBUF_TIMEOUT : HZ / 10));
+	}
 
 	return 0;
 }
@@ -2250,6 +2260,7 @@ static void sc0710_vid_timeout(struct timer_list *t)
 	const struct sc0710_format *live_fmt;
 	unsigned long flags, buf_flags;
 	int any_streaming = 0;
+	int delivered = 0;
 	int dma_active;
 	u32 live_w = 0, live_h = 0;
 	u32 eff_w, eff_h, eff_fs;
@@ -2378,16 +2389,18 @@ static void sc0710_vid_timeout(struct timer_list *t)
 			buf->vb.sequence = ch->frame_sequence;
 			list_del(&buf->list);
 			vb2_buffer_done(&buf->vb.vb2_buf, VB2_BUF_STATE_DONE);
+			delivered = 1;
 		}
 
 		spin_unlock_irqrestore(&client->buffer_lock, buf_flags);
 	}
-	ch->frame_sequence++;
+	if (delivered)
+		ch->frame_sequence++;
 	spin_unlock_irqrestore(&ch->client_list_lock, flags);
 
 	/* Re-set the buffer timeout if any clients are still streaming */
 	if (any_streaming)
-		mod_timer(&ch->timeout, jiffies + VBUF_TIMEOUT);
+		mod_timer(&ch->timeout, jiffies + VBUF_PLACEHOLDER_INTERVAL);
 }
 
 void sc0710_video_notify_source_change_mask(struct sc0710_dev *dev, u8 input_mask)

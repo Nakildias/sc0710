@@ -223,7 +223,10 @@ v4l2-ctl -d /dev/video0 --set-fmt-video=pixelformat=BGR3   # select 4:4:4
 
 The Cam Link Pro exposes one `NV12` video node and one stereo ALSA capture device for each
 HDMI port. A 4K source is delivered at 3840x2160; ordinary sources use a 1920x1080 delivery
-shape. YUYV, BGR24, and multiview are not implemented for that card.
+shape. If the source changes size while an app is capturing, the app gets a
+`V4L2_EVENT_SOURCE_CHANGE`; apps that ignore it (OBS) keep receiving the picture scaled to
+the size they negotiated, so restart the source to capture at the new native size. YUYV,
+BGR24, and multiview are not implemented for that card.
 
 On **MK.2**, HDR mode can also auto-select the format while idle:
 
