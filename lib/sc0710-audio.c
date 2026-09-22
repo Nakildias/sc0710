@@ -19,6 +19,8 @@
  *  Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
  */
 
+#include <linux/ktime.h>
+#include <linux/math64.h>
 #include <linux/vmalloc.h>
 #include <linux/workqueue.h>
 #include "sc0710.h"
@@ -33,6 +35,9 @@ MODULE_PARM_DESC(audio_debug, "enable debug messages [audio]");
 /* Real-delivery pause before the watchdog starts feeding silence; must sit
  * well above normal DMA completion jitter (single-digit ms). */
 #define SC0710_AUDIO_GAP_MS           100
+/* Most silence one wake may feed. A worker held up for longer restarts its
+ * clock instead of flooding the ring buffer to catch up. */
+#define SC0710_AUDIO_SILENCE_MAX_BURST (SC0710_AUDIO_RATE_HZ / 20)
 
 #define dprintk(level, fmt, arg...)\
 	do { if (audio_debug >= level)\
@@ -79,6 +84,46 @@ static void sc0710_audio_push_frames(struct sc0710_audio_dev *chip,
 	}
 }
 
+/* Frames of silence owed since the current gap began, paced by the clock
+ * rather than by the wake interval. Feeding a fixed 10 ms chunk per relative
+ * 10 ms sleep ran slow: each cycle also costs timer rounding and worker
+ * latency, so the 48 kHz stream advanced at about 42.4 kHz. A sound server
+ * that picks this device as its graph clock then starves every playback
+ * device in that graph whenever the HDMI signal is absent.
+ * Called from silence_work only. */
+static unsigned int sc0710_audio_silence_owed(struct sc0710_audio_dev *chip)
+{
+	u64 now_ns = ktime_get_ns();
+	u64 owed = 0;
+
+	if (chip->silence_active)
+		owed = div_u64((now_ns - chip->silence_start_ns) *
+			       SC0710_AUDIO_RATE_HZ, NSEC_PER_SEC);
+
+	/* New gap, or too far behind to catch up: start the clock one wake
+	 * interval back, so this wake feeds one interval's worth. */
+	if (!chip->silence_active || owed < chip->silence_frames ||
+	    owed - chip->silence_frames > SC0710_AUDIO_SILENCE_MAX_BURST) {
+		chip->silence_active = true;
+		chip->silence_start_ns = now_ns -
+			(u64)SC0710_AUDIO_SILENCE_MS * NSEC_PER_MSEC;
+		chip->silence_frames = 0;
+		owed = SC0710_AUDIO_SILENCE_SAMPLES;
+	}
+
+	owed -= chip->silence_frames;
+	chip->silence_frames += owed;
+
+	/* Rebase once a second's worth is fed; exact, and keeps the
+	 * multiplication above far from overflow. */
+	while (chip->silence_frames >= SC0710_AUDIO_RATE_HZ) {
+		chip->silence_frames -= SC0710_AUDIO_RATE_HZ;
+		chip->silence_start_ns += NSEC_PER_SEC;
+	}
+
+	return (unsigned int)owed;
+}
+
 /* Delivery-gap watchdog, armed for the whole capture session. The DMA
  * path stops delivering samples on signal loss, across a resolution
  * switch's DMA stop/restart, and while HDMI audio renegotiates after a
@@ -112,9 +157,11 @@ static void sc0710_audio_silence_work_fn(struct work_struct *work)
 		if (audio_debug)
 			printk_ratelimited(KERN_INFO "%s: audio delivery gap, feeding ALSA silence\n",
 				dev->name);
-		sc0710_audio_push_frames(chip, SC0710_AUDIO_SILENCE_SAMPLES, NULL, 0, true);
+		sc0710_audio_push_frames(chip, sc0710_audio_silence_owed(chip),
+					 NULL, 0, true);
 		next = msecs_to_jiffies(SC0710_AUDIO_SILENCE_MS);
 	} else {
+		chip->silence_active = false;
 		/* Healthy delivery: sleep until the gap threshold after the
 		 * most recent real samples, instead of ticking every period.
 		 * Real deliveries move the deadline forward; this wake just

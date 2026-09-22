@@ -586,6 +586,10 @@ struct sc0710_audio_dev
 	bool                       dma_held;
 	unsigned long              last_sample_jiffies; /* Last real-sample delivery */
 	struct delayed_work        silence_work;
+	/* Silence pacing clock; touched only by silence_work. */
+	bool                       silence_active;
+	u64                        silence_start_ns;
+	u64                        silence_frames; /* fed since silence_start_ns */
 
 	/* keep_audio_alive only. The ALSA trigger callback runs under
 	 * snd_pcm_stream_lock (atomic) but starting/stopping DMA needs
