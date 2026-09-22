@@ -1002,11 +1002,32 @@ const struct sc0710_format *sc0710_format_find_by_timing(u32 timingH, u32 timing
 	return NULL;
 }
 
+/* The MCU's rate byte is only believed when it lands this close (in Hz) to a
+ * mode that has the detected totals. 2 covers the NTSC rates, whose table
+ * entries truncate to 59 / 119 / 23 against a byte of 60 / 120 / 24.
+ *
+ * The byte is not always a rate. A first-generation Nintendo Switch on a
+ * 4K60 Pro MK.2, one and the same 1080p60 signal, latched 52, 98, 98, 98, 52
+ * over five power-ons and 0 after most module loads, and the MCU does not
+ * refresh it while the link stays locked. Nearest-match turned 98 into
+ * 1080p119.88, and 0 took the first table entry, 1080p30, for a whole
+ * session. */
+#define SC0710_RATE_HINT_TOLERANCE 2
+/* Rate assumed when the hint is missing or fits no mode with these totals. */
+#define SC0710_RATE_DEFAULT 60
+
+static u32 sc0710_rate_diff(u32 a, u32 b)
+{
+	return a > b ? a - b : b - a;
+}
+
 const struct sc0710_format *sc0710_format_find_by_timing_and_rate(u32 timingH, u32 timingV, u32 target_fps)
 {
 	unsigned int i;
 	const struct sc0710_format *best_fmt = NULL;
+	const struct sc0710_format *default_fmt = NULL;
 	u32 best_diff = 0xFFFFFFFF;
+	u32 default_diff = 0xFFFFFFFF;
 	int pass;
 
 	if (sc0710_debug_mode)
@@ -1020,6 +1041,8 @@ const struct sc0710_format *sc0710_format_find_by_timing_and_rate(u32 timingH, u
 	for (pass = 0; pass < 2; pass++) {
 		best_fmt = NULL;
 		best_diff = 0xFFFFFFFF;
+		default_fmt = NULL;
+		default_diff = 0xFFFFFFFF;
 
 		for (i = 0; i < ARRAY_SIZE(formats); i++) {
 			int match;
@@ -1035,17 +1058,17 @@ const struct sc0710_format *sc0710_format_find_by_timing_and_rate(u32 timingH, u
 
 			fps = formats[i].fpsX100 / 100;
 
-			/* If no hint, return first match (legacy behavior) */
-			if (target_fps == 0) {
-				printk(KERN_INFO "sc0710: No FPS Hint -> Pick %s\n", formats[i].name);
-				return &formats[i];
+			/* The mode to fall back on: nearest to the default rate. */
+			diff = sc0710_rate_diff(fps, SC0710_RATE_DEFAULT);
+			if (diff < default_diff) {
+				default_diff = diff;
+				default_fmt = &formats[i];
 			}
 
-			/* Calculate difference between format FPS and target */
-			if (fps > target_fps)
-				diff = fps - target_fps;
-			else
-				diff = target_fps - fps;
+			if (target_fps == 0)
+				continue;
+
+			diff = sc0710_rate_diff(fps, target_fps);
 
 			if (sc0710_debug_mode)
 				printk(KERN_INFO "sc0710: Cand %s FPS=%u Diff=%u (pass=%d)\n", formats[i].name, fps, diff, pass);
@@ -1060,9 +1083,19 @@ const struct sc0710_format *sc0710_format_find_by_timing_and_rate(u32 timingH, u
 				return &formats[i];
 		}
 
-		/* If we found a match in this pass, return it */
-		if (best_fmt)
+		/* No mode matched in this pass */
+		if (!default_fmt)
+			continue;
+
+		if (best_fmt && best_diff <= SC0710_RATE_HINT_TOLERANCE)
 			return best_fmt;
+
+		if (target_fps == 0)
+			printk(KERN_INFO "sc0710: No FPS Hint -> Pick %s\n", default_fmt->name);
+		else
+			printk(KERN_INFO "sc0710: FPS hint %u fits no %ux%u mode (nearest %s) -> Pick %s\n",
+			       target_fps, timingH, timingV, best_fmt->name, default_fmt->name);
+		return default_fmt;
 	}
 
 	return NULL;
