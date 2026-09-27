@@ -121,9 +121,9 @@ extern unsigned int keep_audio_alive;
 #define SC0710_MAXBOARDS 8
 
 #define VBUF_TIMEOUT (HZ)
-/* Placeholder cadence for clients that are not receiving live frames. OBS
- * gives up on a device after 48 frame periods (800 ms at 60 fps, 400 ms at
- * 120 fps) and restarts the stream, which at the old 1 Hz cadence became an
+/* Upper bound on the placeholder cadence for clients that are not receiving
+ * live frames; the actual cadence follows the advertised frame rate (see
+ * sc0710_placeholder_interval). At the old 1 Hz cadence OBS fell into an
  * endless reset loop while no signal was present. */
 #define VBUF_PLACEHOLDER_INTERVAL (HZ / 4)
 
