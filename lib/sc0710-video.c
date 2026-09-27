@@ -439,6 +439,17 @@ static void fill_frame_from_image(unsigned char *dest_frame,
 		return;
 	}
 
+	/* Placeholders now go out at a fraction of the frame rate from timer
+	 * context, so skip the per-pixel scaler when rows can be copied whole
+	 * (the 1920-wide status art into a 1920-wide buffer). */
+	if (dest_width == src_width) {
+		for (dest_y = 0; dest_y < dest_height; dest_y++)
+			memcpy(dest_frame + dest_y * dest_row_bytes,
+				src_data + ((dest_y * src_height) / dest_height) * src_row_bytes,
+				dest_row_bytes);
+		return;
+	}
+
 	for (dest_y = 0; dest_y < dest_height; dest_y++) {
 		/* Calculate source Y coordinate (nearest neighbor) */
 		unsigned int src_y = (dest_y * src_height) / dest_height;
@@ -924,6 +935,22 @@ static struct sc0710_format default_no_signal_format = {
 const struct sc0710_format *sc0710_get_default_format(void)
 {
 	return &default_no_signal_format;
+}
+
+/* Placeholder cadence: three periods of the frame rate the node advertises.
+ * OBS gives select() "frames until timeout" periods (5 by default, 83 ms at
+ * 60 fps) and logs "select timed out" / "failed to log status" on every miss,
+ * so a fixed 250 ms cadence spammed its log for as long as there was no
+ * signal. Capped at VBUF_PLACEHOLDER_INTERVAL for implausibly low rates. */
+static unsigned long sc0710_placeholder_interval(const struct sc0710_format *fmt)
+{
+	unsigned long j;
+
+	if (!fmt || !fmt->fpsnum)
+		return VBUF_PLACEHOLDER_INTERVAL;
+
+	j = div_u64((u64)3 * HZ * fmt->fpsden, fmt->fpsnum);
+	return clamp_t(unsigned long, j, 1, VBUF_PLACEHOLDER_INTERVAL);
 }
 
 void sc0710_format_initialize(void)
@@ -1757,7 +1784,13 @@ static int sc0710_start_streaming(struct vb2_queue *q, unsigned int count)
 			 READ_ONCE(dev->clp_input[client->input].locked)) :
 			READ_ONCE(dev->fmt) != NULL;
 
-		mod_timer(&ch->timeout, jiffies + (live ? VBUF_TIMEOUT : HZ / 10));
+		const struct sc0710_format *rate_fmt = READ_ONCE(dev->fmt);
+
+		if (!rate_fmt)
+			rate_fmt = dev->last_fmt ? dev->last_fmt :
+				sc0710_get_default_format();
+		mod_timer(&ch->timeout, jiffies + (live ? VBUF_TIMEOUT :
+			sc0710_placeholder_interval(rate_fmt)));
 	}
 
 	return 0;
@@ -2433,7 +2466,8 @@ static void sc0710_vid_timeout(struct timer_list *t)
 
 	/* Re-set the buffer timeout if any clients are still streaming */
 	if (any_streaming)
-		mod_timer(&ch->timeout, jiffies + VBUF_PLACEHOLDER_INTERVAL);
+		mod_timer(&ch->timeout, jiffies +
+			sc0710_placeholder_interval(live_fmt ? live_fmt : fmt));
 }
 
 void sc0710_video_notify_source_change_mask(struct sc0710_dev *dev, u8 input_mask)
