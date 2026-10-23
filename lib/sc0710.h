@@ -107,6 +107,11 @@ extern unsigned int zc_split;
  * client. Takes effect on the next PCM start. */
 extern unsigned int keep_audio_alive;
 
+/* Cam Link Pro capture path (clp_demux module param, read at probe). 1
+ * (default): sc0710-4port.c demuxes all four inputs from C2H 0 in software,
+ * each node at its source's native size. 0: the conveyor path. */
+extern unsigned int clp_demux;
+
 #define SC0710_MAX_CHANNELS 2
 
 /* A chain contains 1..SC0710_MAX_CHAIN_DESCRIPTORS descriptors,
@@ -646,6 +651,10 @@ struct sc0710_dev {
 	/* Misc structs */
 	struct sc0710_i2c          i2cbus[1];
 
+	/* Cam Link Pro with clp_demux only: the 4-port capture path, which
+	 * replaces the channel/kthread machinery below (sc0710-4port.c). */
+	struct sc0710_4port       *fourport;
+
 	/* Anything channel related. */
 	struct sc0710_dma_channel  channel[SC0710_MAX_CHANNELS];
 
@@ -751,6 +760,11 @@ static inline u32 sc0710_framesize(const struct sc0710_dev *dev,
 	return fmt ? fmt->width * dev->pixfmt->bpp * fmt->height : 0;
 }
 
+static inline bool sc0710_clp_demux(const struct sc0710_dev *dev)
+{
+	return dev->board == SC0710_BOARD_ELGATO_CAMLINK_PRO && clp_demux;
+}
+
 static inline bool sc0710_clp_native_4k(const struct sc0710_dev *dev)
 {
 	return dev->width >= SC0710_CLP_WIDTH &&
@@ -854,6 +868,12 @@ int sc0710_i2c_read_status2(struct sc0710_dev *dev);
 int sc0710_i2c_read_status3(struct sc0710_dev *dev);
 int sc0710_i2c_read_procamp(struct sc0710_dev *dev);
 int sc0710_i2c_write_mcu(struct sc0710_dev *dev, u8 subaddr, u8 *data, int len);
+int sc0710_i2c_read_mcu(struct sc0710_dev *dev, u8 subaddr, u8 *data, int len);
+
+/* -4port.c */
+int  sc0710_4port_probe(struct sc0710_dev *dev);
+void sc0710_4port_remove(struct sc0710_dev *dev);
+void sc0710_4port_release(struct sc0710_dev *dev);
 int sc0710_4kp_wait_pipeline(struct sc0710_dev *dev);
 int sc0710_set_edid_source(struct sc0710_dev *dev, u32 src);
 void sc0710_reset_dma_frame_sync(struct sc0710_dev *dev);

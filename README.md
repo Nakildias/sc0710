@@ -19,7 +19,7 @@ High-performance, multi-client Linux driver for the Elgato 4K60 Pro MK.2, 4K Pro
 |------|-------------|-------|
 | **Elgato 4K60 Pro MK.2** | `1cfa:000e` | Plug-and-play after driver load. No FPGA firmware step. |
 | **Elgato 4K Pro** | `1cfa:0012` | Requires **ECP5 FPGA firmware** programming on every **cold boot**. Handled automatically by the installer and the AUR package; manual `insmod` builds need extra steps (see below). |
-| **Elgato Cam Link Pro** | `1cfa:0011` | Experimental. Four independent HDMI video and audio endpoints, native 3840x2160 NV12 capture on every port, hot-plug recovery, and cold-boot firmware loading have been tested on attached hardware. Simultaneous live sources still need multi-source testing. |
+| **Elgato Cam Link Pro** | `1cfa:0011` | Experimental. Four HDMI inputs captured at once, each at its source's native size (4K NV12, 1080p YUYV); 3x 4K30 + 1x 1080p60 tested live together at full rate. Hot-plug recovery and cold-boot firmware loading tested on attached hardware. |
 
 All three cards share the same `12ab:0710` PCI device ID but use different board profiles in the driver.
 
@@ -195,7 +195,7 @@ Same command as above. It checks the module, DKMS, CLI, systemd units, config fi
 * **DKMS integration** — automatic rebuilds on kernel updates (standard distros)
 * **Atomic / immutable support** — boot-time rebuild via `sc0710-build.service` (Bazzite, Silverblue, etc.)
 * **ECP5 auto-programming**: card-specific firmware extraction at install time; the driver programs the FPGA at load and refuses to bind if it cannot
-* **Cam Link Pro four-input capture**: four V4L2 video nodes and four independently routed ALSA inputs, with genuine 3840x2160 NV12 capture tested on every HDMI port without host-side 1080p upscaling
+* **Cam Link Pro four-input capture**: four V4L2 video nodes and four ALSA inputs, demuxed in software from the single DMA stream that carries all four HDMI inputs; each node runs at its source's native size, so mixed 4K and 1080p sources capture together at full rate
 * **Status images** — storage-efficient No Signal / No Device screens
 * **Connection sensing** — distinguishes unplugged cables from signal loss (not 100% reliable)
 * **Video formats** — 4K60, 1440p144, 1080p240. **EDID Source control (Internal/Display/Merged) on both cards** via the `EDID Source` V4L2 control (`v4l2-ctl --set-ctrl=edid_source=N`). **Custom EDID read/write on both cards** via `VIDIOC_G_EDID`/`VIDIOC_S_EDID` — the 4K Pro through its EEPROM (`edid=` boot param, profiles from `scripts/extract-firmware.sh`), the MK.2 through its MCU (runtime only). The graphical **EDID Config app** (`sc0710-cli --edid-config`) manages this for both cards and can fetch Elgato's official EDID profiles
@@ -221,12 +221,16 @@ v4l2-ctl -d /dev/video0 --set-fmt-video=pixelformat=BGR3   # select 4:4:4
 # OBS / ffmpeg pick it via the normal format menu / -pixel_format bgr24
 ```
 
-The Cam Link Pro exposes one `NV12` video node and one stereo ALSA capture device for each
-HDMI port. A 4K source is delivered at 3840x2160; ordinary sources use a 1920x1080 delivery
-shape. If the source changes size while an app is capturing, the app gets a
-`V4L2_EVENT_SOURCE_CHANGE`; apps that ignore it (OBS) keep receiving the picture scaled to
-the size they negotiated, so restart the source to capture at the new native size. YUYV,
-BGR24, and multiview are not implemented for that card.
+The Cam Link Pro exposes one video node per HDMI port and one ALSA card with a stereo capture
+PCM per port (PCM 0-3 = HDMI 1-4). The card streams all four inputs through one DMA channel
+at all times; the driver demuxes it in software (`lib/sc0710-4port.c`), so each node follows
+its own source: 3840x2160 sources are delivered as `NV12`, 1920x1080 sources as `YUYV`, each
+at the source's frame rate. Each node reports its input through `VIDIOC_QUERY_DV_TIMINGS`, and
+a mode change raises `V4L2_EVENT_SOURCE_CHANGE`. Other source modes, BGR24 and multiview are
+not implemented for that card.
+
+`clp_demux=0` (module parameter, read at load) selects the earlier conveyor capture path
+instead: `NV12` on every port, scaled to a shared delivery size, with one ALSA card per input.
 
 On **MK.2**, HDR mode can also auto-select the format while idle:
 
@@ -353,8 +357,7 @@ For GitHub issues, attach output from `sc0710-cli --dump`.
 
 * **4K60 DMA tearing** — horizontal tears or frame shifts at 4K60 (~995 MB/s) under heavy load; **under active investigation**
 * **10-bit planar formats** — P010/P016 not implemented; HDR passthrough uses native **BGR24** 4:4:4 instead
-* **Cam Link Pro simultaneous live sources**: all four video nodes can stream together and all four ALSA endpoints can run together, but only one live HDMI source was available during development. One live 4K source plus three idle streams is hardware-tested; two or more live sources at once still need verification.
-* **Cam Link Pro non-4K modes**: the 1920x1080 delivery path is implemented but has not yet been tested with a real 1080p source.
+* **Cam Link Pro source modes**: 3840x2160 and 1920x1080 sources are tested (4K30 and 1080p60, live together); other resolutions and HDR metadata are not handled yet.
 * **Cam Link Pro EDID control**: per-input EDID routing is not mapped yet, so the Cam Link Pro nodes do not expose the EDID controls available on the 4K60 Pro MK.2 and 4K Pro.
 
 ## Help wanted
