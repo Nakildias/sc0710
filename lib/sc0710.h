@@ -874,6 +874,8 @@ int sc0710_i2c_read_mcu(struct sc0710_dev *dev, u8 subaddr, u8 *data, int len);
 int  sc0710_4port_probe(struct sc0710_dev *dev);
 void sc0710_4port_remove(struct sc0710_dev *dev);
 void sc0710_4port_release(struct sc0710_dev *dev);
+struct seq_file;
+void sc0710_4port_proc_state(struct seq_file *m, struct sc0710_dev *dev);
 int sc0710_4kp_wait_pipeline(struct sc0710_dev *dev);
 int sc0710_set_edid_source(struct sc0710_dev *dev, u32 src);
 void sc0710_reset_dma_frame_sync(struct sc0710_dev *dev);

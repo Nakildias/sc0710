@@ -23,8 +23,8 @@
  *  frame slot.
  */
 
+#include <linux/seq_file.h>
 #include <linux/vmalloc.h>
-#include <linux/debugfs.h>
 #include <media/v4l2-dv-timings.h>
 #include "sc0710.h"
 
@@ -64,8 +64,7 @@ MODULE_PARM_DESC(fourport_ring_chunks,
 
 static unsigned int fourport_debug;
 module_param(fourport_debug, uint, 0644);
-MODULE_PARM_DESC(fourport_debug,
-	"Cam Link Pro: log stream resyncs with context; at probe, also expose the raw audio ring in debugfs (1 = on)");
+MODULE_PARM_DESC(fourport_debug, "Cam Link Pro: log stream resyncs with context (1 = on)");
 
 /* Grace period before an idle session is stopped, so probes that open and
  * close the nodes (udev, PipeWire) don't restart the hardware each time. */
@@ -140,9 +139,6 @@ struct sc0710_4port {
 	u64                         ablocks, aoverruns;
 	unsigned long               session_start;
 	struct snd_card            *card;
-	/* debugfs: raw audio ring, only with fourport_debug */
-	struct dentry              *dbg;
-	struct debugfs_blob_wrapper abuf_blob;
 
 	/* Hardware session, running while any node is open */
 	struct mutex  hw_lock;
@@ -207,7 +203,8 @@ static u32 fp_port_pick_pixfmt(struct fp_port *p, u32 width, u32 height)
 
 /* Bring the advertised format in line with the input. Idle queues are
  * updated in place; a busy one keeps streaming its negotiated format and
- * gets a source-change event so the client can renegotiate. */
+ * gets a source-change event so the client can renegotiate. Called with
+ * p->lock held. */
 static void fp_port_update_format(struct fp_port *p)
 {
 	u32 width, height, pixfmt;
@@ -226,7 +223,6 @@ static void fp_port_update_format(struct fp_port *p)
 	if (width > (pixfmt == V4L2_PIX_FMT_NV12 ? FP_PAYLOAD : FP_PAYLOAD / 2) || !height)
 		return;
 
-	mutex_lock(&p->lock);
 	if (width != p->width || height != p->height || pixfmt != p->pixfmt ||
 	    p->st.fps != p->fps) {
 		if (!vb2_is_busy(&p->q))
@@ -234,7 +230,6 @@ static void fp_port_update_format(struct fp_port *p)
 		else if (width != p->width || height != p->height || pixfmt != p->pixfmt)
 			v4l2_event_queue(&p->vdev, &ev);
 	}
-	mutex_unlock(&p->lock);
 }
 
 /* ----------------------------------------------------------- */
@@ -602,9 +597,12 @@ static int fp_status_thread(void *data)
 					    st.vactive != p->st.vactive || st.fps != p->st.fps))
 				printk(KERN_INFO "%s: HDMI %d mode %ux%u@%u\n", dev->name, i + 1,
 					st.hactive, st.vactive, st.fps);
+			/* The ioctls read st/locked under the same lock */
+			mutex_lock(&p->lock);
 			p->st = st;
 			p->locked = locked;
 			fp_port_update_format(p);
+			mutex_unlock(&p->lock);
 		}
 		/* The vendor rewrites the port-enable bits on every pass */
 		if (sc_read(dev, 0, 0xec) != 0xf0)
@@ -1102,11 +1100,11 @@ static const struct v4l2_file_operations fp_fops = {
 	.unlocked_ioctl = video_ioctl2,
 };
 
-static int fp_port_register(struct sc0710_4port *fp, int idx)
+/* Everything the DMA and status threads can touch, so it must run before
+ * either thread starts. */
+static void fp_port_init(struct sc0710_4port *fp, int idx)
 {
 	struct fp_port *p = &fp->port[idx];
-	struct vb2_queue *q = &p->q;
-	int ret;
 
 	p->fp = fp;
 	p->idx = idx;
@@ -1115,6 +1113,13 @@ static int fp_port_register(struct sc0710_4port *fp, int idx)
 	spin_lock_init(&p->alock);
 	INIT_LIST_HEAD(&p->bufs);
 	fp_port_set_format(p, V4L2_PIX_FMT_YUYV, 1920, 1080, 60);
+}
+
+static int fp_port_register(struct sc0710_4port *fp, int idx)
+{
+	struct fp_port *p = &fp->port[idx];
+	struct vb2_queue *q = &p->q;
+	int ret;
 
 	q->type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
 	q->io_modes = VB2_MMAP | VB2_USERPTR | VB2_DMABUF | VB2_READ;
@@ -1392,18 +1397,14 @@ int sc0710_4port_probe(struct sc0710_dev *dev)
 	mutex_init(&fp->dma_lock);
 	init_waitqueue_head(&fp->wq);
 
+	for (i = 0; i < FP_PORTS; i++)
+		fp_port_init(fp, i);
+
 	ret = fp_alloc_rings(fp);
 	if (ret)
 		goto fail;
 
 	fp_ports_enable(dev);
-
-	if (fourport_debug) {
-		fp->abuf_blob.data = fp->abuf;
-		fp->abuf_blob.size = FP_AUDIO_DESCS * FP_AUDIO_STRIDE;
-		fp->dbg = debugfs_create_dir(dev->name, NULL);
-		debugfs_create_blob("audio_ring", 0400, fp->dbg, &fp->abuf_blob);
-	}
 
 	fp->dma_thread = kthread_run(fp_dma_thread, fp, "sc0710 4port dma");
 	if (IS_ERR(fp->dma_thread)) {
@@ -1475,11 +1476,78 @@ void sc0710_4port_remove(struct sc0710_dev *dev)
 		kthread_stop(fp->dma_thread);
 	fp->dma_thread = NULL;
 
-	debugfs_remove_recursive(fp->dbg);
-	fp->dbg = NULL;
-
 	fp_free_rings(fp);
 }
+
+#ifdef CONFIG_PROC_FS
+/* DMA bytes per second for one input: the card sends every locked input,
+ * captured or not, as fixed-size lines (NV12: Y then UV lines; YUY2: one
+ * line per row). */
+static u64 fp_port_bps(const struct fp_port *p)
+{
+	u32 lines = p->pixfmt == V4L2_PIX_FMT_NV12 ? p->height * 3 / 2 : p->height;
+
+	return (u64)lines * FP_LINE * p->fps;
+}
+
+/* /proc/sc0710-state for the demux path. Cached state only, as for the
+ * other boards: no I2C or register access from this world-readable file.
+ * Called with the core's devlist mutex held, so fp can't go away. */
+void sc0710_4port_proc_state(struct seq_file *m, struct sc0710_dev *dev)
+{
+	struct sc0710_4port *fp = dev->fourport;
+	u64 total = 0;
+	int i, nlocked = 0;
+
+	seq_printf(m, "     capture: clp_demux (software demux of C2H 0)\n");
+	for (i = 0; i < FP_PORTS; i++) {
+		struct fp_port *p = &fp->port[i];
+
+		mutex_lock(&p->lock);
+		if (p->locked) {
+			u64 bps = fp_port_bps(p);
+
+			/* The first locked input also fills the single-input
+			 * "HDMI:" and "req bytes/s:" fields that sc0710-cli reads. */
+			if (!nlocked++)
+				seq_printf(m, "        HDMI: %ux%up%u (HDMI-%d)\n",
+					p->width, p->height, p->fps, i + 1);
+			total += bps;
+			seq_printf(m, "      HDMI-%d: %ux%up%u %c%c%c%c, %llu MB/s, %s%s, %llu frames, %llu dropped\n",
+				i + 1, p->width, p->height, p->fps,
+				p->pixfmt & 0xff, (p->pixfmt >> 8) & 0xff,
+				(p->pixfmt >> 16) & 0xff, (p->pixfmt >> 24) & 0xff,
+				bps / 1000000,
+				video_is_registered(&p->vdev) ?
+					video_device_node_name(&p->vdev) : "-",
+				p->streaming ? " [streaming]" : "",
+				p->frames, p->dropped);
+		} else {
+			seq_printf(m, "      HDMI-%d: no signal, %s\n", i + 1,
+				video_is_registered(&p->vdev) ?
+					video_device_node_name(&p->vdev) : "-");
+		}
+		mutex_unlock(&p->lock);
+	}
+	if (!nlocked)
+		seq_printf(m, "        HDMI: no signal\n");
+	else
+		/* No fourcc here: the card picks each input's format itself */
+		seq_printf(m, "  req bytes/s: %llu (%llu MB/s for %d locked input%s)\n",
+			total, total / 1000000, nlocked, nlocked == 1 ? "" : "s");
+
+	mutex_lock(&fp->hw_lock);
+	seq_printf(m, "     session: %s, %u users, %llu overruns, %llu resyncs\n",
+		fp->running ? "running" : "idle", fp->users,
+		fp->overruns, fp->resyncs);
+	if (fp->card)
+		seq_printf(m, "       audio: ALSA card %d, %llu blocks, %llu overruns\n",
+			fp->card->number, fp->ablocks, fp->aoverruns);
+	else
+		seq_printf(m, "       audio: none\n");
+	mutex_unlock(&fp->hw_lock);
+}
+#endif
 
 /* Last reference to the v4l2_device gone: no node can reach fp anymore. */
 void sc0710_4port_release(struct sc0710_dev *dev)

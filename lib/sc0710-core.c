@@ -245,6 +245,8 @@ void sc0710_sync_hdr_deliver_all(void)
 	mutex_lock(&devlist);
 	list_for_each(list, &sc0710_devlist) {
 		dev = list_entry(list, struct sc0710_dev, devlist);
+		if (dev->fourport)
+			continue;	/* no HDR delivery modes on the demux path */
 		sc0710_sync_hdr_deliver(dev);
 	}
 	mutex_unlock(&devlist);
@@ -463,6 +465,11 @@ static int sc0710_proc_state_show(struct seq_file *m, void *v)
 		dev = list_entry(list, struct sc0710_dev, devlist);
 
 		seq_printf(m, "%s\n", dev->name);
+
+		if (dev->fourport) {
+			sc0710_4port_proc_state(m, dev);
+			continue;
+		}
 
 		if (dev->irq_requested)
 			seq_printf(m, "         irq: delivered %llu, missed %llu, completions %llu, status %08x%s\n",
@@ -1083,11 +1090,15 @@ static int sc0710_initdev(struct pci_dev *pci_dev,
 
 	/* Cam Link Pro with clp_demux: all four inputs stream through one DMA
 	 * channel and sc0710-4port.c demuxes them in software. None of the
-	 * channel, kthread or devlist machinery below applies. */
+	 * channel or kthread machinery below applies; the devlist does, so
+	 * /proc/sc0710 and /proc/sc0710-state see the card. */
 	if (sc0710_clp_demux(dev)) {
 		err = sc0710_4port_probe(dev);
 		if (err < 0)
 			goto fail_dev;
+		mutex_lock(&devlist);
+		list_add_tail(&dev->devlist, &sc0710_devlist);
+		mutex_unlock(&devlist);
 		return 0;
 	}
 
@@ -1186,6 +1197,10 @@ static void sc0710_finidev(struct pci_dev *pci_dev)
 
 	if (dev->fourport) {
 		WRITE_ONCE(dev->disconnected, true);
+		/* Unlink first: the /proc readers walk this list */
+		mutex_lock(&devlist);
+		list_del(&dev->devlist);
+		mutex_unlock(&devlist);
 		sc0710_4port_remove(dev);
 		pci_disable_device(pci_dev);
 		sc0710_dev_unregister(dev);
