@@ -64,7 +64,8 @@ MODULE_PARM_DESC(fourport_ring_chunks,
 
 static unsigned int fourport_debug;
 module_param(fourport_debug, uint, 0644);
-MODULE_PARM_DESC(fourport_debug, "Cam Link Pro: log stream resyncs with context (1 = on)");
+MODULE_PARM_DESC(fourport_debug,
+	"Cam Link Pro: log stream resyncs with context; at probe, also expose the raw audio ring in debugfs (1 = on)");
 
 /* Grace period before an idle session is stopped, so probes that open and
  * close the nodes (udev, PipeWire) don't restart the hardware each time. */
@@ -139,7 +140,7 @@ struct sc0710_4port {
 	u64                         ablocks, aoverruns;
 	unsigned long               session_start;
 	struct snd_card            *card;
-	/* debugfs: raw audio ring */
+	/* debugfs: raw audio ring, only with fourport_debug */
 	struct dentry              *dbg;
 	struct debugfs_blob_wrapper abuf_blob;
 
@@ -1397,10 +1398,12 @@ int sc0710_4port_probe(struct sc0710_dev *dev)
 
 	fp_ports_enable(dev);
 
-	fp->abuf_blob.data = fp->abuf;
-	fp->abuf_blob.size = FP_AUDIO_DESCS * FP_AUDIO_STRIDE;
-	fp->dbg = debugfs_create_dir(dev->name, NULL);
-	debugfs_create_blob("audio_ring", 0400, fp->dbg, &fp->abuf_blob);
+	if (fourport_debug) {
+		fp->abuf_blob.data = fp->abuf;
+		fp->abuf_blob.size = FP_AUDIO_DESCS * FP_AUDIO_STRIDE;
+		fp->dbg = debugfs_create_dir(dev->name, NULL);
+		debugfs_create_blob("audio_ring", 0400, fp->dbg, &fp->abuf_blob);
+	}
 
 	fp->dma_thread = kthread_run(fp_dma_thread, fp, "sc0710 4port dma");
 	if (IS_ERR(fp->dma_thread)) {
