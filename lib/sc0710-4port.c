@@ -203,8 +203,8 @@ static u32 fp_port_pick_pixfmt(struct fp_port *p, u32 width, u32 height)
 
 /* Bring the advertised format in line with the input. Idle queues are
  * updated in place; a busy one keeps streaming its negotiated format and
- * gets a source-change event so the client can renegotiate. Called with
- * p->lock held. */
+ * gets a source-change event on any timing change, rate included, so the
+ * client can renegotiate. Called with p->lock held. */
 static void fp_port_update_format(struct fp_port *p)
 {
 	u32 width, height, pixfmt;
@@ -227,7 +227,7 @@ static void fp_port_update_format(struct fp_port *p)
 	    p->st.fps != p->fps) {
 		if (!vb2_is_busy(&p->q))
 			fp_port_set_format(p, pixfmt, width, height, p->st.fps);
-		else if (width != p->width || height != p->height || pixfmt != p->pixfmt)
+		else if (p->st.fps)
 			v4l2_event_queue(&p->vdev, &ev);
 	}
 }
@@ -378,9 +378,15 @@ static void fp_feed(struct sc0710_4port *fp, const u8 *buf, size_t len)
 
 	while (pos + FP_LINE <= len) {
 		if (!fp->synced || memcmp(buf + pos, fp_sync, sizeof(fp_sync))) {
-			size_t start = pos;
+			size_t start = pos, from = pos;
 
-			s = fp_find_sync(buf, len, pos + (fp->synced ? 1 : 0));
+			/* An input dropping out can cut its last lines short, which
+			 * leaves the next header inside the line just consumed. Look
+			 * there first, or the line after it (usually another
+			 * input's) is skipped and that input loses a frame. */
+			if (fp->synced)
+				from = pos >= FP_LINE ? pos - FP_LINE + FP_HDR : 0;
+			s = fp_find_sync(buf, len, from);
 			fp->synced = false;
 			if (s < 0) {
 				/* Keep enough tail to catch a header split across chunks */
@@ -397,9 +403,9 @@ static void fp_feed(struct sc0710_4port *fp, const u8 *buf, size_t len)
 			}
 			fp->resyncs++;
 			if (fourport_debug)
-				printk_ratelimited(KERN_INFO "%s: resync in chunk %u at %zu (+%zu): last hdr %*phN, found %*phN\n",
-					fp->dev->name, fp->chunk_idx, (size_t)s, (size_t)s - start,
-					4, fp->last_hdr + 12, 16, buf + s);
+				printk_ratelimited(KERN_INFO "%s: resync in chunk %u at %zu (%+ld): last hdr %*phN, expected %*phN, found %*phN\n",
+					fp->dev->name, fp->chunk_idx, (size_t)s, (long)s - (long)start,
+					4, fp->last_hdr + 12, 16, buf + start, 16, buf + s);
 			continue;
 		}
 		fp_line(fp, buf + pos, buf + pos + FP_HDR);
