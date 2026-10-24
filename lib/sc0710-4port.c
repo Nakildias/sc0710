@@ -98,6 +98,8 @@ struct fp_port {
 
 	/* Format, changed only while the queue is idle (under lock) */
 	u32 pixfmt, width, height, bpl, sizeimage, fps;
+	/* Mode last signalled to a busy queue; sig_fps 0 = none (under lock) */
+	u32 sig_pixfmt, sig_width, sig_height, sig_fps;
 
 	/* Last MCU status and the line type the stream last carried */
 	struct fp_status st;
@@ -203,7 +205,7 @@ static u32 fp_port_pick_pixfmt(struct fp_port *p, u32 width, u32 height)
 
 /* Bring the advertised format in line with the input. Idle queues are
  * updated in place; a busy one keeps streaming its negotiated format and
- * gets a source-change event on any timing change, rate included, so the
+ * gets one source-change event per timing change, rate included, so the
  * client can renegotiate. Called with p->lock held. */
 static void fp_port_update_format(struct fp_port *p)
 {
@@ -223,12 +225,22 @@ static void fp_port_update_format(struct fp_port *p)
 	if (width > (pixfmt == V4L2_PIX_FMT_NV12 ? FP_PAYLOAD : FP_PAYLOAD / 2) || !height)
 		return;
 
-	if (width != p->width || height != p->height || pixfmt != p->pixfmt ||
-	    p->st.fps != p->fps) {
-		if (!vb2_is_busy(&p->q))
-			fp_port_set_format(p, pixfmt, width, height, p->st.fps);
-		else if (p->st.fps)
-			v4l2_event_queue(&p->vdev, &ev);
+	if (width == p->width && height == p->height && pixfmt == p->pixfmt &&
+	    p->st.fps == p->fps) {
+		p->sig_fps = 0;
+		return;
+	}
+	if (!vb2_is_busy(&p->q)) {
+		fp_port_set_format(p, pixfmt, width, height, p->st.fps);
+		p->sig_fps = 0;
+	} else if (p->st.fps && (width != p->sig_width || height != p->sig_height ||
+				 pixfmt != p->sig_pixfmt || p->st.fps != p->sig_fps)) {
+		/* This runs every status pass: signal each new mode once */
+		p->sig_pixfmt = pixfmt;
+		p->sig_width = width;
+		p->sig_height = height;
+		p->sig_fps = p->st.fps;
+		v4l2_event_queue(&p->vdev, &ev);
 	}
 }
 
