@@ -37,6 +37,11 @@
 #define FP_AUDIO_DESCS  8
 #define FP_AUDIO_CHUNK  7680
 #define FP_AUDIO_STRIDE 8192
+/* C2H stream writeback: the engine writes each completed descriptor's
+ * status and length to the descriptor's source address, 32 bytes a slot.
+ * Left at 0, every completion is an IOMMU fault at address 0. */
+#define FP_WB_SLOT      32
+#define FP_WB_SLOTS     (256 + FP_AUDIO_DESCS)
 
 /* Header bytes 14-15, big-endian */
 #define FP_FLAGS_Y      0x004f
@@ -138,6 +143,9 @@ struct sc0710_4port {
 	u8                         *abuf;
 	dma_addr_t                  abuf_dma;
 	u32                         adone_seen;
+	/* Writeback slots: video descriptors first, then audio */
+	void                       *wb;
+	dma_addr_t                  wb_dma;
 	u64                         ablocks, aoverruns;
 	unsigned long               session_start;
 	struct snd_card            *card;
@@ -1334,17 +1342,21 @@ static void fp_free_rings(struct sc0710_4port *fp)
 		dma_free_coherent(d, FP_AUDIO_DESCS * sizeof(*fp->adesc), fp->adesc, fp->adesc_dma);
 	if (fp->abuf)
 		dma_free_coherent(d, FP_AUDIO_DESCS * FP_AUDIO_STRIDE, fp->abuf, fp->abuf_dma);
+	if (fp->wb)
+		dma_free_coherent(d, FP_WB_SLOTS * FP_WB_SLOT, fp->wb, fp->wb_dma);
 	fp->desc = NULL;
 	fp->adesc = NULL;
 	fp->abuf = NULL;
+	fp->wb = NULL;
 }
 
-static void fp_desc_set(struct sc0710_dma_descriptor *d, u32 len, dma_addr_t dst, dma_addr_t next)
+static void fp_desc_set(struct sc0710_dma_descriptor *d, u32 len, dma_addr_t wb,
+			dma_addr_t dst, dma_addr_t next)
 {
 	d->control = FP_DESC_CTRL;
 	d->lengthBytes = len;
-	d->src_l = 0;
-	d->src_h = 0;
+	d->src_l = lower_32_bits(wb);
+	d->src_h = upper_32_bits(wb);
 	d->dst_l = lower_32_bits(dst);
 	d->dst_h = upper_32_bits(dst);
 	d->next_l = lower_32_bits(next);
@@ -1359,7 +1371,8 @@ static int fp_alloc_rings(struct sc0710_4port *fp)
 	fp->desc = dma_alloc_coherent(d, 256 * sizeof(*fp->desc), &fp->desc_dma, GFP_KERNEL);
 	fp->adesc = dma_alloc_coherent(d, FP_AUDIO_DESCS * sizeof(*fp->adesc), &fp->adesc_dma, GFP_KERNEL);
 	fp->abuf = dma_alloc_coherent(d, FP_AUDIO_DESCS * FP_AUDIO_STRIDE, &fp->abuf_dma, GFP_KERNEL);
-	if (!fp->desc || !fp->adesc || !fp->abuf)
+	fp->wb = dma_alloc_coherent(d, FP_WB_SLOTS * FP_WB_SLOT, &fp->wb_dma, GFP_KERNEL);
+	if (!fp->desc || !fp->adesc || !fp->abuf || !fp->wb)
 		return -ENOMEM;
 
 	for (i = 0; i < want; i++) {
@@ -1375,10 +1388,11 @@ static int fp_alloc_rings(struct sc0710_4port *fp)
 			fp->dev->name, fp->nchunks, want);
 
 	for (i = 0; i < fp->nchunks; i++)
-		fp_desc_set(&fp->desc[i], FP_CHUNK, fp->chunk_dma[i],
+		fp_desc_set(&fp->desc[i], FP_CHUNK, fp->wb_dma + i * FP_WB_SLOT, fp->chunk_dma[i],
 			fp->desc_dma + ((i + 1) % fp->nchunks) * sizeof(*fp->desc));
 	for (i = 0; i < FP_AUDIO_DESCS; i++)
-		fp_desc_set(&fp->adesc[i], FP_AUDIO_CHUNK, fp->abuf_dma + i * FP_AUDIO_STRIDE,
+		fp_desc_set(&fp->adesc[i], FP_AUDIO_CHUNK, fp->wb_dma + (256 + i) * FP_WB_SLOT,
+			fp->abuf_dma + i * FP_AUDIO_STRIDE,
 			fp->adesc_dma + ((i + 1) % FP_AUDIO_DESCS) * sizeof(*fp->adesc));
 
 	printk(KERN_INFO "%s: video ring %u x %u bytes, audio ring %u x %u bytes\n",
