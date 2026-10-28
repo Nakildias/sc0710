@@ -312,6 +312,12 @@ static int sc0710_i2c_writeread(struct sc0710_dev *dev, u8 devaddr8bit, u8 *wbuf
 	return ret;
 }
 
+/* Read len bytes from MCU sub-address subaddr (write-pointer then read). */
+int sc0710_i2c_read_mcu(struct sc0710_dev *dev, u8 subaddr, u8 *data, int len)
+{
+	return sc0710_i2c_writeread(dev, I2C_DEV__ARM_MCU, &subaddr, 1, data, len);
+}
+
 /* Atomic DMA restart on signal restoration or resolution/refresh change.
  * Serializes with the DMA service thread via kthread_dma_lock so that
  * dequeue cannot race with stop/resize/start.

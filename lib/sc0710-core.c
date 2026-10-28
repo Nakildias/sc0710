@@ -173,6 +173,13 @@ MODULE_PARM_DESC(zc_split,
 	"coherent scratch allocations more reliable. 0 = keep the vendor 4 MiB "
 	"segmenting.");
 
+unsigned int clp_demux = 1;
+module_param(clp_demux, uint, 0444);
+MODULE_PARM_DESC(clp_demux,
+	"Cam Link Pro capture path (1=demux, default): all four inputs are "
+	"demuxed from one DMA stream in software, each node at its source's "
+	"native size and format. 0 = conveyor path.");
+
 unsigned int keep_audio_alive;
 module_param(keep_audio_alive, uint, 0644);
 MODULE_PARM_DESC(keep_audio_alive,
@@ -238,6 +245,8 @@ void sc0710_sync_hdr_deliver_all(void)
 	mutex_lock(&devlist);
 	list_for_each(list, &sc0710_devlist) {
 		dev = list_entry(list, struct sc0710_dev, devlist);
+		if (dev->fourport)
+			continue;	/* no HDR delivery modes on the demux path */
 		sc0710_sync_hdr_deliver(dev);
 	}
 	mutex_unlock(&devlist);
@@ -456,6 +465,11 @@ static int sc0710_proc_state_show(struct seq_file *m, void *v)
 		dev = list_entry(list, struct sc0710_dev, devlist);
 
 		seq_printf(m, "%s\n", dev->name);
+
+		if (dev->fourport) {
+			sc0710_4port_proc_state(m, dev);
+			continue;
+		}
 
 		if (dev->irq_requested)
 			seq_printf(m, "         irq: delivered %llu, missed %llu, completions %llu, status %08x%s\n",
@@ -952,6 +966,7 @@ static void sc0710_dev_release(struct v4l2_device *v4l2_dev)
 	/* No-op unless the handler was initialized (4K Pro only); freed here
 	 * because open file handles unsubscribe control events through it. */
 	v4l2_ctrl_handler_free(&dev->ctrl_handler);
+	sc0710_4port_release(dev);
 	pci_dev_put(dev->pci);
 	kfree(dev);
 }
@@ -1073,6 +1088,20 @@ static int sc0710_initdev(struct pci_dev *pci_dev,
 	printk(KERN_INFO "sc0710 device at %s\n", pci_name(pci_dev));
 	printk(KERN_INFO "sc0710 page-size %lu bytes\n", PAGE_SIZE);
 
+	/* Cam Link Pro with clp_demux: all four inputs stream through one DMA
+	 * channel and sc0710-4port.c demuxes them in software. None of the
+	 * channel or kthread machinery below applies; the devlist does, so
+	 * /proc/sc0710 and /proc/sc0710-state see the card. */
+	if (sc0710_clp_demux(dev)) {
+		err = sc0710_4port_probe(dev);
+		if (err < 0)
+			goto fail_dev;
+		mutex_lock(&devlist);
+		list_add_tail(&dev->devlist, &sc0710_devlist);
+		mutex_unlock(&devlist);
+		return 0;
+	}
+
 	err = sc0710_dma_channels_alloc(dev);
 	if (err < 0) {
 		printk(KERN_ERR "%s: DMA channel allocation failed (%d), aborting probe\n",
@@ -1165,6 +1194,20 @@ static void sc0710_finidev(struct pci_dev *pci_dev)
 {
 	struct sc0710_dev *dev = pci_get_drvdata(pci_dev);
 	int i;
+
+	if (dev->fourport) {
+		WRITE_ONCE(dev->disconnected, true);
+		/* Unlink first: the /proc readers walk this list */
+		mutex_lock(&devlist);
+		list_del(&dev->devlist);
+		mutex_unlock(&devlist);
+		sc0710_4port_remove(dev);
+		pci_disable_device(pci_dev);
+		sc0710_dev_unregister(dev);
+		v4l2_device_unregister(&dev->v4l2_dev);
+		v4l2_device_put(&dev->v4l2_dev);
+		return;
+	}
 
 	if (dev->board == SC0710_BOARD_ELGATEO_4KP60_MK2) {
 		device_remove_bin_file(&pci_dev->dev, &bin_attr_hdr_tonemap);
