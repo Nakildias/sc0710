@@ -131,8 +131,20 @@ Add `github:Nakildias/sc0710` as a flake input and import `sc0710.nixosModules.d
 Host configuration:
 
 ```nix
-hardware.sc0710.enable = true;          # kernel module + sc0710-cli
-# hardware.sc0710.kernel = pkgs.linuxPackages_6_19.kernel;  # optional override
+#  kernel module + sc0710-cli (CLI is enabled by default)
+hardware.sc0710.enable = true;
+
+# Optional: pin a specific kernel. The driver builds against it automatically.
+# boot.kernelPackages = pkgs.linuxPackages_6_19;
+
+# Optional: override the driver package (defaults to driver.nix built against boot.kernelPackages).
+# hardware.sc0710.package = config.boot.kernelPackages.callPackage ./my-sc0710-driver.nix { };
+
+# Optional: override the CLI package (defaults to cli.nix).
+# hardware.sc0710.cli.package = pkgs.callPackage ./my-sc0710-cli.nix { };
+
+# Optional: install only the kernel module, without the sc0710-cli helper.
+# hardware.sc0710.cli.enable = false;
 ```
 
 **Note:** The NixOS module builds the driver and installs `sc0710-cli`. **4K Pro and Cam Link Pro users on NixOS** additionally run `scripts/extract-firmware.sh` once as root from a repo checkout. It installs the matching ECP5 firmware to `/lib/firmware/sc0710`, which the kernel firmware loader reads directly. MK.2 capture works without a firmware file. The driver programs the FPGA at every module load and refuses to bind if it cannot, so no boot service is needed.
